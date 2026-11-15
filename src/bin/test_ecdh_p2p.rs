@@ -11,7 +11,66 @@ use sha2::{Digest, Sha256};
 use std::time::Instant;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+/// `--watch-key`: the viewer's watch key as the app makes it (kept for the login session on
+/// Linux), and a stream key wrapped by a sender for it. Prints a fingerprint of the PUBLIC
+/// key only: run it twice, the fingerprints match when the key was kept.
+fn watch_key_check() {
+    use litecord::screen_capture::crypto::{decrypt_signaling_payload, encrypt_signaling_payload, get_or_create_local_ecdh_keypair, pair_key, watch_pair_key, watch_public_key};
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let (viewer_uid, sender_uid, cid) = (200u64, 100u64, 5u64);
+    let viewer_public = watch_public_key();
+    let fingerprint: String = Sha256::digest(viewer_public).iter().take(6).map(|b| format!("{b:02x}")).collect();
+    // The sender's side of OP_WATCH -> OP_WATCH_ACK, with this process's own key pair.
+    let sender_public = get_or_create_local_ecdh_keypair();
+    let stream_key = [42u8; 32];
+    let wrapped = encrypt_signaling_payload(&pair_key(&viewer_public, sender_uid, viewer_uid, cid).unwrap(), &stream_key).unwrap();
+    let opened = decrypt_signaling_payload(&watch_pair_key(&sender_public, viewer_uid, sender_uid, cid), &wrapped);
+    println!("watch key fingerprint: {fingerprint}");
+    println!("watch key differs from this process's sender key: {}", viewer_public != sender_public);
+    println!("stream key wrapped by the sender opens with the watch key: {}", opened.as_deref() == Some(&stream_key[..]));
+    println!("same key on a second call: {}", watch_public_key() == viewer_public);
+}
+
+/// `--watch-note`: when the viewer's "no answer" note is due (takes about 9 s).
+fn watch_note_check() {
+    use litecord::screen_capture::watch::{answered, asked, stopped_asking, unanswered, video_arrived};
+    let wait = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
+    let (quiet, refusing) = (7u64, 9u64);
+    asked(quiet);
+    asked(refusing);
+    println!("just asked: {:?}", unanswered());
+    wait(2000);
+    answered(quiet);
+    asked(quiet);
+    asked(refusing);
+    println!("after 2 s, one of them answered: {:?}", unanswered());
+    wait(2200);
+    asked(refusing);
+    println!("after 4.2 s: {:?} (the one that never answered)", unanswered());
+    video_arrived(refusing);
+    println!("its video arrived: {:?}", unanswered());
+    stopped_asking(refusing);
+    asked(refusing);
+    println!("stopped and asked again: {:?}", unanswered());
+    stopped_asking(quiet);
+    asked(quiet);
+    wait(4200);
+    println!("4.2 s later, both asked again and silent: {:?}", unanswered());
+    stopped_asking(refusing);
+    println!("the user stopped watching one: {:?}", unanswered());
+    stopped_asking(quiet);
+    println!("and the other: {:?}", unanswered());
+}
+
 fn main() {
+    if std::env::args().any(|a| a == "--watch-key") {
+        watch_key_check();
+        return;
+    }
+    if std::env::args().any(|a| a == "--watch-note") {
+        watch_note_check();
+        return;
+    }
     println!("============================================================");
     println!("🔒 TESTANDO NEGOCIAÇÃO X25519 ECDH + AES-256-GCM NO LITECORD");
     println!("============================================================");

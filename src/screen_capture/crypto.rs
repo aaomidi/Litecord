@@ -35,6 +35,88 @@ pub fn pair_key(peer_public: &[u8; 32], my_uid: u64, peer_uid: u64, cid: u64) ->
     Some(pair_key_from(secret.as_ref()?, peer_public, my_uid, peer_uid, cid))
 }
 
+/// The key pair this user watches streams with: the public half goes out in every
+/// OP_WATCH, the secret opens the stream keys senders hand back. A sender binds a user id
+/// to the first watch key it sees for as long as its stream lasts, so a key made anew at
+/// each start locked a restarted viewer out until the sender restarted the share.
+static WATCH_KEY: Mutex<Option<(StaticSecret, [u8; 32])>> = Mutex::new(None);
+
+fn watch_key() -> (StaticSecret, [u8; 32]) {
+    let mut lock = WATCH_KEY.lock().unwrap_or_else(|e| e.into_inner());
+    lock.get_or_insert_with(|| {
+        #[cfg(target_os = "linux")]
+        let kept = session_watch_secret();
+        #[cfg(not(target_os = "linux"))]
+        let kept: Option<[u8; 32]> = None;
+        let secret = StaticSecret::from(kept.unwrap_or_else(rand::random::<[u8; 32]>));
+        let public = *PublicKey::from(&secret).as_bytes();
+        (secret, public)
+    })
+    .clone()
+}
+
+pub fn watch_public_key() -> [u8; 32] {
+    watch_key().1
+}
+
+/// `pair_key` for the viewer's side: with the watch key instead of this process's own.
+pub fn watch_pair_key(sender_public: &[u8; 32], my_uid: u64, sender_uid: u64, cid: u64) -> [u8; 32] {
+    pair_key_from(&watch_key().0, sender_public, my_uid, sender_uid, cid)
+}
+
+/// The watch secret of this login session, kept in a file under $XDG_RUNTIME_DIR (a tmpfs:
+/// never on disk, wiped at logout and reboot). `None` (no such directory, something not
+/// ours or open to others in the way, a file that is not a key) leaves the key in memory.
+// Trade-off: until logout the secret that opens the stream keys handed to this user sits in a file instead of only in
+// this process, so any program running as this user can read it and open (or ask for) the streams this user may watch.
+#[cfg(target_os = "linux")]
+fn session_watch_secret() -> Option<[u8; 32]> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    let found = (|| {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty())?;
+        let dir = std::path::Path::new(&runtime).join("litecord");
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+        let me = unsafe { libc::getuid() };
+        let private = |m: &std::fs::Metadata| m.uid() == me && m.mode() & 0o077 == 0;
+        // Not followed if it is a link: only a real directory and file of ours count.
+        if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir() && private(&m)) {
+            return None;
+        }
+        let path = dir.join("watch-key");
+        let read = || {
+            let meta = std::fs::symlink_metadata(&path).ok()?;
+            let bytes = if meta.is_file() && private(&meta) { std::fs::read(&path).ok()? } else { return None };
+            <[u8; 32]>::try_from(bytes.as_slice()).ok().map(|key| (key, "reutilizada"))
+        };
+        if std::fs::symlink_metadata(&path).is_ok() {
+            return read();
+        }
+        // Written whole under another name and then linked into place: nobody reads half
+        // a key, and of two instances starting together both use the one that got there first.
+        let secret: [u8; 32] = rand::random();
+        let tmp = dir.join(format!("watch-key.{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let linked = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .and_then(|mut f| f.write_all(&secret).and_then(|_| f.sync_all()))
+            .and_then(|_| std::fs::hard_link(&tmp, &path));
+        let _ = std::fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => Some((secret, "criada")),
+            Err(_) => read(),
+        }
+    })();
+    match found {
+        Some((_, how)) => log::info!("🔑 [ASSISTIR SOB DEMANDA] Chave de espectador desta sessão de login {}.", how),
+        None => log::warn!("🔑 [ASSISTIR SOB DEMANDA] Chave de espectador só na memória (sem diretório de sessão utilizável ou com um arquivo de chave inválido): reiniciar o Litecord durante uma transmissão exige reiniciar o compartilhamento."),
+    }
+    found.map(|(key, _)| key)
+}
+
 fn pair_key_from(secret: &StaticSecret, peer_public: &[u8; 32], uid_a: u64, uid_b: u64, cid: u64) -> [u8; 32] {
     let shared = secret.diffie_hellman(&PublicKey::from(*peer_public));
     let mut hasher = Sha256::new();

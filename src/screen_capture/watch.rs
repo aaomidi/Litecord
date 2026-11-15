@@ -18,6 +18,9 @@ pub const LEASE: Duration = Duration::from_secs(4);
 pub const RENEW_EVERY: Duration = Duration::from_secs(1);
 /// Loss reports older than this no longer count for the bitrate.
 const LOSS_REPORT_AGE: Duration = Duration::from_secs(3);
+/// OP_WATCH capability bit 0: the viewer decodes the H.264 Main streams of the VA-API
+/// sender (CABAC, pic_order_cnt_type 0) correctly and without added delay.
+pub const CAP_H264_MAIN: u8 = 0x01;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
@@ -221,6 +224,7 @@ static LAST_VIDEO: Mutex<Option<HashMap<u64, Instant>>> = Mutex::new(None);
 
 pub fn video_arrived(uid: u64) {
     LAST_VIDEO.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(uid, Instant::now());
+    answered(uid);
 }
 
 /// The sender is provably still streaming to us (its video arrived in the last 2.5 s):
@@ -281,6 +285,42 @@ pub fn forget_stream(uid: u64) {
     if let Some(m) = STREAM_KEYS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         m.remove(&uid);
     }
+}
+
+/// Asking this long without the sender answering is worth telling the user: a sender that
+/// refuses a request (not in its channel, another key bound to this user id) or cannot be
+/// reached says nothing at all.
+const UNANSWERED_AFTER: Duration = Duration::from_secs(4);
+
+/// The streams being asked for: since when, and whether their sender answered since.
+static ASKING: Mutex<Option<HashMap<u64, (Instant, bool)>>> = Mutex::new(None);
+
+/// A watch request for `uid` went out.
+pub fn asked(uid: u64) {
+    ASKING.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(uid).or_insert((Instant::now(), false));
+}
+
+/// No more requests for `uid` (the user stopped watching, the stream ended, the call was left).
+pub fn stopped_asking(uid: u64) {
+    if let Some(m) = ASKING.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.remove(&uid);
+    }
+}
+
+/// `uid` answered a request: its stream key or its video arrived.
+pub fn answered(uid: u64) {
+    if let Some(e) = ASKING.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|m| m.get_mut(&uid)) {
+        e.1 = true;
+    }
+}
+
+/// The streams asked for since `UNANSWERED_AFTER` whose sender never answered, in id order
+/// (the UI says so on each one's card).
+pub fn unanswered() -> Vec<u64> {
+    let asking = ASKING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut uids: Vec<u64> = asking.iter().flatten().filter(|(_, (since, answered))| !answered && since.elapsed() >= UNANSWERED_AFTER).map(|(&uid, _)| uid).collect();
+    uids.sort_unstable();
+    uids
 }
 
 #[cfg(test)]
