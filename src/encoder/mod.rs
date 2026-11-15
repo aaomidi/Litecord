@@ -121,6 +121,12 @@ pub fn detect_gpu_hardware() -> GpuHardwareType {
     GpuHardwareType::SoftwareOnly
 }
 
+/// To be called right before `std::process::exit` (see `vaapi::before_exit`).
+pub fn before_exit() {
+    #[cfg(all(target_os = "linux", feature = "vaapi"))]
+    vaapi::before_exit();
+}
+
 /// Cria a melhor instância de codificador de vídeo disponível para a plataforma
 pub fn create_best_encoder(target_fps: u32, is_screen_content: bool) -> Box<dyn VideoEncoder> {
     info!("🔍 [VIDEO CODEC FACTORY] Avaliando melhor engine de codificação para o sistema...");
@@ -142,6 +148,12 @@ pub fn create_best_encoder(target_fps: u32, is_screen_content: bool) -> Box<dyn 
     if manual_selection != "auto" {
         info!("🎯 [VIDEO CODEC FACTORY] Codificador manual configurado pelo usuário: '{}'", manual_selection);
         match manual_selection {
+            // The FFmpeg loader only knows h264_nvenc and writes AVCodecContext fields at
+            // fixed offsets: on Linux it is not loaded without NVENC on the machine.
+            #[cfg(target_os = "linux")]
+            "nvenc" | "ffmpeg" if detect_gpu_hardware() != GpuHardwareType::NvidiaNvenc => {
+                warn!("⚠️ [VIDEO CODEC FACTORY] NVENC manual: sem NVENC neste sistema, FFmpeg não será carregado; executando detecção automática...");
+            }
             "nvenc" | "ffmpeg" => {
                 match nvenc::FfmpegNvencEncoder::try_new(target_fps, is_screen_content) {
                     Ok(enc) => {
@@ -185,9 +197,12 @@ pub fn create_best_encoder(target_fps: u32, is_screen_content: bool) -> Box<dyn 
             }
             "openh264" => {
                 info!("🎯 [VIDEO CODEC FACTORY] Inicializando Cisco OpenH264 CPU manual...");
-                if let Ok(enc) = OpenH264Encoder::new(target_fps, is_screen_content) {
-                    info!("🚀 [VIDEO CODEC FACTORY] Cisco OpenH264 CPU manual ativado com sucesso!");
-                    return Box::new(enc);
+                match OpenH264Encoder::new(target_fps, is_screen_content) {
+                    Ok(enc) => {
+                        info!("🚀 [VIDEO CODEC FACTORY] Cisco OpenH264 CPU manual ativado com sucesso!");
+                        return Box::new(enc);
+                    }
+                    Err(e) => warn!("⚠️ [VIDEO CODEC FACTORY] OpenH264 CPU manual falhou ({}), tentando novamente...", e),
                 }
             }
             _ => {}
@@ -224,8 +239,9 @@ pub fn create_best_encoder(target_fps: u32, is_screen_content: bool) -> Box<dyn 
         }
     }
 
+    // The CPU choice stays on the CPU: no GPU engine is tried (or loaded) after it.
     #[cfg(target_os = "linux")]
-    {
+    if manual_selection != "openh264" {
         let hw = detect_gpu_hardware();
         info!("🎯 [VIDEO CODEC FACTORY] Hardware detectado no sistema: {:?}", hw);
 

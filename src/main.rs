@@ -418,6 +418,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !restore {
                     #[cfg(target_os = "linux")]
                     screen_capture::kill_portal_child();
+                    encoder::before_exit();
                     std::process::exit(0);
                 }
 
@@ -4442,6 +4443,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sm_for_close.stop();
         #[cfg(target_os = "linux")]
         screen_capture::kill_portal_child();
+        encoder::before_exit();
         std::process::exit(0);
     });
 

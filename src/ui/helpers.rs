@@ -373,12 +373,6 @@ pub fn populate_video_interface_settings(ui: &AppWindow) {
             is_selected: enc == "auto",
         },
         SettingOptionItem {
-            id: "vaapi".into(),
-            name: "VA-API (GPU)".into(),
-            desc: "Codificação H.264 pela GPU AMD / Intel via GStreamer VA-API.".into(),
-            is_selected: enc == "vaapi",
-        },
-        SettingOptionItem {
             id: "nvenc".into(),
             name: "NVIDIA NVENC".into(),
             desc: "Codificação acelerada por hardware via GPU NVIDIA GeForce / RTX.".into(),
@@ -397,6 +391,18 @@ pub fn populate_video_interface_settings(ui: &AppWindow) {
             is_selected: enc == "openh264",
         },
     ];
+    // Right after "auto"; only in builds that have the encoder.
+    #[cfg(all(target_os = "linux", feature = "vaapi"))]
+    let enc_items = {
+        let mut items = enc_items;
+        items.insert(1, SettingOptionItem {
+            id: "vaapi".into(),
+            name: "VA-API (GPU)".into(),
+            desc: "Codificação H.264 pela GPU AMD / Intel via GStreamer VA-API.".into(),
+            is_selected: enc == "vaapi",
+        });
+        items
+    };
 
     #[cfg(target_os = "windows")]
     let vcap_items = vec![

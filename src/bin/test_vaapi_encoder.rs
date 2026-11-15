@@ -9,7 +9,9 @@ fn main() {
 
 #[cfg(all(target_os = "linux", feature = "vaapi"))]
 fn main() {
-    std::process::exit(harness::run());
+    let code = harness::run();
+    litecord::encoder::before_exit();
+    std::process::exit(code);
 }
 
 #[cfg(all(target_os = "linux", feature = "vaapi"))]
@@ -43,10 +45,12 @@ test_vaapi_encoder [options]
   --keyframes K    2s (default: like Litecord, every 2 s) | none | every:N | FRAME,FRAME,...
   --gaps SPEC      FRAME:MS,... sleep MS before those frames
   --resize SPEC    FRAME:SIZE,... change the picture size from those frames on
-  --fail MODE      init | after:N | stall:N  (sets LITECORD_VAAPI_TEST_FAIL: break the VA path
-                   at construction, from GPU frame N on at once, or with real timeouts)
-  --enc-props STR  extra vah264enc properties (sets LITECORD_VAAPI_ENC_PROPS), experiments only
+  --fail MODE      init | after:N[:COUNT[:EVERY]] | stall:N[:COUNT[:EVERY]]  (sets
+                   LITECORD_VAAPI_TEST_FAIL: break the VA path at construction, from GPU frame
+                   N on at once, or with real timeouts; for good, or COUNT frames, one in EVERY)
   --max-none N     encode() calls allowed to return None (default 0)
+  --exit-race US   at the end, drop the encoder on another thread and exit US microseconds
+                   later, like the app quitting during a stream (a hang is the failure)
   --dump FILE      write the Annex B stream
   --no-verify      skip decoding and parsing (timing runs)
   --psnr           also report the PSNR of what the receiver shows against the input
@@ -170,7 +174,7 @@ Exit status 1 when a hard check fails, 2 when the encoder cannot be created.";
         fn text_line(&mut self, x: usize, y: usize, x_end: usize, scale: usize, bgr: [u8; 3], rng: &mut Rng) {
             let advance = 6 * scale + scale / 2;
             let mut cx = x;
-            let stop = x + (x_end - x) * (40 + rng.below(60) as usize) / 100;
+            let stop = x + x_end.saturating_sub(x) * (40 + rng.below(60) as usize) / 100;
             while cx + advance < stop {
                 for _ in 0..2 + rng.below(8) {
                     if cx + advance >= stop {
@@ -461,8 +465,8 @@ Exit status 1 when a hard check fails, 2 when the encoder cannot be created.";
                         if sps.profile_idc != 66 || sps.constraint_flags & 0x40 == 0 {
                             fails.add(n, format!("not Constrained Baseline: profile_idc={} flags={:#04x}", sps.profile_idc, sps.constraint_flags));
                         }
-                        if hardware && sps.colour != Some((false, Some((6, 6, 6)))) {
-                            fails.add(n, format!("SPS colours {:?}, expected limited range 6/6/6", sps.colour));
+                        if hardware && sps.colour != Some((false, Some((1, 1, 6)))) {
+                            fails.add(n, format!("SPS colours {:?}, expected limited range 1/1/6", sps.colour));
                         }
                         if matches!(sps.colour, Some((true, _)) | Some((_, Some((_, _, 1))))) {
                             fails.add(n, format!("SPS declares full range or BT.709: {:?}", sps.colour));
@@ -686,9 +690,6 @@ Exit status 1 when a hard check fails, 2 when the encoder cannot be created.";
         let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).try_init();
         if let Some(mode) = args.0.get("fail") {
             std::env::set_var("LITECORD_VAAPI_TEST_FAIL", mode);
-        }
-        if let Some(props) = args.0.get("enc-props") {
-            std::env::set_var("LITECORD_VAAPI_ENC_PROPS", props);
         }
         let kind = args.str("encoder", "vaapi");
         let mut size = parse_size(&args.str("size", "1080"))?;
@@ -930,7 +931,14 @@ Exit status 1 when a hard check fails, 2 when the encoder cannot be created.";
             colour_check(&kind, (size.0 & !1, size.1 & !1), fps, &mut fails);
         }
         let t_drop = Instant::now();
-        drop(enc);
+        match args.0.get("exit-race") {
+            Some(us) => {
+                let us = us.parse().map_err(|_| format!("--exit-race: not a number: {us}"))?;
+                std::thread::spawn(move || drop(enc));
+                std::thread::sleep(Duration::from_micros(us));
+            }
+            None => drop(enc),
+        }
         // Only true when something in this process called gst::init.
         let gst_up = unsafe { gstreamer::ffi::gst_is_initialized() } != 0;
         println!("\ndrop took {:.1} ms; GStreamer initialised in this process: {gst_up}", t_drop.elapsed().as_secs_f64() * 1000.0);

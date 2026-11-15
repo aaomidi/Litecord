@@ -6,60 +6,99 @@
 //! - Constrained Baseline only: with Main/High the encoder's picture order counts make the
 //!   OpenH264 receiver show about three pictures per keyframe.
 //! - BT.601 limited range (vapostproc picks BT.709 at 1080p by itself), declared in the SPS
-//!   by `h264_vui::declare_colour` since vah264enc writes no colour description. The caps
+//!   by `h264_vui::declare_colour` since vah264enc writes no colour description: matrix 6
+//!   (what every receiver converts with) with the desktop's own primaries and transfer (1),
+//!   as the FFmpeg path intends, so colour-managed browsers do not re-map them. The caps
 //!   on both sides of vapostproc name the same transfer function (sRGB): asked for BT.709's
 //!   on its output, radeonsi re-curves the picture (grey 128 comes back as 135).
 //! - One access unit per frame with no delay. vah264enc holds four frames back unless its
 //!   source is live, so whatever feeds this pipeline must be a live source.
 //!
 //! When the GPU path stops answering mid-stream, the encoder switches itself to OpenH264
-//! for the rest of the stream: nothing else would replace it.
+//! (nothing else would replace it) and tries the GPU again later.
 
 use super::{OpenH264Encoder, VideoEncoder};
+use crate::screen_capture::hw_decode::h264_state::nal_ranges;
 use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use log::{info, warn};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Preferred first; `vah264lpenc` is the only one Intel's low-power encoders register.
 const ENCODER_ELEMENTS: [&str; 2] = ["vah264enc", "vah264lpenc"];
 /// Streams start at this rate (types::REQUESTED_BITRATE_BPS).
 const INITIAL_BITRATE_BPS: u32 = 8_000_000;
-/// A new pipeline creates the VA context and compiles the conversion on its first frame.
-const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(1000);
+const PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
+/// A new pipeline creates the VA context on its first frame (measured: 16-82 ms at 1080p).
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(400);
 const FRAME_TIMEOUT: Duration = Duration::from_millis(100);
-/// Failed frames in a row before the stream goes to OpenH264 (viewers drop a stream after
-/// 2.5 s without pictures).
-const MAX_FAILURES: u32 = 3;
+/// Time without a picture before the stream goes to OpenH264. Viewers drop a stream after
+/// 2.5 s; a GPU hiccup shorter than this only costs the frames it lasted and a keyframe.
+const STALL_BUDGET: Duration = Duration::from_millis(1000);
+/// Every separate loss costs a keyframe: more than this many within `LOSS_WINDOW` also
+/// send the stream to OpenH264.
+const MAX_LOSSES: u32 = 10;
+const LOSS_WINDOW: Duration = Duration::from_secs(10);
+/// On OpenH264, the GPU is tried again after this long (on a keyframe the caller asks
+/// for); the wait doubles with every attempt, up to `GPU_RETRY_MAX`.
+const GPU_RETRY_AFTER: Duration = Duration::from_secs(30);
+const GPU_RETRY_MAX: Duration = Duration::from_secs(480);
 /// vah264enc starts a new sequence (an IDR) whenever its bitrate changes, so a new rate
 /// waits for the next keyframe the caller asks for (at least every 2 s), up to this long.
 const BITRATE_MAX_WAIT: Duration = Duration::from_millis(3000);
+const TEARDOWN_WAIT: Duration = Duration::from_millis(300);
 const PROBE_SIZE: (u32, u32) = (640, 360);
 
 /// Test hook: `LITECORD_VAAPI_TEST_FAIL=init` fails construction, `after:N` makes every GPU
-/// frame from the Nth on fail at once, `stall:N` makes them time out for real.
+/// frame from the Nth on fail at once, `stall:N` makes them time out for real. Two more
+/// numbers (`stall:N:COUNT:EVERY`) limit it to COUNT frames, one in EVERY: GPU hiccups.
 #[derive(Clone, Copy, PartialEq)]
 enum TestFail {
     None,
     Init,
-    After(u64),
-    Stall(u64),
+    After,
+    Stall,
 }
 
-fn test_fail() -> TestFail {
-    let Ok(v) = std::env::var("LITECORD_VAAPI_TEST_FAIL") else { return TestFail::None };
-    let n = |s: &str| s.parse::<u64>().unwrap_or(0);
-    match v.split_once(':') {
-        Some(("after", s)) => TestFail::After(n(s)),
-        Some(("stall", s)) => TestFail::Stall(n(s)),
-        _ if v == "init" => TestFail::Init,
-        _ => TestFail::None,
+struct TestHook {
+    fail: TestFail,
+    from: u64,
+    left: u64,
+    every: u64,
+    calls: u64,
+}
+
+impl TestHook {
+    fn from_env() -> Self {
+        let v = std::env::var("LITECORD_VAAPI_TEST_FAIL").unwrap_or_default();
+        let mut parts = v.split(':');
+        let fail = match parts.next() {
+            Some("init") => TestFail::Init,
+            Some("after") => TestFail::After,
+            Some("stall") => TestFail::Stall,
+            _ => TestFail::None,
+        };
+        let mut number = |default: u64| parts.next().and_then(|s| s.parse().ok()).unwrap_or(default);
+        Self { fail, from: number(0), left: number(u64::MAX), every: number(1).max(1), calls: 0 }
+    }
+
+    /// The failure to simulate for the next GPU frame, if any.
+    fn next(&mut self, gpu_frames: u64) -> TestFail {
+        if self.fail == TestFail::None || gpu_frames < self.from || self.left == 0 {
+            return TestFail::None;
+        }
+        self.calls += 1;
+        if (self.calls - 1) % self.every != 0 {
+            return TestFail::None;
+        }
+        self.left -= 1;
+        self.fail
     }
 }
-
-use crate::screen_capture::hw_decode::h264_state::nal_ranges;
 
 /// The access unit without filler data NAL units (type 12): in CBR mode radeonsi pads
 /// every picture smaller than the frame budget with them, megabits of nothing on a still
@@ -81,6 +120,30 @@ fn without_filler(au: Vec<u8>) -> Vec<u8> {
     out
 }
 
+/// Pipelines being stopped right now, and whether the process is about to exit. Mesa's VA
+/// driver deadlocks when `exit()` runs while another thread closes a VA display (its exit
+/// handler joins the driver threads the closing thread waits for).
+static TEARDOWNS: AtomicUsize = AtomicUsize::new(0);
+static EXITING: AtomicBool = AtomicBool::new(false);
+
+struct Teardown;
+
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        TEARDOWNS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// To be called right before `std::process::exit`: pipelines still running are left to the
+/// system from now on, and one being stopped gets a moment to finish.
+pub fn before_exit() {
+    EXITING.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while TEARDOWNS.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// The pipeline from colour conversion to the encoded access units. The bitrate, keyframe
 /// requests and the output only touch this part, so the frame source can be replaced.
 struct EncodeChain {
@@ -88,6 +151,10 @@ struct EncodeChain {
     bus: gst::Bus,
     encoder: gst::Element,
     sink: gst_app::AppSink,
+    /// How long dropping this waits for the pipeline to stop.
+    teardown_wait: Duration,
+    /// Set while it stops. Last field: released after the pipeline.
+    teardown: Option<Arc<Teardown>>,
 }
 
 enum PullError {
@@ -96,17 +163,14 @@ enum PullError {
 }
 
 impl EncodeChain {
-    fn description(element: &str, bitrate_bps: u32) -> String {
-        // Experiments only: vah264enc properties (gst-launch syntax) replacing or joining ours.
-        let extra = std::env::var("LITECORD_VAAPI_ENC_PROPS").unwrap_or_default();
-        let key = |prop: &str| prop.split('=').next().unwrap_or("").to_string();
-        let props: Vec<&str> = ENCODER_PROPS.split_whitespace().filter(|p| !extra.split_whitespace().any(|e| key(e) == key(p))).collect();
+    /// The size is named after vapostproc: an encoder that cannot take it fails to
+    /// negotiate instead of getting a scaled picture.
+    fn description(element: &str, width: u32, height: u32, bitrate_bps: u32) -> String {
         format!(
-            "vapostproc ! video/x-raw(memory:VAMemory),format=NV12,colorimetry=(string)2:4:7:1 \
-             ! {element} name=enc {} bitrate={} cpb-size={} {extra} \
+            "vapostproc ! video/x-raw(memory:VAMemory),format=NV12,width={width},height={height},colorimetry=(string)2:4:7:1 \
+             ! {element} name=enc {ENCODER_PROPS} bitrate={} cpb-size={} \
              ! video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au \
              ! appsink name=sink sync=false async=false max-buffers=4 drop=false emit-signals=false enable-last-sample=false",
-            props.join(" "),
             bitrate_bps / 1000,
             cpb_size_kbit(bitrate_bps)
         )
@@ -116,22 +180,25 @@ impl EncodeChain {
         let bus = pipeline.bus().ok_or("pipeline without bus")?;
         let encoder = pipeline.by_name("enc").ok_or("encoder element missing")?;
         let sink = pipeline.by_name("sink").and_then(|e| e.downcast::<gst_app::AppSink>().ok()).ok_or("appsink missing")?;
-        Ok(Self { pipeline, bus, encoder, sink })
+        Ok(Self { pipeline, bus, encoder, sink, teardown_wait: TEARDOWN_WAIT, teardown: None })
     }
 
     /// Takes effect on the next frame, which the encoder turns into an IDR.
     fn set_bitrate(&self, bitrate_bps: u32) {
         for (name, value) in [("bitrate", bitrate_bps / 1000), ("cpb-size", cpb_size_kbit(bitrate_bps))] {
-            // set_property panics on a missing property or another type.
-            if self.encoder.find_property(name).map(|p| p.value_type() == u32::static_type()).unwrap_or(false) {
-                self.encoder.set_property(name, value);
+            // set_property panics on a missing property, another type or a value out of range.
+            if let Some(spec) = self.encoder.find_property(name) {
+                if let Some(range) = spec.downcast_ref::<gst::glib::ParamSpecUInt>() {
+                    self.encoder.set_property(name, value.clamp(range.minimum(), range.maximum()));
+                }
             }
         }
     }
 
-    /// The next frame entering the encoder becomes an IDR with SPS and PPS.
-    fn request_keyframe(&self) -> bool {
-        self.sink.send_event(gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build())
+    /// The frame stamped `pts` becomes an IDR with SPS and PPS; not an earlier one that is
+    /// still on its way to the encoder (given up on, its output is thrown away).
+    fn request_keyframe(&self, pts: gst::ClockTime) -> bool {
+        self.sink.send_event(gst_video::UpstreamForceKeyUnitEvent::builder().running_time(pts).all_headers(true).build())
     }
 
     fn bus_error(&self) -> Option<String> {
@@ -181,15 +248,35 @@ impl EncodeChain {
 
 impl Drop for EncodeChain {
     fn drop(&mut self) {
-        // Stopping waits for the streaming thread; if that one hangs in the driver (the
-        // reason this pipeline is being dropped, perhaps), the stream thread must not hang too.
+        let teardown = Arc::new(Teardown);
+        TEARDOWNS.fetch_add(1, Ordering::SeqCst);
+        if EXITING.load(Ordering::SeqCst) {
+            // Never closed: the process is exiting (see `before_exit`).
+            std::mem::forget(self.pipeline.clone());
+            return;
+        }
+        self.teardown = Some(teardown.clone());
+        // Stopping waits for the streaming thread. Should that one hang in the driver (the
+        // reason for this drop, perhaps), the stream thread only waits a moment and leaves
+        // the rest to the helper thread.
         let pipeline = self.pipeline.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         let stop = move || {
             let _ = pipeline.set_state(gst::State::Null);
+            // Released first: when the stream thread waited, the VA display closes there,
+            // before the drop returns.
+            drop((pipeline, teardown));
+            let _ = done_tx.send(());
         };
-        if let Err(e) = std::thread::Builder::new().name("vaapi-teardown".into()).spawn(stop) {
-            warn!("⚠️ [VAAPI] Não foi possível encerrar o pipeline em segundo plano: {}", e);
-            let _ = self.pipeline.set_state(gst::State::Null);
+        match std::thread::Builder::new().name("vaapi-teardown".into()).spawn(stop) {
+            Ok(_) => {
+                if done_rx.recv_timeout(self.teardown_wait).is_err() && !self.teardown_wait.is_zero() {
+                    warn!("⚠️ [VAAPI] O pipeline não parou em {} ms; segue encerrando em segundo plano", self.teardown_wait.as_millis());
+                }
+            }
+            Err(_) => {
+                let _ = self.pipeline.set_state(gst::State::Null);
+            }
         }
     }
 }
@@ -208,13 +295,17 @@ impl Drop for EncodeChain {
 ///   300-440 kB (OpenH264: 170-190 kB, at lower quality in both keyframes and P pictures);
 ///   each 2 steps of QP are worth about 10% of the size.
 /// - `cpb-size` (see `cpb_size_kbit`) caps a keyframe at half a second of the bitrate.
-/// - `target-usage=3` encodes a 1080p frame in 8 ms where the default (4) takes 12.5 ms,
-///   at the same sizes and quality.
+/// - `max-qp=44` is for the pictures the rate control starves: the first keyframe of a
+///   pipeline (25-26 dB instead of 21-25 on an IDE screen) and every keyframe of dense text
+///   at 3 Mbps (21 dB instead of 15-19). Its price is paid on that last content only:
+///   keyframes pass the cap by 12% and the stream its target by 12% at 30 FPS, 24% at 60
+///   (5% and 12% without the bound). `max-qp=42` tripled the excess for 1.5 dB more.
 const ENCODER_PROPS: &str =
-    "rate-control=cbr min-qp=30 target-usage=3 key-int-max=1024 b-frames=0 i-frames=0 ref-frames=1 num-slices=1 aud=false cc-insert=false";
+    "rate-control=cbr min-qp=30 max-qp=44 target-usage=3 key-int-max=1024 b-frames=0 i-frames=0 ref-frames=1 num-slices=1 aud=false cc-insert=false";
 
 /// The smallest buffer vah264enc accepts (half a second of the bitrate; smaller values are
-/// silently replaced by two seconds). A keyframe never came out larger than it.
+/// silently replaced by two seconds). Not a hard limit: keyframes came out up to 3% larger
+/// than it, 12% where `max-qp` holds the quality up.
 fn cpb_size_kbit(bitrate_bps: u32) -> u32 {
     (bitrate_bps / 1000).div_ceil(2)
 }
@@ -285,7 +376,7 @@ struct Session {
 
 impl Session {
     fn start(element: &str, width: u32, height: u32, fps: u32, bitrate_bps: u32) -> Result<Self, String> {
-        let description = format!("{} ! {}", MemorySource::description(width, height, fps), EncodeChain::description(element, bitrate_bps));
+        let description = format!("{} ! {}", MemorySource::description(width, height, fps), EncodeChain::description(element, width, height, bitrate_bps));
         let pipeline = gst::parse::launch(&description)
             .map_err(|e| e.to_string())?
             .downcast::<gst::Pipeline>()
@@ -308,22 +399,30 @@ pub struct VaapiEncoder {
     bitrate_bps: u32,
     bitrate_asked_at: Instant,
     needs_keyframe: bool,
+    /// A picture was lost on the way: viewers can only go on from a keyframe.
+    lost_picture: bool,
     session: Option<Session>,
     /// Timestamps come from this clock: calls arrive at any pace, with gaps of any length.
     clock: Instant,
     last_pts_ns: u64,
     gpu_frames: u64,
-    failures: u32,
+    /// Start of the first of the failed calls in a row.
+    failing_since: Option<Instant>,
+    /// Separate losses since `loss_window`.
+    losses: u32,
+    loss_window: Instant,
     software: Option<OpenH264Encoder>,
-    test_fail: TestFail,
+    software_since: Instant,
+    gpu_retry_after: Duration,
+    test: TestHook,
 }
 
 impl VaapiEncoder {
     /// Fails unless this machine really encodes Constrained Baseline through VA-API: the
     /// caller can only choose another encoder now, not once the stream runs.
     pub fn try_new(target_fps: u32, is_screen_content: bool) -> Result<Self, String> {
-        let test_fail = test_fail();
-        if test_fail == TestFail::Init {
+        let test = TestHook::from_env();
+        if test.fail == TestFail::Init {
             return Err("falha simulada (LITECORD_VAAPI_TEST_FAIL=init)".into());
         }
         gst::init().map_err(|e| format!("GStreamer: {e}"))?;
@@ -345,13 +444,18 @@ impl VaapiEncoder {
                         bitrate_bps: INITIAL_BITRATE_BPS,
                         bitrate_asked_at: Instant::now(),
                         needs_keyframe: false,
+                        lost_picture: false,
                         session: None,
                         clock: Instant::now(),
                         last_pts_ns: 0,
                         gpu_frames: 0,
-                        failures: 0,
+                        failing_since: None,
+                        losses: 0,
+                        loss_window: Instant::now(),
                         software: None,
-                        test_fail,
+                        software_since: Instant::now(),
+                        gpu_retry_after: GPU_RETRY_AFTER,
+                        test,
                     });
                 }
                 Err(e) => last_error = format!("{element}: {e}"),
@@ -367,7 +471,7 @@ impl VaapiEncoder {
         let session = Session::start(element, w, h, fps, INITIAL_BITRATE_BPS)?;
         let frame = vec![0u8; (w * h * 4) as usize];
         session.source.push(&frame, w as usize, h as usize, (w * 4) as usize, gst::ClockTime::ZERO)?;
-        let au = match session.chain.pull(gst::ClockTime::ZERO, FIRST_FRAME_TIMEOUT) {
+        let au = match session.chain.pull(gst::ClockTime::ZERO, PROBE_TIMEOUT) {
             Ok(au) => au,
             Err(PullError::Timeout) => return Err("sem resposta do codificador".into()),
             Err(PullError::Broken(e)) => return Err(e),
@@ -383,13 +487,12 @@ impl VaapiEncoder {
     }
 
     fn encode_on_gpu(&mut self, bgra: &[u8], w: u32, h: u32, stride: usize) -> Result<Vec<u8>, String> {
-        let stall = match self.test_fail {
-            TestFail::After(n) if self.gpu_frames >= n => return Err("falha simulada (LITECORD_VAAPI_TEST_FAIL=after)".into()),
-            TestFail::Stall(n) => self.gpu_frames >= n,
-            _ => false,
+        let stall = match self.test.next(self.gpu_frames) {
+            TestFail::After => return Err("falha simulada (LITECORD_VAAPI_TEST_FAIL=after)".into()),
+            fail => fail == TestFail::Stall,
         };
         if self.session.as_ref().map(|s| (s.width, s.height) != (w, h)).unwrap_or(true) {
-            // Dropped first: the old pipeline stops in the background while the new one starts.
+            // The old pipeline is stopped before the new one starts.
             self.session = None;
             let session = Session::start(self.element, w, h, self.target_fps, self.bitrate_bps)?;
             info!("🚀 [VAAPI] Pipeline {} iniciado: {}x{} {} FPS, {:.1} Mbps", self.element, w, h, self.target_fps, self.bitrate_bps as f64 / 1e6);
@@ -399,24 +502,29 @@ impl VaapiEncoder {
         }
         let pts = self.next_pts();
         let Some(session) = self.session.as_mut() else { return Err("sem pipeline".into()) };
+        let first = session.frames == 0;
 
         let rate_due = session.bitrate_bps != self.bitrate_bps && (self.needs_keyframe || self.bitrate_asked_at.elapsed() >= BITRATE_MAX_WAIT);
         if rate_due {
             session.chain.set_bitrate(self.bitrate_bps);
             session.bitrate_bps = self.bitrate_bps;
         }
-        let keyframe_expected = session.frames == 0 || rate_due || (self.needs_keyframe && session.chain.request_keyframe());
+        let keyframe_expected = first || rate_due || (self.needs_keyframe && session.chain.request_keyframe(pts));
 
         if !stall {
-            session.source.push(bgra, w as usize, h as usize, stride, pts)?;
+            if let Err(e) = session.source.push(bgra, w as usize, h as usize, stride, pts) {
+                self.session = None;
+                return Err(e);
+            }
         }
-        let timeout = if session.frames == 0 { FIRST_FRAME_TIMEOUT } else { FRAME_TIMEOUT };
+        let timeout = if first { FIRST_FRAME_TIMEOUT } else { FRAME_TIMEOUT };
         let au = match session.chain.pull(pts, timeout) {
             Ok(au) => au,
             Err(PullError::Timeout) => {
-                // The encoder may still have encoded this frame, which no viewer will get:
-                // the next one must not reference it.
+                // The encoder may still encode this frame, which no viewer will get: the
+                // next one must not reference it.
                 self.needs_keyframe = true;
+                self.lost_picture = true;
                 return Err(format!("sem resposta em {} ms", timeout.as_millis()));
             }
             Err(PullError::Broken(e)) => {
@@ -430,9 +538,16 @@ impl VaapiEncoder {
         let au = without_filler(au);
         if !matches!(au.as_slice(), [0, 0, 1, ..] | [0, 0, 0, 1, ..]) {
             self.needs_keyframe = true;
+            self.lost_picture = true;
             return Err("saída sem start code".into());
         }
         if !nal_ranges(&au).iter().any(|r| au[r.start] & 0x1f == 5) {
+            if first || self.lost_picture {
+                // Viewers do not have the picture this one was predicted from.
+                self.needs_keyframe = true;
+                self.lost_picture = true;
+                return Err("quadro P no lugar do keyframe".into());
+            }
             if keyframe_expected {
                 warn!("⚠️ [VAAPI] Keyframe pedido, mas o codificador devolveu um quadro P; pedindo de novo");
                 self.needs_keyframe = true;
@@ -440,22 +555,53 @@ impl VaapiEncoder {
             return Ok(au);
         }
         self.needs_keyframe = false;
-        Ok(super::h264_vui::declare_colour(&au, 6, 6, 6))
+        self.lost_picture = false;
+        Ok(super::h264_vui::declare_colour(&au, 1, 1, 6))
+    }
+
+    /// Drops the pipeline without waiting for it to stop: it is being given up on.
+    fn abandon_session(&mut self) {
+        if let Some(mut session) = self.session.take() {
+            session.chain.teardown_wait = Duration::ZERO;
+        }
     }
 
     fn switch_to_software(&mut self, reason: &str) {
-        warn!("⚠️ [VAAPI] {} falhas seguidas na GPU ({}); a transmissão continua com OpenH264 (CPU)", self.failures, reason);
-        self.session = None;
+        warn!(
+            "⚠️ [VAAPI] GPU sem entregar quadros ({}); a transmissão continua com OpenH264 (CPU), nova tentativa na GPU em {} s",
+            reason,
+            self.gpu_retry_after.as_secs()
+        );
+        self.abandon_session();
+        self.failing_since = None;
+        self.losses = 0;
         match OpenH264Encoder::new(self.target_fps, self.is_screen_content) {
             Ok(mut enc) => {
-                enc.set_bitrate_bps(self.bitrate_bps);
                 // Its first picture is a keyframe.
                 enc.force_intra_frame();
                 self.software = Some(enc);
+                self.software_since = Instant::now();
+            }
+            Err(e) => warn!("⚠️ [VAAPI] OpenH264 também falhou ({}); tentando a GPU de novo", e),
+        }
+    }
+
+    /// On OpenH264, with a keyframe due: one frame through a new GPU pipeline, which starts
+    /// with a keyframe too. The stream goes back to the GPU when it answers.
+    fn retry_gpu(&mut self, bgra: &[u8], w: u32, h: u32, stride: usize) -> Option<Vec<u8>> {
+        self.software_since = Instant::now();
+        self.gpu_retry_after = (self.gpu_retry_after * 2).min(GPU_RETRY_MAX);
+        match self.encode_on_gpu(bgra, w, h, stride) {
+            Ok(au) => {
+                info!("🚀 [VAAPI] A GPU voltou a responder; a transmissão volta para o VA-API");
+                self.software = None;
+                Some(au)
             }
             Err(e) => {
-                warn!("⚠️ [VAAPI] OpenH264 também falhou ({}); tentando a GPU de novo", e);
-                self.failures = 0;
+                warn!("⚠️ [VAAPI] GPU ainda indisponível ({}); nova tentativa em {} s", e, self.gpu_retry_after.as_secs());
+                self.abandon_session();
+                self.lost_picture = false;
+                None
             }
         }
     }
@@ -487,18 +633,40 @@ impl VideoEncoder for VaapiEncoder {
         if w == 0 || h == 0 || bgra_data.len() < stride * (h as usize - 1) + w as usize * 4 {
             return None;
         }
-        if let Some(software) = self.software.as_mut() {
+        if self.software.is_some() {
+            let keyframe_due = std::mem::take(&mut self.needs_keyframe);
+            if keyframe_due && self.software_since.elapsed() >= self.gpu_retry_after {
+                if let Some(au) = self.retry_gpu(bgra_data, w, h, stride) {
+                    return Some(au);
+                }
+            }
+            let software = self.software.as_mut()?;
+            // It ignores changes in its first 15 s: asked on every frame, like the send
+            // loop does with a plain OpenH264 encoder.
+            software.set_bitrate_bps(self.bitrate_bps);
             return software.encode(bgra_data, width, height);
         }
+        let started = Instant::now();
         match self.encode_on_gpu(bgra_data, w, h, stride) {
             Ok(au) => {
-                self.failures = 0;
+                self.failing_since = None;
                 Some(au)
             }
             Err(e) => {
-                self.failures += 1;
-                if self.failures < MAX_FAILURES {
-                    warn!("⚠️ [VAAPI] Quadro perdido na GPU ({}/{}): {}", self.failures, MAX_FAILURES, e);
+                let since = match self.failing_since {
+                    Some(since) => since,
+                    None => {
+                        if self.loss_window.elapsed() >= LOSS_WINDOW {
+                            self.loss_window = started;
+                            self.losses = 0;
+                        }
+                        self.losses += 1;
+                        self.failing_since = Some(started);
+                        warn!("⚠️ [VAAPI] Quadro perdido na GPU: {}", e);
+                        started
+                    }
+                };
+                if since.elapsed() < STALL_BUDGET && self.losses <= MAX_LOSSES {
                     return None;
                 }
                 self.switch_to_software(&e);
@@ -518,9 +686,6 @@ impl VideoEncoder for VaapiEncoder {
         if bitrate_bps != self.bitrate_bps {
             self.bitrate_bps = bitrate_bps;
             self.bitrate_asked_at = Instant::now();
-        }
-        if let Some(software) = self.software.as_mut() {
-            software.set_bitrate_bps(bitrate_bps);
         }
     }
 
