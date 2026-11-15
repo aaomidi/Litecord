@@ -208,6 +208,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let popout_window = PopoutStreamWindow::new()?;
     let popout_weak = popout_window.as_weak();
+    #[cfg(feature = "automation")]
+    automation::set_popout(&popout_window);
+    // Before either window draws its first frame: that is when a window finds out
+    // whether it can show received streams from the decoder's GPU buffers.
+    #[cfg(all(target_os = "linux", feature = "vaapi"))]
+    crate::ui::gl_video::install(&app, &popout_window);
     let popout_hwnd_store: Arc<Mutex<Option<isize>>> = Arc::new(Mutex::new(None));
 
     // Tell the stream decoder whether any window can show a stream, so nothing is decoded
@@ -609,6 +615,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let my_uid = gateway::get_my_user_id().to_string();
             let is_pop_self = uid == "self" || uid == my_uid;
             let cur_frame = if is_pop_self { ui.get_active_stream_frame() } else { ui.get_remote_stream_frame() };
+            // A picture shown from the GPU is a texture of the main window's own context (it
+            // has no pixels to give): the popout imports the picture itself before its
+            // first frame.
+            #[cfg(all(target_os = "linux", feature = "vaapi"))]
+            let cur_frame = if !is_pop_self && cur_frame.to_rgba8().is_none() { Image::default() } else { cur_frame };
             if let Some(pop_win) = pop_w_cb.upgrade() {
                 pop_win.set_user_id(uid.clone().into());
                 pop_win.set_username(if uname.is_empty() { ui.get_active_stream_user() } else { uname.into() });
@@ -925,7 +936,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let app_w = app_weak_rx.clone();
             let pop_w = pop_w_rx.clone();
             move |uid, uname, quality, pixel_buf| {
-                *latest_rx_frame_cb.lock().unwrap() = Some((uid, uname, quality, pixel_buf));
+                {
+                    // Linux: a 1x1 buffer only says the stream goes on (its pictures are
+                    // shown from the GPU); it does not replace a waiting picture.
+                    let mut slot = latest_rx_frame_cb.lock().unwrap();
+                    let no_picture = cfg!(all(target_os = "linux", feature = "vaapi")) && pixel_buf.width() <= 1;
+                    let waiting = slot.as_ref().is_some_and(|(id, _, _, buf)| *id == uid && buf.width() > 1);
+                    if !(no_picture && waiting) {
+                        *slot = Some((uid, uname, quality, pixel_buf));
+                    }
+                }
                 if !is_rx_ui_pending_cb.swap(true, Ordering::AcqRel) {
                     let app_w2 = app_w.clone();
                     let pop_w2 = pop_w.clone();
@@ -941,7 +961,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if screen_capture::is_stream_recently_stopped(uid) {
                                 return;
                             }
+                            #[cfg(feature = "automation")]
+                            automation::UI_FRAMES.fetch_add(1, Ordering::Relaxed);
                             let uid_str = uid.to_string();
+                            // Linux: a 1x1 buffer carries no picture (see above); the one on
+                            // screen stays.
+                            let no_picture = cfg!(all(target_os = "linux", feature = "vaapi")) && pixel_buf.width() <= 1;
                             let frame = Image::from_rgba8(pixel_buf);
                             let rx_fps = screen_capture::get_rx_fps();
                             let rx_fps_str = if rx_fps > 0.0 {
@@ -949,17 +974,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 "".to_string()
                             };
-                            // Next frames are converted at the largest size they are shown at.
-                            {
-                                let main_px = app_w2.upgrade().map(|ui| ui.window().size());
-                                let pop_px = pop_w2.upgrade().filter(|p| p.window().is_visible()).map(|p| p.window().size());
-                                let (mut vw, mut vh) = main_px.map(|s| (s.width, s.height)).unwrap_or((0, 0));
-                                if let Some(p) = pop_px {
-                                    vw = vw.max(p.width);
-                                    vh = vh.max(p.height);
-                                }
-                                screen_capture::set_stream_view_size(vw, vh);
-                            }
                             let mut should_update_pop = false;
                             if let Some(ui) = app_w2.upgrade() {
                                 let popped_uid = ui.get_popped_out_stream_uid().to_string();
@@ -970,7 +984,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ui.set_active_stream_user_id(uid_str.clone().into());
                                 ui.set_active_stream_user(uname.into());
                                 ui.set_tr_stream_quality(quality.into());
-                                ui.set_remote_stream_frame(frame.clone());
+                                if !no_picture {
+                                    let size = frame.size();
+                                    ui.set_remote_stream_exact(crate::ui::gpu_video::drawn_at_own_size(false, (size.width, size.height)));
+                                    ui.set_remote_stream_frame(frame.clone());
+                                }
                                 ui.set_remote_stream_fps(rx_fps_str.clone().into());
                                 if let Some(pop) = pop_w2.upgrade() {
                                     crate::ui::gpu_video::refresh(&ui, &pop);
@@ -991,7 +1009,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(pop) = pop_w2.upgrade() {
                                     let pop_uid = pop.get_user_id().to_string();
                                     if pop_uid == uid_str || pop_uid.is_empty() {
-                                        pop.set_stream_frame(frame);
+                                        if !no_picture {
+                                            let size = frame.size();
+                                            pop.set_stream_exact(crate::ui::gpu_video::drawn_at_own_size(true, (size.width, size.height)));
+                                            pop.set_stream_frame(frame);
+                                        }
                                         pop.set_stream_fps(rx_fps_str.into());
                                     }
                                 }

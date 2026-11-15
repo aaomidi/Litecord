@@ -1,6 +1,12 @@
 //! Linux backend: H.264 decoding on the GPU through GStreamer's VA-API elements (AMD, Intel).
 //!
 //!   access units -> vah264dec -> vapostproc (scaling and RGB, on the GPU) -> RGBx in memory
+//!                                                                      or -> RGB DMABuf
+//!
+//! The DMABuf form is used while the windows can draw it as it is (`gl_present`, GPU
+//! renderer on Wayland): the picture never leaves the GPU. One pipeline produces one form;
+//! when the windows stop taking DMABufs the stream waits for its next keyframe and a new
+//! pipeline returns pixels.
 //!
 //! One access unit goes in and its picture comes out of the same call. What that took, each
 //! found by running the elements against the streams Litecord senders make (radeonsi,
@@ -41,6 +47,7 @@ use gstreamer_video as gst_video;
 use gstreamer_video::VideoFrameExt;
 use slint::{Rgba8Pixel, SharedPixelBuffer};
 
+use super::gl_present;
 use super::h264_state::{nal_ranges, H264State, Parsed, StateError, StreamInfo};
 use super::HwError;
 
@@ -96,9 +103,17 @@ impl From<StateError> for HwError {
     }
 }
 
-/// A decoded picture at the size asked for, and the stream's own width and height.
+/// What a decoded picture comes back as, at the size asked for.
+pub enum Output {
+    /// Pixels in memory.
+    Rgba(SharedPixelBuffer<Rgba8Pixel>),
+    /// The GPU's own buffer (a `video/x-raw(memory:DMABuf)` sample, RGB).
+    Dmabuf(gst::Sample),
+}
+
+/// A decoded picture, and the stream's own width and height.
 pub struct Picture {
-    pub rgba: SharedPixelBuffer<Rgba8Pixel>,
+    pub output: Output,
     pub width: u32,
     pub height: u32,
 }
@@ -151,19 +166,26 @@ impl VaapiDecoder {
             return Err(HwError::Unsupported(format!("{} reference frames (at most {MAX_REF_FRAMES} without delay)", p.sps.max_num_ref_frames)));
         }
         check_slice_types(au, &ranges)?;
-        if self.session.as_ref().map(|s| s.info != info).unwrap_or(true) {
+        // A pipeline that makes DMABufs is of no use once the windows stop taking them.
+        let usable = |s: &Session| s.info == info && (s.drm_format.is_none() || gl_present::ready());
+        if !self.session.as_ref().map(usable).unwrap_or(false) {
             if !p.idr {
                 return Err(HwError::NeedKeyframe("waiting for a keyframe".into()));
             }
             // Dropped first: the old pipeline stops in the background while the new one starts.
             self.session = None;
             let profile = caps_profile(&p);
-            self.session = Some(Session::start(&info, profile).map_err(HwError::Device)?);
+            let session = Session::start(&info, profile, !self.probe && gl_present::ready()).map_err(HwError::Device)?;
             self.state.reset(&info);
             if !self.probe {
                 let matrix = if info.bt709 { "BT.709" } else { "BT.601" };
-                log::info!("🎞️ [VAAPI DEC] vah264dec pipeline started: {}x{} {}, {} limited range", info.width, info.height, profile, matrix);
+                let output = match &session.drm_format {
+                    Some(drm) => format!("pictures stay on the GPU ({drm} DMABuf)"),
+                    None => "pictures are read back as pixels".to_string(),
+                };
+                log::info!("🎞️ [VAAPI DEC] vah264dec pipeline started: {}x{} {}, {} limited range; {}", info.width, info.height, profile, matrix, output);
             }
+            self.session = Some(session);
         }
         let (pic, _) = self.state.begin(&p)?;
         self.append_units(au, &ranges, true)?;
@@ -183,15 +205,24 @@ impl VaapiDecoder {
         };
         let (out_w, out_h) = output_size(fit(info.width, info.height), &info);
         let Some(session) = self.session.as_mut() else { return Err(HwError::Device("no pipeline".into())) };
+        // What went wrong while pictures stay on the GPU may be that very hand-over (a
+        // format the driver cannot make after all, buffers the windows hold on to): such
+        // a stream first goes back to pixels, on this decoder, before it is given up on.
+        let (dmabuf, first) = (session.drm_format.is_some(), session.pictures == 0);
         match session.decode(feed, out_w, out_h, stall) {
-            Ok(rgba) => {
+            Ok(output) => {
                 self.state.finish(&p, &pic);
                 self.pictures += 1;
-                Ok(Some(Picture { rgba, width: info.width, height: info.height }))
+                Ok(Some(Picture { output, width: info.width, height: info.height }))
             }
             Err(Failure::Stalled(e)) => {
                 self.fail();
                 let again = self.last_stall.replace(Instant::now()).map(|t| t.elapsed() < STALL_MEMORY).unwrap_or(false);
+                if again && dmabuf {
+                    self.last_stall = None;
+                    gl_present::give_up(&format!("the decoder stalled twice while its pictures stayed on the GPU ({e})"));
+                    return Err(HwError::NeedKeyframe(e));
+                }
                 if again {
                     return Err(HwError::Device(format!("{e}, twice within {} s", STALL_MEMORY.as_secs())));
                 }
@@ -202,6 +233,10 @@ impl VaapiDecoder {
             }
             Err(Failure::Broken(e)) => {
                 self.fail();
+                if dmabuf && first {
+                    gl_present::give_up(&format!("the decoder could not leave its pictures on the GPU ({e})"));
+                    return Err(HwError::NeedKeyframe(e));
+                }
                 Err(HwError::Device(e))
             }
         }
@@ -305,22 +340,27 @@ struct Session {
     appsrc: gst_app::AppSrc,
     size_filter: gst::Element,
     sink: gst_app::AppSink,
+    /// The DMABuf format pictures come out in (with its modifier, as vapostproc names
+    /// it), or `None` for pixels in memory.
+    drm_format: Option<String>,
     out_size: (u32, u32),
     pushed: u64,
     pictures: u64,
-    /// Since the last report (debug log): time spent waiting for pictures (decoding and
-    /// conversion on the GPU), mapping them (the driver's copy out of the GPU) and copying
-    /// them into the buffers the UI gets.
+    /// Since the last report: time spent waiting for pictures (decoding and conversion on
+    /// the GPU), mapping them (the driver's copy out of the GPU) and copying them into the
+    /// buffers the UI gets, and how many were read back at all.
     waited: Duration,
     mapped: Duration,
     copied: Duration,
+    read_back: u64,
 }
 
-/// Pictures between two timing reports in the debug log.
+/// Pictures between two timing reports in the log (ten seconds at 60 FPS).
 const REPORT_EVERY: u64 = 600;
 
 impl Session {
-    fn start(info: &StreamInfo, profile: &str) -> Result<Self, String> {
+    /// `dmabuf`: leave the pictures on the GPU, if vapostproc has an RGB DMABuf format.
+    fn start(info: &StreamInfo, profile: &str, dmabuf: bool) -> Result<Self, String> {
         // Range, matrix, transfer, primaries. Limited range always (see h264_state); the
         // transfer function and primaries are sRGB's on both sides, so vapostproc applies
         // the matrix and nothing else. Chroma samples sit in the middle of their four
@@ -351,8 +391,25 @@ impl Session {
                 dec.set_property_from_str("compliance", "normal");
             }
         }
+        let drm_format = if dmabuf { rgb_dmabuf_format(&pipeline) } else { None };
+        if drm_format.is_some() {
+            // vapostproc only hands out DMABufs to a sink that says it reads VideoMeta
+            // (strides and offsets); appsink says nothing by itself. Not installed for
+            // pixels, where the pipeline is what the self-test checked.
+            if let Some(pad) = sink.static_pad("sink") {
+                pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |_, probe| {
+                    if let Some(query) = probe.query_mut() {
+                        if let gst::QueryViewMut::Allocation(allocation) = query.view_mut() {
+                            allocation.add_allocation_meta::<gst_video::VideoMeta>(None);
+                            return gst::PadProbeReturn::Handled;
+                        }
+                    }
+                    gst::PadProbeReturn::Ok
+                });
+            }
+        }
         // From here on dropping the session stops the pipeline.
-        let mut session = Self { info: *info, pipeline, bus, appsrc, size_filter, sink, out_size: (0, 0), pushed: 0, pictures: 0, waited: Duration::ZERO, mapped: Duration::ZERO, copied: Duration::ZERO };
+        let mut session = Self { info: *info, pipeline, bus, appsrc, size_filter, sink, drm_format, out_size: (0, 0), pushed: 0, pictures: 0, waited: Duration::ZERO, mapped: Duration::ZERO, copied: Duration::ZERO, read_back: 0 };
         session.set_output_size(info.width, info.height);
         if let Err(e) = session.pipeline.set_state(gst::State::Playing) {
             return Err(format!("{e}: {}", session.bus_error().unwrap_or_default()));
@@ -362,13 +419,24 @@ impl Session {
 
     /// Takes effect on the next picture (vapostproc renegotiates; the decoder is untouched).
     fn set_output_size(&mut self, w: u32, h: u32) {
-        let caps = gst::Caps::builder("video/x-raw")
-            .field("format", "RGBx")
-            .field("width", w as i32)
-            .field("height", h as i32)
-            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
-            .field("colorimetry", "1:1:7:1")
-            .build();
+        let caps = match &self.drm_format {
+            None => gst::Caps::builder("video/x-raw")
+                .field("format", "RGBx")
+                .field("width", w as i32)
+                .field("height", h as i32)
+                .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+                .field("colorimetry", "1:1:7:1")
+                .build(),
+            Some(drm) => gst::Caps::builder("video/x-raw")
+                .features(["memory:DMABuf"])
+                .field("format", "DMA_DRM")
+                .field("drm-format", drm.as_str())
+                .field("width", w as i32)
+                .field("height", h as i32)
+                .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+                .field("colorimetry", "1:1:7:1")
+                .build(),
+        };
         self.size_filter.set_property("caps", &caps);
         self.out_size = (w, h);
     }
@@ -384,7 +452,7 @@ impl Session {
     }
 
     /// Pushes one access unit and waits for its picture. `stall` leaves the push out (test).
-    fn decode(&mut self, feed: Vec<u8>, w: u32, h: u32, stall: bool) -> Result<SharedPixelBuffer<Rgba8Pixel>, Failure> {
+    fn decode(&mut self, feed: Vec<u8>, w: u32, h: u32, stall: bool) -> Result<Output, Failure> {
         if let Some(e) = self.bus_error() {
             return Err(Failure::Broken(e));
         }
@@ -403,28 +471,37 @@ impl Session {
         let pushed_at = Instant::now();
         let sample = self.pull(pts, timeout)?;
         let pulled_at = Instant::now();
-        let (rgba, mapped) = copy_rgbx(&sample).map_err(Failure::Broken)?;
         self.waited += pulled_at - pushed_at;
-        self.mapped += mapped;
-        self.copied += pulled_at.elapsed().saturating_sub(mapped);
+        let output = if self.drm_format.is_some() {
+            Output::Dmabuf(sample)
+        } else {
+            let (rgba, mapped) = copy_rgbx(&sample).map_err(Failure::Broken)?;
+            self.mapped += mapped;
+            self.copied += pulled_at.elapsed().saturating_sub(mapped);
+            self.read_back += 1;
+            Output::Rgba(rgba)
+        };
         self.pictures += 1;
         if self.pictures % REPORT_EVERY == 0 {
-            let ms = |d: Duration| d.as_secs_f64() * 1000.0 / REPORT_EVERY as f64;
-            log::debug!(
-                "🎞️ [VAAPI DEC] {}x{} -> {}x{}, per picture: {:.2} ms decoding and converting on the GPU, {:.2} ms mapping it into memory, {:.2} ms copying it out",
+            let ms = |d: Duration, n: u64| d.as_secs_f64() * 1000.0 / n.max(1) as f64;
+            log::info!(
+                "🎞️ [VAAPI DEC] {}x{} -> {}x{}, per picture: {:.2} ms decoding and converting on the GPU, {:.2} ms mapping it into memory, {:.2} ms copying it out ({} of {} read back)",
                 self.info.width,
                 self.info.height,
                 w,
                 h,
-                ms(self.waited),
-                ms(self.mapped),
-                ms(self.copied)
+                ms(self.waited, REPORT_EVERY),
+                ms(self.mapped, self.read_back),
+                ms(self.copied, self.read_back),
+                self.read_back,
+                REPORT_EVERY
             );
             self.waited = Duration::ZERO;
             self.mapped = Duration::ZERO;
             self.copied = Duration::ZERO;
+            self.read_back = 0;
         }
-        Ok(rgba)
+        Ok(output)
     }
 
     /// Waits for the picture stamped `pts`. A picture of an earlier access unit is thrown
@@ -455,6 +532,29 @@ impl Session {
             }
         }
     }
+}
+
+/// The RGB DMABuf format vapostproc offers on this driver, with its modifier (for example
+/// `XB24:0x0200000028a01f04` on radeonsi). One without alpha is preferred: the picture is
+/// opaque whatever the fourth byte holds. `None` turns GPU presentation off.
+fn rgb_dmabuf_format(pipeline: &gst::Pipeline) -> Option<String> {
+    let template = pipeline.by_name("post")?.static_pad("src")?.pad_template_caps();
+    let mut offered = Vec::new();
+    for (structure, features) in template.iter_with_features() {
+        if !features.contains("memory:DMABuf") {
+            continue;
+        }
+        if let Ok(list) = structure.get::<gst::List>("drm-format") {
+            offered.extend(list.iter().filter_map(|v| v.get::<String>().ok()));
+        } else if let Ok(one) = structure.get::<String>("drm-format") {
+            offered.push(one);
+        }
+    }
+    let found = ["XB24", "XR24", "AB24", "AR24"].iter().find_map(|want| offered.iter().find(|o| o.starts_with(want)).cloned());
+    if found.is_none() {
+        gl_present::give_up(&format!("vapostproc offers no RGB DMABuf format (it has {offered:?})"));
+    }
+    found
 }
 
 impl Drop for Session {
@@ -491,12 +591,22 @@ fn copy_rgbx(sample: &gst::Sample) -> Result<(SharedPixelBuffer<Rgba8Pixel>, Dur
     if w == 0 || h == 0 || stride < row || data.len() < stride * (h - 1) + row {
         return Err(format!("picture buffer too small ({} bytes for {w}x{h}, stride {stride})", data.len()));
     }
-    let mut out = SharedPixelBuffer::<Rgba8Pixel>::new(w as u32, h as u32);
-    for (dst, src) in out.make_mut_bytes().chunks_exact_mut(row).zip(data.chunks(stride)) {
-        dst.copy_from_slice(&src[..row]);
-        for px in dst.chunks_exact_mut(4) {
-            px[3] = 255;
+    // Reading the mapped picture is the slow part, and a memcpy reads it fastest: one copy
+    // of the whole picture into a buffer that is not cleared first (0.8 ms for 1080p
+    // here; clearing, copying row by row and patching each row took 1.9 ms, and writing
+    // `pixel | alpha` pixel by pixel 11.6 ms). The alpha byte is set afterwards, in
+    // ordinary memory.
+    let mut out = if stride == row {
+        SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&data[..row * h], w as u32, h as u32)
+    } else {
+        let mut out = SharedPixelBuffer::<Rgba8Pixel>::new(w as u32, h as u32);
+        for (dst, src) in out.make_mut_bytes().chunks_exact_mut(row).zip(data.chunks(stride)) {
+            dst.copy_from_slice(&src[..row]);
         }
+        out
+    };
+    for px in out.make_mut_bytes().chunks_exact_mut(4) {
+        px[3] = 255;
     }
     Ok((out, mapped))
 }
@@ -539,16 +649,16 @@ fn self_test() -> Result<(), String> {
     let started = Instant::now();
     let mut decoder = VaapiDecoder::with(TestFail::None, true);
     for (name, au) in [("keyframe", PROBE_AU), ("second picture", PROBE_P)] {
-        let picture = match decoder.decode(au, |w, h| (w, h)) {
-            Ok(Some(picture)) => picture,
-            Ok(None) => return Err(format!("self-test: no {name}")),
+        let (picture, rgba) = match decoder.decode(au, |w, h| (w, h)) {
+            Ok(Some(Picture { output: Output::Rgba(rgba), width, height })) => ((width, height), rgba),
+            Ok(_) => return Err(format!("self-test: no {name}")),
             Err(e) => return Err(format!("self-test, {name}: {e:?}")),
         };
-        let (w, h) = (picture.rgba.width(), picture.rgba.height());
-        if (w, h) != PROBE_SIZE || (picture.width, picture.height) != PROBE_SIZE {
+        let (w, h) = (rgba.width(), rgba.height());
+        if (w, h) != PROBE_SIZE || picture != PROBE_SIZE {
             return Err(format!("self-test: {name} is {w}x{h}, expected {}x{}", PROBE_SIZE.0, PROBE_SIZE.1));
         }
-        let bytes = picture.rgba.as_bytes();
+        let bytes = rgba.as_bytes();
         for ((x, y), expected) in PROBE_COLOURS {
             let at = ((y * w + x) * 4) as usize;
             let got = &bytes[at..at + 4];

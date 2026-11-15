@@ -47,6 +47,25 @@
 //!                                            stream not watched (named "a" if given) and one
 //!                                            watched, to look at the voice stage without an
 //!                                            account
+//!                                            "filler":true also fills the server list, the
+//!                                            channel list and the call like a real server
+//! {"cmd":"demo_stream","path":"/x/a.h264","fps":60,"user_id":"3"}
+//!                                            play an H.264 Annex B file, looping, as that
+//!                                            peer's watched stream: its access units enter
+//!                                            the decode queue as received frames do. Sent
+//!                                            again with another file, the stream goes on
+//!                                            with that one (a size change at a keyframe)
+//! {"cmd":"demo_stream","drop":2}             leave the next 2 access units out (lost frames)
+//! {"cmd":"demo_stream","pause":true}         feed nothing until "pause":false
+//! {"cmd":"demo_stream","stop":true}          the stream ends, as when its sender stops
+//! {"cmd":"perf"}                             counters for measurements: access units fed,
+//!                                            pictures decoded, pictures given to the UI,
+//!                                            and on Linux pictures offered as GPU buffers
+//!                                            and imported by a window
+//! {"cmd":"popout_fullscreen"}                the popout's maximize button
+//! {"cmd":"popout_close"}                     the popout's close button
+//! {"cmd":"popout_resize","width":800,"height":450} popout size in logical pixels
+//! {"cmd":"popout_screenshot","path":"/tmp/p.png"}
 //! {"cmd":"spawn_threads","n":100,"alloc":true} start and join n threads (that allocate):
 //!                                            what a thread that exits costs in memory
 //! ```
@@ -62,6 +81,144 @@ use slint::platform::{Key, PointerEventButton, WindowEvent};
 use slint::{ComponentHandle, LogicalPosition, Model, SharedString};
 
 use crate::AppWindow;
+
+thread_local! {
+    /// The popout window, for the commands that act on it (UI thread).
+    static POPOUT: std::cell::RefCell<Option<slint::Weak<crate::PopoutStreamWindow>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tells the control server about the popout window.
+pub fn set_popout(popout: &crate::PopoutStreamWindow) {
+    POPOUT.with(|p| *p.borrow_mut() = Some(popout.as_weak()));
+}
+
+fn popout() -> Result<crate::PopoutStreamWindow, String> {
+    POPOUT.with(|p| p.borrow().as_ref().and_then(|w| w.upgrade())).ok_or_else(|| "no popout window".to_string())
+}
+
+/// Pictures of received streams the UI thread took from the decoder (measurements).
+pub static UI_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The demo stream: a file played into the decode queue by its own thread.
+struct DemoStream {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    drop: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    peer: u64,
+}
+
+static DEMO_STREAM: std::sync::Mutex<Option<DemoStream>> = std::sync::Mutex::new(None);
+static DEMO_FED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Sequence number of the last access unit played (fed, dropped or paused over): it goes
+/// on when another file takes over, as a sender's does.
+static DEMO_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The access units of an Annex B stream, start codes included. A new one starts at a
+/// delimiter, parameter set or SEI that follows a slice, or at a picture's first slice.
+fn split_access_units(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut units = Vec::new();
+    let (mut i, mut au_start, mut have_slice) = (0, None, false);
+    while i + 3 < data.len() {
+        if data[i] != 0 || data[i + 1] != 0 || data[i + 2] != 1 {
+            i += 1;
+            continue;
+        }
+        let code = if i > 0 && data[i - 1] == 0 { i - 1 } else { i };
+        let kind = data[i + 3] & 0x1f;
+        let slice = matches!(kind, 1 | 5);
+        // first_mb_in_slice is 0 when the slice data starts with a 1 bit.
+        let first_slice = slice && data.get(i + 4).is_some_and(|b| b & 0x80 != 0);
+        if have_slice && (matches!(kind, 6..=9) || first_slice) {
+            units.push(data[au_start.unwrap_or(0)..code].to_vec());
+            au_start = Some(code);
+            have_slice = false;
+        }
+        au_start.get_or_insert(code);
+        have_slice |= slice;
+        i += 3;
+    }
+    if have_slice {
+        units.push(data[au_start.unwrap_or(0)..].to_vec());
+    }
+    units
+}
+
+fn demo_stream(cmd: &Value) -> Result<Value, String> {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Arc;
+    let mut demo = DEMO_STREAM.lock().unwrap_or_else(|e| e.into_inner());
+    if cmd["stop"].as_bool().unwrap_or(false) {
+        let Some(d) = demo.take() else { return Err("no demo stream".into()) };
+        d.stop.store(true, Ordering::Relaxed);
+        crate::screen_capture::trigger_stream_stopped(d.peer);
+        return Ok(json!({ "ok": true }));
+    }
+    if let Some(n) = cmd["drop"].as_u64() {
+        let d = demo.as_ref().ok_or("no demo stream")?;
+        d.drop.store(n as u32, Ordering::Relaxed);
+        return Ok(json!({ "ok": true }));
+    }
+    if let Some(on) = cmd["pause"].as_bool() {
+        let d = demo.as_ref().ok_or("no demo stream")?;
+        d.paused.store(on, Ordering::Relaxed);
+        return Ok(json!({ "ok": true }));
+    }
+    let path = cmd["path"].as_str().ok_or("missing \"path\"")?;
+    let fps = cmd["fps"].as_f64().unwrap_or(60.0).clamp(1.0, 240.0);
+    let peer: u64 = cmd["user_id"].as_str().unwrap_or("3").parse().map_err(|_| "user_id is not a number")?;
+    let name = cmd["name"].as_str().unwrap_or("Streaming, watched here").to_string();
+    let data = std::fs::read(path).map_err(|e| format!("could not read {path}: {e}"))?;
+    let units = split_access_units(&data);
+    if units.is_empty() {
+        return Err(format!("no access units in {path}"));
+    }
+    if let Some(old) = demo.take() {
+        old.stop.store(true, Ordering::Relaxed);
+    }
+    let d = DemoStream { stop: Arc::new(AtomicBool::new(false)), paused: Arc::new(AtomicBool::new(false)), drop: Arc::new(AtomicU32::new(0)), peer };
+    let (stop, paused, drop) = (d.stop.clone(), d.paused.clone(), d.drop.clone());
+    let count = units.len();
+    std::thread::Builder::new()
+        .name("demo-stream".into())
+        .spawn(move || {
+            let period = Duration::from_secs_f64(1.0 / fps);
+            let (mut start, mut n) = (std::time::Instant::now(), 0u64);
+            let mut at = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                let due = start + period.mul_f64(n as f64);
+                let now = std::time::Instant::now();
+                if due > now {
+                    std::thread::sleep(due - now);
+                    // Another file may have taken over meanwhile: nothing more from this one.
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                } else if now - due > Duration::from_millis(500) {
+                    // Far behind (the machine slept): start pacing again from here.
+                    (start, n) = (now, 0);
+                }
+                let unit = &units[at % units.len()];
+                let seq = DEMO_SEQ.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                at += 1;
+                n += 1;
+                if paused.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let dropping = drop.load(Ordering::Relaxed);
+                if dropping > 0 {
+                    drop.store(dropping - 1, Ordering::Relaxed);
+                    continue;
+                }
+                if let Some(feed) = crate::screen_capture::DEMO_FEED.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    feed(peer, name.clone(), fps.round() as u8, seq, (at as f64 * 1000.0 / fps) as u32, unit.clone());
+                    DEMO_FED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    *demo = Some(d);
+    Ok(json!({ "ok": true, "access_units": count, "fps": fps, "user_id": peer.to_string() }))
+}
 
 /// Starts the control server if `LITECORD_AUTOMATION_PORT` holds a port number.
 pub fn start(ui: &AppWindow) {
@@ -163,6 +320,7 @@ fn execute(ui: &AppWindow, cmd: &Value) -> Result<Value, String> {
                 "physical": [size.width, size.height],
                 "logical": [size.width as f32 / scale, size.height as f32 / scale],
                 "scale": scale,
+                "popout_physical": popout().ok().filter(|p| p.window().is_visible()).map(|p| { let s = p.window().size(); [s.width, s.height] }),
             }))
         }
         "screenshot" => {
@@ -474,12 +632,64 @@ fn execute(ui: &AppWindow, cmd: &Value) -> Result<Value, String> {
                 is_self,
                 is_streaming,
                 is_stream_hidden,
+                watch_note: Default::default(),
             };
             let people = vec![
                 person("1", "Me", true, false, false),
                 person("2", cmd["a"].as_str().unwrap_or("Streaming, not watched"), false, true, true),
                 person("3", "Streaming, watched here", false, true, false),
             ];
+            let mut people = people;
+            if cmd["filler"].as_bool().unwrap_or(false) {
+                // A server as a member sees it: servers on the left, categories with
+                // text and voice channels, and a few more people in the call.
+                for (i, name) in ["Bruna", "Caio", "Débora", "Estêvão"].iter().enumerate() {
+                    let mut p = person(&(10 + i).to_string(), name, false, false, false);
+                    p.is_muted = i == 1;
+                    people.push(p);
+                }
+                let guilds: Vec<crate::GuildItem> = ["Amigos", "Rust BR", "Jogatina", "Trabalho", "Música", "Filmes", "Estudos", "Família", "Linux", "Testes"]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| crate::GuildItem { id: (100 + i).to_string().into(), name: (*name).into(), icon: name.chars().next().unwrap_or('?').to_string().into(), has_image: false, icon_image: Default::default() })
+                    .collect();
+                ui.set_guilds(std::rc::Rc::new(slint::VecModel::from(guilds)).into());
+                ui.set_active_guild_name("Amigos".into());
+                let mut channels = Vec::new();
+                let channel = |id: usize, name: &str, is_voice: bool, is_category: bool, parent: usize, unread: i32| crate::ChannelItem {
+                    id: id.to_string().into(),
+                    name: name.into(),
+                    is_voice,
+                    voice_count: if id == 1005 { 7 } else { 0 },
+                    is_voice_member: false,
+                    parent_channel_id: if parent == 0 { "".into() } else { parent.to_string().into() },
+                    avatar_text: "".into(),
+                    avatar_url: "".into(),
+                    avatar_slot: -1,
+                    is_category,
+                    has_parent: parent != 0,
+                    is_collapsed: false,
+                    has_separator: false,
+                    unread_count: unread,
+                    emoji_id: "".into(),
+                    emoji_slot: -1,
+                    label: name.into(),
+                };
+                let text = ["geral", "avisos", "memes", "links", "clipes", "música", "off-topic", "ajuda", "projetos", "eventos"];
+                for (c, category) in ["Informações", "Conversa", "Jogos", "Voz"].iter().enumerate() {
+                    let parent = 1000 * (c + 1);
+                    channels.push(channel(parent, &category.to_uppercase(), false, true, 0, 0));
+                    for (i, name) in text.iter().enumerate() {
+                        let voice = c == 3;
+                        let name = if voice { format!("Sala {}", i + 1) } else { format!("{name}-{}", c + 1) };
+                        channels.push(channel(parent + i + 1, &name, voice, false, parent, if i % 4 == 1 && !voice { 3 } else { 0 }));
+                    }
+                }
+                ui.set_channels(std::rc::Rc::new(slint::VecModel::from(channels)).into());
+                ui.set_current_voice_channel("Sala 5".into());
+                ui.set_active_channel_name("geral-2".into());
+                ui.set_user_tag("demo".into());
+            }
             ui.set_voice_participants(std::rc::Rc::new(slint::VecModel::from(people)).into());
             ui.set_has_active_stream(true);
             ui.set_active_stream_user_id("3".into());
@@ -494,6 +704,47 @@ fn execute(ui: &AppWindow, cmd: &Value) -> Result<Value, String> {
             ui.set_web_share_active(false);
             ui.set_web_share_url("".into());
             Ok(json!({ "ok": true }))
+        }
+        "demo_stream" => demo_stream(cmd),
+        "perf" => {
+            let reply = json!({
+                "ok": true,
+                "fed": DEMO_FED.load(std::sync::atomic::Ordering::Relaxed),
+                "decoded": crate::screen_capture::RX_FRAMES_SHOWN.load(std::sync::atomic::Ordering::Relaxed),
+                "on_gpu": crate::screen_capture::RX_GPU_FRAMES.load(std::sync::atomic::Ordering::Relaxed),
+                "ui_frames": UI_FRAMES.load(std::sync::atomic::Ordering::Relaxed),
+            });
+            #[cfg(all(target_os = "linux", feature = "vaapi"))]
+            let reply = {
+                use crate::screen_capture::hw_decode::gl_present;
+                let mut reply = reply;
+                reply["gl_ready"] = json!(gl_present::ready());
+                reply["offered"] = json!(gl_present::OFFERED.load(std::sync::atomic::Ordering::Relaxed));
+                reply["presented"] = json!(gl_present::IMPORTED.load(std::sync::atomic::Ordering::Relaxed));
+                reply
+            };
+            Ok(reply)
+        }
+        "popout_fullscreen" => {
+            popout()?.invoke_toggle_fullscreen();
+            Ok(json!({ "ok": true }))
+        }
+        "popout_close" => {
+            popout()?.invoke_close_popout();
+            Ok(json!({ "ok": true }))
+        }
+        "popout_resize" => {
+            let w = cmd["width"].as_f64().ok_or("missing \"width\"")? as f32;
+            let h = cmd["height"].as_f64().ok_or("missing \"height\"")? as f32;
+            popout()?.window().set_size(slint::LogicalSize::new(w, h));
+            Ok(json!({ "ok": true }))
+        }
+        "popout_screenshot" => {
+            let path = cmd["path"].as_str().ok_or("missing \"path\"")?;
+            let shot = popout()?.window().take_snapshot().map_err(|e| format!("snapshot failed: {e}"))?;
+            image::save_buffer(path, shot.as_bytes(), shot.width(), shot.height(), image::ExtendedColorType::Rgba8)
+                .map_err(|e| format!("could not write {path}: {e}"))?;
+            Ok(json!({ "ok": true, "path": path, "width": shot.width(), "height": shot.height() }))
         }
         "state" => Ok(state(ui)),
         other => Err(format!("unknown cmd {other}")),

@@ -493,6 +493,8 @@ export component AppWindow inherits Window {
     in-out property <string> active_stream_user_id: "";
     in-out property <image> active_stream_frame;
     in-out property <image> remote_stream_frame;
+    // That picture was made at the size it is drawn at: shown pixel for pixel, not smoothed.
+    in property <bool> remote_stream_exact: false;
     // The remote stream is drawn by the GPU under the window (Windows): its area is painted
     // in the hole colour (#010203), which the renderer leaves transparent.
     in property <bool> gpu_video_main: false;
@@ -1722,6 +1724,7 @@ export component AppWindow inherits Window {
                                             width: 100%;
                                             height: 100%;
                                             image-fit: contain;
+                                            image-rendering: (!(p.is_self && root.is_screen_sharing) && root.remote_stream_exact) ? pixelated : smooth;
                                         }
 
                                         // The border goes over the video: the software renderer clips children
@@ -5317,6 +5320,8 @@ export component PopoutStreamWindow inherits Window {
     }
 
     in-out property <image> stream_frame;
+    // That picture was made at the size it is drawn at: shown pixel for pixel, not smoothed.
+    in property <bool> stream_exact: false;
     in-out property <string> username: Tr.stream_word;
     in-out property <string> user_id: "";
     in-out property <string> stream_fps: "";
@@ -5358,6 +5363,7 @@ export component PopoutStreamWindow inherits Window {
         height: 100%;
         source: root.stream_frame;
         image-fit: contain;
+        image-rendering: (!root.is_self && root.stream_exact) ? pixelated : smooth;
     }
 
     // Top Autohiding Controls Bar (Discord Floating Overlay Style)

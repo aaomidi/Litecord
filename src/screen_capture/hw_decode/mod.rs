@@ -11,6 +11,8 @@ pub mod dxva;
 #[cfg(windows)]
 pub mod layers;
 #[cfg(all(target_os = "linux", feature = "vaapi"))]
+pub mod gl_present;
+#[cfg(all(target_os = "linux", feature = "vaapi"))]
 pub mod vaapi;
 
 use std::collections::HashSet;
@@ -92,11 +94,27 @@ impl GpuDecoder {
             let (w, h) = fit(frame.info.width, frame.info.height);
             Ok(Some(GpuPicture::Rgba(self.inner.read_rgba(&frame, w, h)?, frame.info.width, frame.info.height)))
         }
-        // Linux: vapostproc scales and converts on the GPU; the picture always comes back
-        // as RGBA (no window layers), so the stream is not marked as drawn by the GPU.
+        // Linux: vapostproc scales and converts on the GPU. With the GPU renderer the
+        // picture stays there and the windows draw it from the decoder's buffer
+        // (gl_present). Otherwise it comes back as RGBA.
         #[cfg(all(target_os = "linux", feature = "vaapi"))]
         {
-            Ok(self.inner.decode(au, fit)?.map(|p| GpuPicture::Rgba(p.rgba, p.width, p.height)))
+            let Some(picture) = self.inner.decode(au, fit)? else { return Ok(None) };
+            match picture.output {
+                vaapi::Output::Dmabuf(sample) => {
+                    if !gl_present::offer(self.peer, sample, picture.height) {
+                        // Not an error of the decoder: the stream stays on it, and its
+                        // next keyframe starts a pipeline that returns pixels.
+                        return Err(HwError::NeedKeyframe("GPU presentation ended".into()));
+                    }
+                    mark_peer(self.peer, true);
+                    Ok(Some(GpuPicture::Shown(picture.height)))
+                }
+                vaapi::Output::Rgba(rgba) => {
+                    gl_present::clear(self.peer);
+                    Ok(Some(GpuPicture::Rgba(rgba, picture.width, picture.height)))
+                }
+            }
         }
         #[cfg(not(any(windows, all(target_os = "linux", feature = "vaapi"))))]
         {

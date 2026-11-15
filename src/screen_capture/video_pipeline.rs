@@ -116,18 +116,21 @@ pub fn fit_bgra_to_canvas(
 
 static PEER_SPS_PPS_CACHE: Mutex<Option<HashMap<u64, Vec<u8>>>> = Mutex::new(None);
 
-/// Largest size (physical pixels, `w << 32 | h`) a received stream is shown at, set by the
-/// UI. Frames are converted straight to that size: converting and then drawing a 1080p
-/// frame shown in a 980 px window cost about four times the pixels that end up on screen.
+/// Sizes (physical pixels, `w << 32 | h`) of the areas a received stream is shown in, set
+/// by the UI: its card in the main window and the popout (zero: not shown there). Frames
+/// are converted straight to the larger of the two pictures: converting and then drawing
+/// a 1080p frame shown in a 408 px high card cost about seven times the pixels that end
+/// up on screen.
 static STREAM_VIEW_PX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STREAM_POPOUT_PX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn set_stream_view_size(w: u32, h: u32) {
-    STREAM_VIEW_PX.store((w as u64) << 32 | h as u64, Ordering::Relaxed);
+    set_stream_view_sizes((w, h), (0, 0));
 }
 
-fn stream_view_size() -> (u32, u32) {
-    let v = STREAM_VIEW_PX.load(Ordering::Relaxed);
-    ((v >> 32) as u32, v as u32)
+pub fn set_stream_view_sizes(main: (u32, u32), popout: (u32, u32)) {
+    STREAM_VIEW_PX.store((main.0 as u64) << 32 | main.1 as u64, Ordering::Relaxed);
+    STREAM_POPOUT_PX.store((popout.0 as u64) << 32 | popout.1 as u64, Ordering::Relaxed);
 }
 
 /// Whether any window can show a received stream right now. When none can (Litecord in
@@ -448,8 +451,16 @@ fn shown_size(w: u32, h: u32) -> (u32, u32) {
     if crate::utils::test_hooks::FULL_SIZE_CONVERSION.load(Ordering::Relaxed) {
         return (w, h);
     }
-    let (view_w, view_h) = stream_view_size();
-    fit_within(w, h, view_w, view_h)
+    let fit = |px: u64| match ((px >> 32) as u32, px as u32) {
+        (0, _) | (_, 0) => (0, 0),
+        (view_w, view_h) => fit_within(w, h, view_w, view_h),
+    };
+    let (main, popout) = (fit(STREAM_VIEW_PX.load(Ordering::Relaxed)), fit(STREAM_POPOUT_PX.load(Ordering::Relaxed)));
+    if main == (0, 0) && popout == (0, 0) {
+        // Nothing reported yet.
+        return (w, h);
+    }
+    (main.0.max(popout.0), main.1.max(popout.1))
 }
 
 pub fn decode_video_frame(decoders: &mut StreamDecoders, peer_uid: u64, frame_data: &[u8]) -> Decoded {
@@ -527,6 +538,10 @@ pub fn decode_video_frame(decoders: &mut StreamDecoders, peer_uid: u64, frame_da
             }
         }
     }
+    // This stream's pictures come from the CPU decoder: the last one a GPU decoder left
+    // for the windows is not shown again.
+    #[cfg(all(target_os = "linux", feature = "vaapi"))]
+    super::hw_decode::gl_present::clear(peer_uid);
     match decode_on_cpu(&mut decoders.cpu, peer_uid, &annex_b) {
         Some((b, w, h)) => Decoded::Picture(b, w, h),
         None => Decoded::Failed,
@@ -747,8 +762,12 @@ pub fn decode_jpeg(jpeg_data: &[u8]) -> Option<(SharedPixelBuffer<Rgba8Pixel>, u
     Some((pixel_buffer, width, height))
 }
 
-/// Largest size that fits `max_w` x `max_h` with the frame's aspect ratio, never larger
-/// than the frame itself (even dimensions; 0 means "no limit").
+/// Size for a frame shown in `max_w` x `max_h` with its aspect ratio kept, never larger
+/// than the frame itself (0 means "no limit"). Dimensions are rounded up to even ones, so
+/// the picture is the area's size or a pixel or two more, never less: then it is drawn
+/// pixel for pixel. One that is a pixel short gets stretched, which blurs it on the GPU
+/// renderer, and the software renderer (it steps through a picture in 1/256ths) draws it
+/// 0.4% too large and cuts off its right and bottom edges.
 pub fn fit_within(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     if max_w == 0 || max_h == 0 || w == 0 || h == 0 {
         return (w, h);
@@ -757,8 +776,8 @@ pub fn fit_within(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     if scale >= 1.0 {
         return (w, h);
     }
-    let even = |v: f64| ((v.round() as u32) & !1).max(2);
-    (even(w as f64 * scale), even(h as f64 * scale))
+    let even = |v: f64, max: u32| ((((v - 1e-6).ceil() as u32) + 1) & !1).clamp(2, max.max(2));
+    (even(w as f64 * scale, w), even(h as f64 * scale, h))
 }
 
 /// How a stream's YUV samples map to RGB (from the SPS VUI).
@@ -918,10 +937,10 @@ mod scaled_conversion_tests {
 
     #[test]
     fn fit_keeps_aspect_and_never_upscales() {
-        assert_eq!(fit_within(1920, 1080, 980, 620), (980, 550));
+        assert_eq!(fit_within(1920, 1080, 980, 620), (980, 552));
         assert_eq!(fit_within(1920, 1080, 3840, 2160), (1920, 1080));
         assert_eq!(fit_within(1920, 1080, 0, 0), (1920, 1080));
-        assert_eq!(fit_within(1080, 1920, 620, 620), (348, 620));
+        assert_eq!(fit_within(1080, 1920, 620, 620), (350, 620));
     }
 
     fn solid_i420(w: usize, h: usize, yv: u8, uv: u8, vv: u8) -> (Vec<u8>, Vec<u8>, Vec<u8>) {

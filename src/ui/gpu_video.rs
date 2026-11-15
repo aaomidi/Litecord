@@ -27,6 +27,65 @@ thread_local! {
     static LAYERS: RefCell<Windows> = const { RefCell::new(Windows { main: None, popout: None }) };
     /// The remote stream area in the main window, physical pixels (zero: not shown).
     static VIEWPORT: Cell<(i32, i32, u32, u32)> = const { Cell::new((0, 0, 0, 0)) };
+    /// The size of that area in logical pixels. The decoder is told it in physical pixels,
+    /// worked out when it is told: the scale factor changes when the window moves to
+    /// another monitor, and the area's logical size does not.
+    static VIEW_LOGICAL: Cell<(f32, f32)> = const { Cell::new((0.0, 0.0)) };
+    /// The popout's new size while its resize is being handled (the window itself still
+    /// has the old one then); zero otherwise.
+    static POPOUT_RESIZING: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
+    /// The sizes the decoder will be told next, and the timer that tells it.
+    static VIEW_WANTED: Cell<Option<((u32, u32), (u32, u32))>> = const { Cell::new(None) };
+    static VIEW_TIMER: slint::Timer = slint::Timer::default();
+}
+
+/// A size is told to the decoder once it has stayed the same this long: the card's height
+/// animates for 200 ms and a window is resized in many steps, and every new size makes
+/// the decoder set its conversion up again.
+const VIEW_SETTLE: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Tells the decoder how large a received stream is shown (physical pixels): its card in
+/// the main window and the popout, each zero while it does not show one. Pictures are
+/// converted to the larger of the two instead of the stream's own size. Fractions of a
+/// pixel count as a whole one, so the picture is never smaller than its area.
+fn publish_view_size(app: &AppWindow, popout: &PopoutStreamWindow) {
+    let k = app.window().scale_factor();
+    let (vw, vh) = VIEW_LOGICAL.with(|v| v.get());
+    let (vw, vh) = ((vw * k - 0.01).ceil().max(0.0) as u32, (vh * k - 0.01).ceil().max(0.0) as u32);
+    let peer = app.get_active_stream_user_id();
+    let popped_out = !peer.is_empty() && app.get_popped_out_stream_uid() == peer;
+    let main = if screen_capture::main_window_watching() && !popped_out { (vw, vh) } else { (0, 0) };
+    let pop = if screen_capture::popout_watching() && !popout.get_is_self() {
+        match POPOUT_RESIZING.with(|p| p.get()) {
+            (0, _) | (_, 0) => {
+                let s = popout.window().size();
+                (s.width, s.height)
+            }
+            size => size,
+        }
+    } else {
+        (0, 0)
+    };
+    let sizes = (main, pop);
+    if VIEW_WANTED.with(|w| w.replace(Some(sizes))) == Some(sizes) {
+        return;
+    }
+    VIEW_TIMER.with(|t| t.start(slint::TimerMode::SingleShot, VIEW_SETTLE, move || screen_capture::set_stream_view_sizes(sizes.0, sizes.1)));
+}
+
+/// Whether a picture of this size is drawn at its own size, give or take the rounding,
+/// in the area it is shown in (the popout's, or the stream card of the main window): the
+/// decoder made it for that area. Such a picture is shown pixel for pixel; smoothing it
+/// would only blur it, since it rarely starts on a whole pixel.
+pub fn drawn_at_own_size(in_popout: bool, picture: (u32, u32)) -> bool {
+    let Some((main, popout)) = VIEW_WANTED.with(|w| w.get()) else { return false };
+    let (area_w, area_h) = if in_popout { popout } else { main };
+    let (w, h) = (picture.0 as f32, picture.1 as f32);
+    if area_w == 0 || area_h == 0 || w < 1.0 || h < 1.0 {
+        return false;
+    }
+    let scale = (area_w as f32 / w).min(area_h as f32 / h);
+    (scale - 1.0).abs() * w.min(h) <= 2.5
 }
 
 /// Hooks the layers into both windows (once the native windows exist).
@@ -52,6 +111,7 @@ pub fn viewport_changed(app: &AppWindow, popout: &PopoutStreamWindow, x: f32, y:
     let k = app.window().scale_factor();
     let rect = ((x * k).round() as i32, (y * k).round() as i32, (w * k).round().max(0.0) as u32, (h * k).round().max(0.0) as u32);
     VIEWPORT.with(|v| v.set(rect));
+    VIEW_LOGICAL.with(|v| v.set((w.max(0.0), h.max(0.0))));
     #[cfg(windows)]
     LAYERS.with(|l| {
         if let Some(m) = l.borrow().main.as_ref() {
@@ -63,6 +123,7 @@ pub fn viewport_changed(app: &AppWindow, popout: &PopoutStreamWindow, x: f32, y:
 
 /// The popout changed size (physical pixels): the video fills it.
 pub fn popout_resized(app: &AppWindow, popout: &PopoutStreamWindow, w: u32, h: u32) {
+    POPOUT_RESIZING.with(|p| p.set((w, h)));
     #[cfg(windows)]
     LAYERS.with(|l| {
         if let Some(p) = l.borrow().popout.as_ref() {
@@ -70,10 +131,12 @@ pub fn popout_resized(app: &AppWindow, popout: &PopoutStreamWindow, w: u32, h: u
         }
     });
     refresh(app, popout);
+    POPOUT_RESIZING.with(|p| p.set((0, 0)));
 }
 
-/// Re-evaluates which windows show their stream through the GPU.
+/// Re-evaluates which windows show their stream through the GPU, and at what size.
 pub fn refresh(app: &AppWindow, popout: &PopoutStreamWindow) {
+    publish_view_size(app, popout);
     #[cfg(windows)]
     {
         let parse = |s: slint::SharedString| s.parse::<u64>().unwrap_or(0);

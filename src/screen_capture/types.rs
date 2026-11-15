@@ -233,6 +233,8 @@ pub fn trigger_stream_stopped(uid: u64) {
     if let Ok(mut frames) = get_active_stream_frames().lock() {
         frames.remove(&uid);
     }
+    #[cfg(all(target_os = "linux", feature = "vaapi"))]
+    super::hw_decode::gl_present::clear(uid);
     let stream_ssrc: u32 = ((uid as u32) ^ 0x5354524D) | 0x8000_0000;
     if let Ok(mut queues) = crate::gateway::get_speaker_pcm_queues().lock() {
         queues.remove(&stream_ssrc);
