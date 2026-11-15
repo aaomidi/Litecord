@@ -353,6 +353,36 @@ impl GatewayClient {
                             }
                         }
                     }
+                    GatewayCommand::UpdateSelfMuteDeaf { self_mute, self_deaf } => {
+                        *client_cmd.voice_self_mute.lock().unwrap() = self_mute;
+
+                        // The channel is the one joined, never the one open in the chat pane:
+                        // OP 4 with another voice channel's id would move the call there.
+                        // Outside a call there is nothing to tell Discord (the next join
+                        // carries the mute state).
+                        let Some(channel_id) = client_cmd.voice_channel_id.lock().unwrap().clone() else { continue };
+                        let guild_id = client_cmd.voice_guild_id.lock().unwrap().clone().unwrap_or_default();
+                        let effective_gid_val = if guild_id.trim().is_empty() || guild_id == "@me" {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::json!(guild_id)
+                        };
+
+                        let payload = serde_json::json!({
+                            "op": 4,
+                            "d": {
+                                "guild_id": effective_gid_val,
+                                "channel_id": channel_id,
+                                "self_mute": self_mute,
+                                "self_deaf": self_deaf
+                            }
+                        });
+
+                        info!("Sending OP 4 VoiceStateUpdate (mute/deafen) to the gateway: {}", payload);
+                        if let Some(tx) = client_cmd.ws_tx.lock().await.as_ref() {
+                            let _ = tx.send(Message::Text(payload.to_string().into())).await;
+                        }
+                    }
                     GatewayCommand::SubscribeGuild { .. } => {}
                 }
             }

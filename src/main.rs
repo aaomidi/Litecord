@@ -2093,8 +2093,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     info!("[DeepSleep] Restaurado - re-sincronizando {} mensagem(s) pendente(s) do canal {}.", pending, ch_id);
                     let app_w = app_weak_restore.clone();
                     let ch = ch_id.clone();
+                    let active = Arc::clone(&active_channel_restore);
                     tokio::spawn(async move {
-                        load_messages_for_channel(&http, app_w, &ch).await;
+                        load_messages_for_channel(&http, app_w, &active, &ch).await;
                     });
                 }
 
@@ -2111,12 +2112,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let activity = crate::ui::helpers::take_hidden_channel_activity();
                 let dm_total = crate::ui::helpers::get_total_dm_unreads();
                 let app_w = app_weak_restore.clone();
+                let guilds_map_ui = Arc::clone(&guilds_map_restore);
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = app_w.upgrade() {
                         ui.set_total_dm_unread_count(dm_total);
                         if let Some(rows) = fresh_channels {
                             crate::ui::helpers::update_channel_voice_rows(&ui, rows);
                         }
+                        crate::ui::helpers::follow_moved_voice_channel(&ui, &guilds_map_ui);
                         crate::ui::helpers::apply_channel_activity(&ui, &activity, &ch_id, gid == "@me");
                     }
                 });
@@ -2786,9 +2789,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Leave Voice Callback
     let cmd_tx_leave = Arc::clone(&cmd_tx_store);
     let active_guild_leave = Arc::clone(&active_guild_id);
-    let active_channel_leave = Arc::clone(&active_channel_id);
-    let guilds_map_leave = Arc::clone(&guilds_map);
-    let http_client_leave = Arc::clone(&http_client);
     let app_weak_leave = app_weak.clone();
     let sm_leave = Arc::clone(&screen_manager);
     let hidden_streams_leave = Arc::clone(&hidden_streams);
@@ -2817,6 +2817,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_is_voice_connecting(false);
             ui.set_is_voice_focused(false);
             ui.set_current_voice_channel("".into());
+            ui.set_voice_channel_id("".into());
+            ui.set_voice_chat_unread(0);
             ui.set_is_in_dm_call(false); // também encerra chamada DM se estava ativa
             ui.set_is_screen_sharing(false);
             ui.set_share_notice("".into());
@@ -2847,56 +2849,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
 
-            // Find the first readable text channel of the current guild
-            let target_text_ch = if let Ok(map) = guilds_map_leave.lock() {
-                map.get(&gid).and_then(|g| {
-                    g.channels.iter().find(|c| !c.is_voice && !c.is_category).cloned()
-                })
-            } else {
-                None
-            };
-
-            if let Some(tch) = target_text_ch {
-                *active_channel_leave.lock().unwrap() = tch.id.clone();
-                let clean_name = crate::utils::styled_text::plain_display_name(tch.name.trim_start_matches('#').trim()).into_owned();
-                let tch_id = tch.id.clone();
-                ui.set_active_channel_name(clean_name.into());
-                ui.set_active_channel_id(tch_id.clone().into());
-
-                let http_opt = http_client_leave.lock().unwrap().as_ref().cloned();
-                let app_w = app_weak_leave.clone();
-                if let Some(http) = http_opt {
-                    tokio::spawn(async move {
-                        load_messages_for_channel(&http, app_w, &tch_id).await;
-                    });
-                }
-            } else {
-                let mut current_msgs: Vec<ChatMessage> = ui.get_messages().iter().collect();
-                current_msgs.push(ChatMessage {
-                    id: "".into(),
-                    author: "Litecord Voice".into(),
-                    content: crate::utils::i18n_ui::pick("🔴 Disconnected from the voice room.", "🔴 Desconectado da sala de voz.").into(),
-                    commands: slint::ModelRc::default(),
-                    content_lines: slint::ModelRc::default(),
-                    embed_content: "".into(),
-                    embed_lines: slint::ModelRc::default(),
-                    embed_color: slint::Color::from_rgb_u8(88, 101, 242),
-                    embed_footer: "".into(),
-                    code_block: "".into(),
-                    reply_author: "".into(),
-                    reply_content: "".into(),
-                    reply_command: "".into(),
-                    links: slint::ModelRc::default(),
-                    buttons: slint::ModelRc::default(),
-                    attachments: slint::ModelRc::default(),
-                    timestamp: crate::utils::i18n_ui::ui_text().now_label.into(),
-                    show_header: true,
-                    ..Default::default()
-                });
-                let model = std::rc::Rc::new(slint::VecModel::from(current_msgs));
-                ui.set_messages(model.into());
-                request_chat_scroll_to_bottom(app_weak_leave.clone());
-            }
+            // The chat pane keeps what it shows: the channel that was open, or this call's
+            // own chat, which stays readable as the chat of a voice channel not joined.
         }
     });
 
@@ -2924,6 +2878,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_is_voice_focused(true);
             ui.set_is_in_dm_call(true);
             ui.set_current_voice_channel(call_name.into());
+            ui.set_voice_channel_id("".into());
+            ui.set_voice_chat_unread(0);
             sound_effects::play_ui_sound(sound_effects::UiSound::JoinChannel);
         }
 
@@ -3009,6 +2965,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_is_voice_connecting(false);
             ui.set_is_voice_focused(false);
             ui.set_current_voice_channel("".into());
+            ui.set_voice_channel_id("".into());
+            ui.set_voice_chat_unread(0);
             gateway::clear_voice_participants();
         }
     });
@@ -3035,6 +2993,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_is_voice_focused(true);
             ui.set_is_in_dm_call(true);
             ui.set_current_voice_channel(caller.into());
+            ui.set_voice_channel_id("".into());
+            ui.set_voice_chat_unread(0);
             sound_effects::play_ui_sound(sound_effects::UiSound::JoinChannel);
 
             // Iniciar mic
@@ -3211,6 +3171,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let app_w_inner = app_w.clone();
             let ch_id_clone = ch_id.clone();
+            // A page that arrives after another channel was opened is not for the chat on
+            // screen: it is dropped, and that channel's own load owns the paging state.
+            let still_open = {
+                let (active, paged) = (Arc::clone(&active_ch_older), ch_id.clone());
+                move || *active.lock().unwrap() == paged
+            };
+            let still_open_err = still_open.clone();
             tokio::spawn(async move {
                 match http.get_channel_messages_before(&ch_id_clone, &oldest_id).await {
                     Ok(msgs_val) => {
@@ -3222,6 +3189,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         let _ = slint::invoke_from_event_loop(move || {
+                            if !still_open() {
+                                info!("Dropping the older messages loaded for channel {}: another channel was opened meanwhile.", ch_id_clone);
+                                return;
+                            }
                             if let Some(ui) = app_w_inner.upgrade() {
                                 ui.set_is_loading_older_messages(false);
                                 ui.set_has_more_older_messages(has_more);
@@ -3278,6 +3249,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => {
                         error!("Erro ao carregar mensagens anteriores: {}", e);
                         let _ = slint::invoke_from_event_loop(move || {
+                            if !still_open_err() {
+                                return;
+                            }
                             if let Some(ui) = app_w_inner.upgrade() {
                                 ui.set_is_loading_older_messages(false);
                             }
@@ -4021,7 +3995,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let active_guild_chan_select = Arc::clone(&active_guild_id);
     let active_channel_chan_select = Arc::clone(&active_channel_id);
     let app_weak_chan_select = app_weak.clone();
-    let http_client_chan_select = Arc::clone(&http_client);
     let cmd_tx_chan_select = Arc::clone(&cmd_tx_store);
     let selected_input_voice = Arc::clone(&selected_input);
     let active_mic_stream_voice = Arc::clone(&active_mic_stream);
@@ -4133,6 +4106,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sm_chan_select = Arc::clone(&screen_manager);
 
+    // Shows a channel in the chat pane: from here on it is the one read, paged, sent to and
+    // updated live. The chat of a voice channel is the voice channel itself (same id, same
+    // message endpoints and events), so it is opened the same way, with `is_voice_chat`
+    // set for the header.
+    let show_channel_chat: std::rc::Rc<dyn Fn(&AppWindow, &str, &str, bool)> = {
+        let active_channel = Arc::clone(&active_channel_id);
+        let http_client = Arc::clone(&http_client);
+        std::rc::Rc::new(move |ui: &AppWindow, ch_id: &str, ch_name: &str, is_voice_chat: bool| {
+            *active_channel.lock().unwrap() = ch_id.to_string();
+            let clean_name = crate::utils::styled_text::plain_display_name(ch_name.trim_start_matches('#').trim());
+            ui.set_active_channel_name(clean_name.as_ref().into());
+            ui.set_active_channel_id(ch_id.into());
+            ui.set_voice_chat_channel_id(if is_voice_chat { ch_id.into() } else { "".into() });
+            if ch_id == ui.get_voice_channel_id().as_str() {
+                ui.set_voice_chat_unread(0);
+            }
+            request_chat_scroll_to_bottom(ui.as_weak());
+
+            // Zera o badge de não lidos do canal que foi aberto
+            let mut channels: Vec<ChannelItem> = ui.get_channels().iter().collect();
+            if let Some(ch) = channels.iter_mut().find(|c| c.id == ch_id) {
+                ch.unread_count = 0;
+            }
+            let model = std::rc::Rc::new(slint::VecModel::from(channels));
+            ui.set_channels(model.into());
+
+            // Zera o unread deste canal no mapa global de DMs e atualiza o badge do botão principal de DMs
+            let remaining_dm_unreads = crate::ui::helpers::clear_dm_unread(ch_id);
+            ui.set_total_dm_unread_count(remaining_dm_unreads);
+
+            let http_opt = http_client.lock().unwrap().as_ref().cloned();
+            let app_w = ui.as_weak();
+            let ch_id_clone = ch_id.to_string();
+
+            if let Some(http) = http_opt {
+                let active = Arc::clone(&active_channel);
+                tokio::spawn(async move {
+                    load_messages_for_channel(&http, app_w, &active, &ch_id_clone).await;
+                });
+            }
+        })
+    };
+    let show_chat_select = std::rc::Rc::clone(&show_channel_chat);
+
     app.on_select_channel(move |channel_id: SharedString| {
         let ch_id = channel_id.to_string();
         info!("Canal selecionado pelo usuário: {}", ch_id);
@@ -4183,67 +4200,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mic_name = selected_input_voice.lock().unwrap().clone();
                 *active_mic_stream_voice.lock().unwrap() = Some(start_mic_capture(mic_name, level_tx_voice.clone()));
                 info!("Abrindo o microfone para o canal de voz...");
-                
-                let mut current_msgs: Vec<ChatMessage> = ui.get_messages().iter().collect();
-                current_msgs.push(ChatMessage {
-                    id: "".into(),
-                    author: "Litecord Voice".into(),
-                    content: format!("{}: {}", crate::utils::i18n_ui::pick("🔊 Joined voice channel", "🔊 Entrou no canal de voz"), ch_name).into(),
-                    commands: slint::ModelRc::default(),
-                    content_lines: slint::ModelRc::default(),
-                    embed_content: "".into(),
-                    embed_lines: slint::ModelRc::default(),
-                    embed_color: slint::Color::from_rgb_u8(88, 101, 242),
-                    embed_footer: "".into(),
-                    code_block: "".into(),
-                    reply_author: "".into(),
-                    reply_content: "".into(),
-                    reply_command: "".into(),
-                    links: slint::ModelRc::default(),
-                    buttons: slint::ModelRc::default(),
-                    attachments: slint::ModelRc::default(),
-                    timestamp: crate::utils::i18n_ui::ui_text().now_label.into(),
-                    show_header: true,
-                    ..Default::default()
-                });
-                let model = std::rc::Rc::new(slint::VecModel::from(current_msgs));
-                ui.set_messages(model.into());
+
+                // The call's own chat is loaded behind the voice room, ready for "View Text Chat".
+                ui.set_voice_channel_id(ch_id.clone().into());
+                show_chat_select(&ui, &ch_id, &ch_name, true);
             } else {
-                let clean_name = crate::utils::styled_text::plain_display_name(ch_name.trim_start_matches('#').trim());
-                ui.set_active_channel_name(clean_name.as_ref().into());
-                ui.set_active_channel_id(ch_id.clone().into());
                 ui.set_is_voice_focused(false);
-                request_chat_scroll_to_bottom(app_weak_chan_select.clone());
-
-                // Zera o badge de não lidos do canal que foi aberto
-                let mut channels: Vec<ChannelItem> = ui.get_channels().iter().collect();
-                if let Some(ch) = channels.iter_mut().find(|c| c.id == ch_id.as_str()) {
-                    ch.unread_count = 0;
-                }
-                let model = std::rc::Rc::new(slint::VecModel::from(channels));
-                ui.set_channels(model.into());
-
-                // Zera o unread deste canal no mapa global de DMs e atualiza o badge do botão principal de DMs
-                let remaining_dm_unreads = crate::ui::helpers::clear_dm_unread(&ch_id);
-                ui.set_total_dm_unread_count(remaining_dm_unreads);
-
-                let http_opt = http_client_chan_select.lock().unwrap().as_ref().cloned();
-                let app_w = app_weak_chan_select.clone();
-                let ch_id_clone = ch_id.clone();
-
-                if let Some(http) = http_opt {
-                    tokio::spawn(async move {
-                        load_messages_for_channel(&http, app_w, &ch_id_clone).await;
-                    });
-                }
+                show_chat_select(&ui, &ch_id, &ch_name, false);
             }
         }
     });
 
+    // The chat of a voice channel without joining its call: the speech-bubble button of its
+    // row in the channel list, and "View Text Chat" in the voice room (for the call's own).
+    let app_weak_open_chat = app_weak.clone();
+    let active_channel_open_chat = Arc::clone(&active_channel_id);
+    let guilds_map_open_chat = Arc::clone(&guilds_map);
+    app.on_open_channel_chat(move |channel_id: SharedString| {
+        let ch_id = channel_id.to_string();
+        let Some(ui) = app_weak_open_chat.upgrade() else { return };
+        ui.set_is_voice_focused(false);
+        if *active_channel_open_chat.lock().unwrap() == ch_id {
+            // Already in the chat pane (the call's chat is loaded when the call is joined).
+            if ch_id == ui.get_voice_channel_id().as_str() {
+                ui.set_voice_chat_unread(0);
+            }
+            request_chat_scroll_to_bottom(app_weak_open_chat.clone());
+            return;
+        }
+        info!("Opening the chat of voice channel {}", ch_id);
+        // Looked up in every server: the call may be in another one than the one on screen.
+        let ch_name = guilds_map_open_chat.lock().unwrap()
+            .values()
+            .find_map(|g| g.channels.iter().find(|c| c.id == ch_id).map(|c| c.name.clone()))
+            .unwrap_or_else(|| crate::utils::i18n_ui::pick("channel", "canal").to_string());
+        show_channel_chat(&ui, &ch_id, &ch_name, true);
+    });
+
     // Mute Button Toggle Callback
     let cmd_tx_mute = Arc::clone(&cmd_tx_store);
-    let active_guild_mute = Arc::clone(&active_guild_id);
-    let active_channel_mute = Arc::clone(&active_channel_id);
     let app_weak_mute = app_weak.clone();
 
     app.on_toggle_mute(move || {
@@ -4256,14 +4251,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sound_effects::UiSound::Unmute
             });
 
-            let gid = active_guild_mute.lock().unwrap().clone();
-            let cid = active_channel_mute.lock().unwrap().clone();
             let deafened = ui.get_is_deafened();
 
+            // The gateway applies it to the call in progress: the channel on screen may be
+            // another one (a text channel, or the chat of a voice channel not joined).
             if let Some(cmd_tx_guard) = cmd_tx_mute.lock().unwrap().as_ref() {
-                let _ = cmd_tx_guard.try_send(GatewayCommand::UpdateVoiceState {
-                    guild_id: gid,
-                    channel_id: Some(cid),
+                let _ = cmd_tx_guard.try_send(GatewayCommand::UpdateSelfMuteDeaf {
                     self_mute: new_muted,
                     self_deaf: deafened,
                 });
@@ -4273,8 +4266,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Deafen Button Toggle Callback
     let cmd_tx_deafen = Arc::clone(&cmd_tx_store);
-    let active_guild_deafen = Arc::clone(&active_guild_id);
-    let active_channel_deafen = Arc::clone(&active_channel_id);
     let app_weak_deafen = app_weak.clone();
 
     app.on_toggle_deafen(move || {
@@ -4288,14 +4279,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sound_effects::UiSound::Undeafen
             });
 
-            let gid = active_guild_deafen.lock().unwrap().clone();
-            let cid = active_channel_deafen.lock().unwrap().clone();
             let muted = ui.get_is_muted();
 
             if let Some(cmd_tx_guard) = cmd_tx_deafen.lock().unwrap().as_ref() {
-                let _ = cmd_tx_guard.try_send(GatewayCommand::UpdateVoiceState {
-                    guild_id: gid,
-                    channel_id: Some(cid),
+                let _ = cmd_tx_guard.try_send(GatewayCommand::UpdateSelfMuteDeaf {
                     self_mute: muted,
                     self_deaf: new_deafened,
                 });
@@ -4306,13 +4293,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start Global Keybinds Listener (Global shortcuts for Mute/Deafen)
     let app_weak_kb_mute = app_weak.clone();
     let cmd_tx_kb_mute = Arc::clone(&cmd_tx_store);
-    let active_guild_kb_mute = Arc::clone(&active_guild_id);
-    let active_channel_kb_mute = Arc::clone(&active_channel_id);
 
     let app_weak_kb_deaf = app_weak.clone();
     let cmd_tx_kb_deaf = Arc::clone(&cmd_tx_store);
-    let active_guild_kb_deaf = Arc::clone(&active_guild_id);
-    let active_channel_kb_deaf = Arc::clone(&active_channel_id);
 
     let app_weak_kb_rec = app_weak.clone();
 
@@ -4320,8 +4303,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         move || {
             let app_w = app_weak_kb_mute.clone();
             let cmd_tx = Arc::clone(&cmd_tx_kb_mute);
-            let agid = Arc::clone(&active_guild_kb_mute);
-            let acid = Arc::clone(&active_channel_kb_mute);
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = app_w.upgrade() {
                     let new_muted = !ui.get_is_muted();
@@ -4332,14 +4313,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         sound_effects::UiSound::Unmute
                     });
 
-                    let gid = agid.lock().unwrap().clone();
-                    let cid = acid.lock().unwrap().clone();
                     let deafened = ui.get_is_deafened();
 
                     if let Some(cmd_tx_guard) = cmd_tx.lock().unwrap().as_ref() {
-                        let _ = cmd_tx_guard.try_send(GatewayCommand::UpdateVoiceState {
-                            guild_id: gid,
-                            channel_id: Some(cid),
+                        let _ = cmd_tx_guard.try_send(GatewayCommand::UpdateSelfMuteDeaf {
                             self_mute: new_muted,
                             self_deaf: deafened,
                         });
@@ -4350,8 +4327,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         move || {
             let app_w = app_weak_kb_deaf.clone();
             let cmd_tx = Arc::clone(&cmd_tx_kb_deaf);
-            let agid = Arc::clone(&active_guild_kb_deaf);
-            let acid = Arc::clone(&active_channel_kb_deaf);
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = app_w.upgrade() {
                     let new_deafened = !ui.get_is_deafened();
@@ -4363,14 +4338,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         sound_effects::UiSound::Undeafen
                     });
 
-                    let gid = agid.lock().unwrap().clone();
-                    let cid = acid.lock().unwrap().clone();
                     let muted = ui.get_is_muted();
 
                     if let Some(cmd_tx_guard) = cmd_tx.lock().unwrap().as_ref() {
-                        let _ = cmd_tx_guard.try_send(GatewayCommand::UpdateVoiceState {
-                            guild_id: gid,
-                            channel_id: Some(cid),
+                        let _ = cmd_tx_guard.try_send(GatewayCommand::UpdateSelfMuteDeaf {
                             self_mute: muted,
                             self_deaf: new_deafened,
                         });
@@ -4525,6 +4496,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_client_cmd = Arc::clone(&http_client);
     let active_channel_cmd = Arc::clone(&active_channel_id);
     let active_guild_cmd = Arc::clone(&active_guild_id);
+    let guilds_map_cmd = Arc::clone(&guilds_map);
     app.on_execute_active_command(move |cmd_name: SharedString, arg_value: SharedString, app_id: SharedString, cmd_id: SharedString, version: SharedString, param_name: SharedString| {
         let cmd_name_str = cmd_name.to_string();
         let arg_val_str = arg_value.to_string();
@@ -4534,7 +4506,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let param_name_str = param_name.to_string();
         
         let channel_id = active_channel_cmd.lock().unwrap().clone();
-        let guild_id = active_guild_cmd.lock().unwrap().clone();
+        let shown_guild_id = active_guild_cmd.lock().unwrap().clone();
+        // The open channel can belong to another server than the one on screen (the chat of
+        // the call in progress, opened from the voice room): the interaction goes with the
+        // channel's own server, and a command of the server on screen that Discord rejects
+        // there is not posted as plain text.
+        let guild_id = {
+            let map = guilds_map_cmd.lock().unwrap();
+            let has_channel = |g: &GuildData| g.channels.iter().any(|c| c.id == channel_id);
+            if map.get(&shown_guild_id).is_some_and(has_channel) {
+                shown_guild_id.clone()
+            } else {
+                map.values().find(|g| has_channel(g)).map(|g| g.id.clone()).unwrap_or_else(|| shown_guild_id.clone())
+            }
+        };
+        let other_server = guild_id != shown_guild_id;
         let http_opt = http_client_cmd.lock().unwrap().as_ref().cloned();
 
         if let Some(http) = http_opt {
@@ -4560,6 +4546,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         options,
                         ""
                     ).await {
+                        if other_server {
+                            warn!("Slash command /{} rejected in channel {}, which is not in the server on screen (nothing posted): {}", clean_name, channel_id, e);
+                            return;
+                        }
                         warn!("Falha ao enviar slash command interaction (tentando fallback): {}", e);
                         let fallback_msg = if arg_val_str.is_empty() {
                             format!("/{}", clean_name)
@@ -4807,6 +4797,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             info!("🚪 Desconectando UI do canal de voz (sessão encerrada/deslocada por outro cliente)");
                             ui.set_is_in_voice(false);
                             ui.set_is_voice_connecting(false);
+                            ui.set_voice_channel_id("".into());
+                            ui.set_voice_chat_unread(0);
                             ui.set_is_screen_sharing(false);
                             ui.set_has_active_stream(false);
                             ui.set_popped_out_stream_uid("".into());
@@ -4865,6 +4857,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         (shown_guild == "@me", in_list)
                     };
                     let visible = APP_IS_VISIBLE.load(Ordering::Relaxed);
+                    // A message in the chat of the call in progress while that chat is not on
+                    // screen (voice room in front, or another channel open) is counted on
+                    // "View Text Chat". Checked here first so other messages do not wake the UI.
+                    let in_my_voice_channel = gateway::get_guild_voice_states_store().lock()
+                        .is_ok_and(|states| states.get(&gateway::get_my_user_id()).is_some_and(|c| *c == channel_id));
+                    if visible && !is_self && in_my_voice_channel {
+                        let (app_w, id) = (app_weak_inner.clone(), channel_id.clone());
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = app_w.upgrade() {
+                                let on_screen = !ui.get_is_voice_focused() && ui.get_active_channel_id() == id.as_str();
+                                if ui.get_is_in_voice() && ui.get_voice_channel_id() == id.as_str() && !on_screen {
+                                    ui.set_voice_chat_unread(ui.get_voice_chat_unread() + 1);
+                                }
+                            }
+                        });
+                    }
                     // Sidebar row update for this message; while hidden it is only recorded
                     // and applied when the window comes back.
                     let sidebar = |new_unread: i32| {
@@ -5080,18 +5088,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let gid = active_guild_inner.lock().unwrap().clone();
                     let channels_opt = guilds_map_inner.lock().ok().and_then(|map| map.get(&gid).map(|g| g.channels.clone()));
-                    if let Some(chans) = channels_opt {
-                        let ui_channels = {
-                            let cats_guard = get_collapsed_categories().lock().unwrap().clone();
-                            build_ui_channels(&chans, &cats_guard)
-                        };
-                        let app_w = app_weak_inner.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = app_w.upgrade() {
-                                crate::ui::helpers::update_channel_voice_rows(&ui, ui_channels);
+                    let ui_channels = channels_opt.map(|chans| {
+                        let cats_guard = get_collapsed_categories().lock().unwrap().clone();
+                        build_ui_channels(&chans, &cats_guard)
+                    });
+                    let app_w = app_weak_inner.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = app_w.upgrade() {
+                            if let Some(rows) = ui_channels {
+                                crate::ui::helpers::update_channel_voice_rows(&ui, rows);
                             }
-                        });
-                    }
+                            crate::ui::helpers::follow_moved_voice_channel(&ui, &guilds_map_inner);
+                        }
+                    });
                 }
                 GatewayEvent::GuildLoaded { .. } => {
                     // Handled via HTTP REST instant fetching

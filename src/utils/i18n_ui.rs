@@ -332,6 +332,9 @@ ui_strings! {
     (ui_sounds_breath_desc, set_ui_sounds_breath_desc, "Two soft, pure notes that swell in and fade away.", "Duas notas suaves e puras que crescem e se desfazem.", "Dos notas suaves y puras que crecen y se desvanecen.", "Zwei weiche, reine Töne, die anschwellen und verklingen.", "Deux notes douces et pures qui enflent puis s’éteignent.", "Две мягкие чистые ноты, которые нарастают и затихают.", "ふわりと立ち上がって消えていく、やわらかく澄んだ2つの音。"),
     (ui_sounds_off, set_ui_sounds_off, "Off", "Desligado", "Desactivado", "Aus", "Désactivé", "Выключено", "オフ"),
     (ui_sounds_off_desc, set_ui_sounds_off_desc, "No interface sounds.", "Sem sons da interface.", "Sin sonidos de la interfaz.", "Keine Signaltöne.", "Aucun son de l’interface.", "Без звуков интерфейса.", "効果音を鳴らしません。"),
+    // Labels beside the name in the chat header while it shows a voice channel's own chat: the call in progress, or a voice channel not joined.
+    (call_chat, set_call_chat, "Call chat", "Chat da chamada", "Chat de la llamada", "Anruf-Chat", "Chat de l’appel", "Чат звонка", "通話チャット"),
+    (voice_channel_chat, set_voice_channel_chat, "Voice channel chat", "Chat do canal de voz", "Chat del canal de voz", "Chat des Sprachkanals", "Chat du salon vocal", "Чат голосового канала", "ボイスチャンネルのチャット"),
 }
 
 #[cfg(test)]

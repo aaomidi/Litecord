@@ -147,6 +147,11 @@ pub enum GatewayCommand {
         self_mute: bool,
         self_deaf: bool,
     },
+    /// Mute/deafen for the call in progress, whatever channel or server is on screen.
+    UpdateSelfMuteDeaf {
+        self_mute: bool,
+        self_deaf: bool,
+    },
     SubscribeGuild {
         guild_id: String,
         channel_ids: Vec<String>,

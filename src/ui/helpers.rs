@@ -210,6 +210,28 @@ pub fn update_channel_voice_rows(ui: &AppWindow, fresh: Vec<ChannelItem>) {
     ui.set_channels(std::rc::Rc::new(slint::VecModel::from(rows)).into());
 }
 
+/// Follows the account when Discord moved it to another voice channel (a moderator's drag,
+/// the AFK move): "View Text Chat", its unread count and the banner name then belong to the
+/// channel the call is in now. The chat pane keeps the channel it shows.
+pub fn follow_moved_voice_channel(ui: &AppWindow, guilds_map: &Arc<Mutex<HashMap<String, crate::gateway::GuildData>>>) {
+    let joined = ui.get_voice_channel_id();
+    // Empty outside a call and in a DM call, which has no chat of its own.
+    if !ui.get_is_in_voice() || joined.is_empty() {
+        return;
+    }
+    let now = gateway::get_guild_voice_states_store().lock().ok()
+        .and_then(|states| states.get(&gateway::get_my_user_id()).cloned());
+    let Some(now) = now.filter(|c| c != joined.as_str()) else { return };
+    info!("Moved to another voice channel by Discord: {} -> {}", joined, now);
+    let name = guilds_map.lock().ok()
+        .and_then(|map| map.values().find_map(|g| g.channels.iter().find(|c| c.id == now).map(|c| c.name.clone())));
+    if let Some(name) = name {
+        ui.set_current_voice_channel(name.into());
+    }
+    ui.set_voice_channel_id(now.into());
+    ui.set_voice_chat_unread(0);
+}
+
 pub fn apply_i18n_translations(ui: &AppWindow, lang: i18n::Language) {
     let resolved = match lang {
         i18n::Language::Auto => i18n::detect_os_language(),

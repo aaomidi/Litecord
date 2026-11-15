@@ -531,7 +531,7 @@ async fn open_first_readable_channel(
         }
         let ch_id = text_ch.id.clone();
         *active_channel_id.lock().unwrap() = ch_id.clone();
-        let readable = load_messages_for_channel(http, app_weak.clone(), &ch_id).await;
+        let readable = load_messages_for_channel(http, app_weak.clone(), active_channel_id, &ch_id).await;
         let current = active_channel_id.lock().unwrap().clone();
         if current != ch_id {
             // The user opened another channel while this one loaded.
@@ -760,7 +760,7 @@ pub async fn fetch_and_populate_dms(
                     }
                 });
 
-                load_messages_for_channel(http, app_weak.clone(), &cid).await;
+                load_messages_for_channel(http, app_weak.clone(), &active_channel_id, &cid).await;
             }
         }
         Err(e) => {
@@ -797,15 +797,31 @@ pub async fn prefetch_dms_cache(
     }
 }
 
+/// Loads the last messages of `channel_id` into the chat pane. `active_channel_id` is the
+/// channel the pane belongs to now (the one the input sends to): an answer that arrives
+/// after the user moved to another channel is dropped, so a slow load never fills the
+/// chat of a different channel.
 pub async fn load_messages_for_channel(
     http: &DiscordHttpClient,
     app_weak: slint::Weak<AppWindow>,
+    active_channel_id: &Arc<Mutex<String>>,
     channel_id: &str,
 ) -> bool {
     info!("Carregando mensagens do canal {}...", channel_id);
     emoji_cache::get_emoji_cache().set_active_channel(channel_id);
     let ch_id_for_emojis = channel_id.to_string();
     let app_weak_load = app_weak.clone();
+    let still_open = {
+        let (active, loaded) = (Arc::clone(active_channel_id), channel_id.to_string());
+        move || {
+            let open = *active.lock().unwrap() == loaded;
+            if !open {
+                info!("Dropping the messages loaded for channel {}: another channel was opened meanwhile.", loaded);
+            }
+            open
+        }
+    };
+    let still_open_err = still_open.clone();
     match http.get_channel_messages(channel_id).await {
         Ok(msgs_val) => {
             let has_more = msgs_val.len() >= 30;
@@ -816,6 +832,9 @@ pub async fn load_messages_for_channel(
             }
 
             let _ = slint::invoke_from_event_loop(move || {
+                if !still_open() {
+                    return;
+                }
                 if let Some(ui) = app_weak.upgrade() {
                     ui.set_has_more_older_messages(has_more);
                     ui.set_is_loading_older_messages(false);
@@ -901,8 +920,12 @@ pub async fn load_messages_for_channel(
             };
 
             let _ = slint::invoke_from_event_loop(move || {
+                if !still_open_err() {
+                    return;
+                }
                 if let Some(ui) = app_weak.upgrade() {
                     ui.set_has_more_older_messages(false);
+                    ui.set_is_loading_older_messages(false);
                     let ui_msgs = vec![ChatMessage {
                         id: "".into(),
                         author: "Litecord System".into(),
