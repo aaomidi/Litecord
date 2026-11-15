@@ -116,18 +116,54 @@ pub fn fit_bgra_to_canvas(
 
 static PEER_SPS_PPS_CACHE: Mutex<Option<HashMap<u64, Vec<u8>>>> = Mutex::new(None);
 
-/// Largest size (physical pixels, `w << 32 | h`) a received stream is shown at, set by the
-/// UI. Frames are converted straight to that size: converting and then drawing a 1080p
-/// frame shown in a 980 px window cost about four times the pixels that end up on screen.
+/// Sizes (physical pixels, `w << 32 | h`) of the areas a received stream is shown in, set
+/// by the UI: its card in the main window and the popout (zero: not shown there). Frames
+/// are converted straight to the larger of the two pictures: converting and then drawing
+/// a 1080p frame shown in a 408 px high card cost about seven times the pixels that end
+/// up on screen.
 static STREAM_VIEW_PX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STREAM_POPOUT_PX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn set_stream_view_size(w: u32, h: u32) {
-    STREAM_VIEW_PX.store((w as u64) << 32 | h as u64, Ordering::Relaxed);
+    set_stream_view_sizes((w, h), (0, 0));
 }
 
-fn stream_view_size() -> (u32, u32) {
-    let v = STREAM_VIEW_PX.load(Ordering::Relaxed);
-    ((v >> 32) as u32, v as u32)
+pub fn set_stream_view_sizes(main: (u32, u32), popout: (u32, u32)) {
+    STREAM_VIEW_PX.store((main.0 as u64) << 32 | main.1 as u64, Ordering::Relaxed);
+    STREAM_POPOUT_PX.store((popout.0 as u64) << 32 | popout.1 as u64, Ordering::Relaxed);
+}
+
+/// When the UI thread was given a picture of a received stream that it has not taken yet
+/// (microseconds on `rx_clock`, 0: it has none waiting).
+static RX_UI_PENDING_SINCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A picture that has waited this long (half a frame at 60 FPS) means the UI thread is
+/// busy drawing and falling behind the stream. A shorter wait says nothing: the picture
+/// may have been handed over a moment ago.
+const RX_UI_BEHIND_US: u64 = 8_000;
+
+fn rx_clock_us() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64 + 1
+}
+
+/// The UI's side of the hand-over says whether a picture is waiting for it.
+pub fn set_rx_ui_pending(pending: bool) {
+    if pending {
+        // The oldest wait counts: a newer picture replacing the waiting one does not restart it.
+        let _ = RX_UI_PENDING_SINCE.compare_exchange(0, rx_clock_us(), Ordering::AcqRel, Ordering::Relaxed);
+    } else {
+        RX_UI_PENDING_SINCE.store(0, Ordering::Release);
+    }
+}
+
+/// Whether a picture decoded now would only replace, unseen, the one the UI thread still
+/// has to take: that one has waited long enough to say the UI is not keeping up, or the
+/// decoder itself is (`decoder_busy`: frames are queueing up behind it, and reading this
+/// one back would put it further behind).
+pub fn rx_ui_behind(decoder_busy: bool) -> bool {
+    let since = RX_UI_PENDING_SINCE.load(Ordering::Acquire);
+    since != 0 && (decoder_busy || rx_clock_us().saturating_sub(since) >= RX_UI_BEHIND_US)
 }
 
 /// Whether any window can show a received stream right now. When none can (Litecord in
@@ -448,8 +484,16 @@ fn shown_size(w: u32, h: u32) -> (u32, u32) {
     if crate::utils::test_hooks::FULL_SIZE_CONVERSION.load(Ordering::Relaxed) {
         return (w, h);
     }
-    let (view_w, view_h) = stream_view_size();
-    fit_within(w, h, view_w, view_h)
+    let fit = |px: u64| match ((px >> 32) as u32, px as u32) {
+        (0, _) | (_, 0) => (0, 0),
+        (view_w, view_h) => fit_within(w, h, view_w, view_h),
+    };
+    let (main, popout) = (fit(STREAM_VIEW_PX.load(Ordering::Relaxed)), fit(STREAM_POPOUT_PX.load(Ordering::Relaxed)));
+    if main == (0, 0) && popout == (0, 0) {
+        // Nothing reported yet.
+        return (w, h);
+    }
+    (main.0.max(popout.0), main.1.max(popout.1))
 }
 
 pub fn decode_video_frame(decoders: &mut StreamDecoders, peer_uid: u64, frame_data: &[u8]) -> Decoded {

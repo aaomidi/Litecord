@@ -14,7 +14,7 @@ default = ["vaapi"]
 automation = []
 # Linux: H.264 screen-share encoding on the GPU through GStreamer's VA-API elements
 # (src/encoder/vaapi.rs). Does nothing on other systems.
-vaapi = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
+vaapi = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:gstreamer-allocators"]
 
 [dependencies]
 slint = "1.9"
@@ -131,6 +131,8 @@ libc = "0.2"
 gstreamer = { version = "0.25", optional = true }
 gstreamer-app = { version = "0.25", optional = true }
 gstreamer-video = { version = "0.25", optional = true }
+# The file descriptor of a decoded picture's DMABuf (screen_capture::hw_decode::gl_present).
+gstreamer-allocators = { version = "0.25", optional = true }
 
 [build-dependencies]
 slint-build = "1.9"

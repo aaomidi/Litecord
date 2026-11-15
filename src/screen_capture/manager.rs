@@ -7,6 +7,11 @@ use std::collections::HashMap;
 /// and asks that peer for a keyframe.
 static DECODE_RESYNC: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
 
+/// Test only (automation port): puts a frame in the decode queue as the receive thread
+/// does. Arguments: peer, name, FPS, sequence number, timestamp (ms), access unit.
+#[cfg(feature = "automation")]
+pub static DEMO_FEED: std::sync::Mutex<Option<Box<dyn Fn(u64, String, u8, u32, u32, Vec<u8>) + Send>>> = std::sync::Mutex::new(None);
+
 /// Frames waiting for the decoder: half a second at 60 FPS, enough to ride out a short
 /// stall (a game hitch) without dropping anything. Past that it is better to skip to a
 /// fresh keyframe than to show the stream seconds late (it used to hold 120 frames).
@@ -1254,6 +1259,23 @@ impl ScreenCaptureManager {
         }
 
         let (tx_decode, rx_decode) = std::sync::mpsc::sync_channel::<QueuedVideoFrame>(DECODE_QUEUE_FRAMES);
+        // Test only: the automation port's demo stream enters the queue here, as a
+        // received frame does once it is decrypted and whole.
+        #[cfg(feature = "automation")]
+        {
+            let tx_demo = tx_decode.clone();
+            let feed = move |peer_uid: u64, peer_name: String, peer_fps: u8, seq: u32, pts_ms: u32, frame_data: Vec<u8>| {
+                let q_item = QueuedVideoFrame { peer_uid, peer_name, peer_fps, seq, pts_ms, frame_data };
+                if let Err(std::sync::mpsc::TrySendError::Full(_)) = tx_demo.try_send(q_item) {
+                    mark_decode_resync(peer_uid);
+                    static FULL: crate::utils::logger::LogThrottle = crate::utils::logger::LogThrottle::new(1000);
+                    if let Some(n) = FULL.hit() {
+                        log::warn!("⚠️ [JITTER BUFFER] Fila de decodificação cheia ({} quadros): {} quadro(s) descartado(s); pedindo Keyframe ao transmissor {}", DECODE_QUEUE_FRAMES, n, peer_uid);
+                    }
+                }
+            };
+            *DEMO_FEED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(feed));
+        }
 
         let is_running_decoder = Arc::clone(&self.is_receiver_running);
         let channel_id_decoder = Arc::clone(&self.channel_id);
@@ -1273,6 +1295,7 @@ impl ScreenCaptureManager {
                 let mut last_gpu_ping: HashMap<u64, Instant> = HashMap::new();
                 let mut last_pli_req: HashMap<u64, Instant> = HashMap::new();
                 let mut rx_frame_count: HashMap<u64, u64> = HashMap::new();
+                let mut rx_decode_us: HashMap<u64, u128> = HashMap::new();
                 let mut rx_last_stats: HashMap<u64, Instant> = HashMap::new();
                 let mut rx_error_streak: HashMap<u64, u32> = HashMap::new();
                 // Aguardando IDR por peer: quando true, dropa frames até receber SPS/IDR
@@ -1360,6 +1383,8 @@ impl ScreenCaptureManager {
                                 waiting_for_idr.insert(peer_uid, true);
                                 // Also free the GPU decoder (device and surfaces) meanwhile.
                                 decoders.release_gpu();
+                                #[cfg(all(target_os = "linux", feature = "vaapi"))]
+                                super::hw_decode::gl_present::clear_all();
                                 continue;
                             }
 
@@ -1402,14 +1427,17 @@ impl ScreenCaptureManager {
                                 let dec_us = t_dec_start.elapsed().as_micros();
                                 let count = rx_frame_count.entry(peer_uid).or_insert(0);
                                 *count += 1;
+                                let decode_us = rx_decode_us.entry(peer_uid).or_insert(0);
+                                *decode_us += dec_us;
                                 let last_stats = rx_last_stats.entry(peer_uid).or_insert_with(Instant::now);
                                 if last_stats.elapsed() >= Duration::from_secs(1) {
                                     let elapsed_s = last_stats.elapsed().as_secs_f64();
                                     let rx_fps = (*count as f64) / elapsed_s;
                                     CURRENT_RX_FPS.store((rx_fps * 10.0).round() as u32, Ordering::Relaxed);
                                     info!("📥 [TELEMETRIA RX WORKER] Peer {}: {:.1} FPS ({} quadros em {:.2}s) | {}p {}fps | Decode: {:.2}ms",
-                                        peer_uid, rx_fps, *count, elapsed_s, h, peer_fps, dec_us as f64 / 1000.0);
+                                        peer_uid, rx_fps, *count, elapsed_s, h, peer_fps, *decode_us as f64 / 1000.0 / (*count).max(1) as f64);
                                     *count = 0;
+                                    *decode_us = 0;
                                     *last_stats = Instant::now();
                                 }
 
@@ -1475,6 +1503,8 @@ impl ScreenCaptureManager {
                                 CURRENT_RX_FPS.store(0, Ordering::Relaxed);
                                 // No stream arriving: let the GPU decoder go until the next one.
                                 decoders.release_gpu();
+                                #[cfg(all(target_os = "linux", feature = "vaapi"))]
+                                super::hw_decode::gl_present::clear_all();
                             }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
