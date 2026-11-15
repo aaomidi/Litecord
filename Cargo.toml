@@ -9,8 +9,12 @@ repository = "https://github.com/Ak4ai/Litecord"
 readme = "README.md"
 
 [features]
+default = ["vaapi"]
 # Test-only remote control of the UI (see src/automation.rs). Never enable for releases.
 automation = []
+# Linux: H.264 screen-share encoding on the GPU through GStreamer's VA-API elements
+# (src/encoder/vaapi.rs). Does nothing on other systems.
+vaapi = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 
 [dependencies]
 slint = "1.9"
@@ -124,6 +128,9 @@ gtk = "0.18"
 x11rb = { version = "0.14", features = ["allow-unsafe-code"] }
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "screencast"] }
 libc = "0.2"
+gstreamer = { version = "0.25", optional = true }
+gstreamer-app = { version = "0.25", optional = true }
+gstreamer-video = { version = "0.25", optional = true }
 
 [build-dependencies]
 slint-build = "1.9"

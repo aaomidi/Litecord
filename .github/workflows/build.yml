@@ -98,6 +98,8 @@ jobs:
             libfreetype6-dev \
             libxkbcommon-x11-dev \
             libxkbcommon-x11-0 \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
             patchelf \
             xvfb
 
@@ -149,7 +151,7 @@ jobs:
             alsa-lib openssl gtk3 libayatana-appindicator xdotool \
             libx11 libxcb libxkbcommon libxkbcommon-x11 wayland fontconfig freetype2 \
             mesa vulkan-icd-loader pipewire pipewire-alsa \
-            gstreamer gst-plugins-base gst-plugins-good gst-plugin-pipewire \
+            gstreamer gst-plugins-base gst-plugins-good gst-plugin-pipewire gst-plugin-va \
             xorg-server-xvfb
 
       - name: Checkout repository

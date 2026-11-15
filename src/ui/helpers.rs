@@ -373,6 +373,12 @@ pub fn populate_video_interface_settings(ui: &AppWindow) {
             is_selected: enc == "auto",
         },
         SettingOptionItem {
+            id: "vaapi".into(),
+            name: "VA-API (GPU)".into(),
+            desc: "Codificação H.264 pela GPU AMD / Intel via GStreamer VA-API.".into(),
+            is_selected: enc == "vaapi",
+        },
+        SettingOptionItem {
             id: "nvenc".into(),
             name: "NVIDIA NVENC".into(),
             desc: "Codificação acelerada por hardware via GPU NVIDIA GeForce / RTX.".into(),
