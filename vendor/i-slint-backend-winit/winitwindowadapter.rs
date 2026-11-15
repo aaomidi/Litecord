@@ -465,8 +465,20 @@ impl WinitWindowAdapter {
             .and_then(|x| x.parse::<f32>().ok())
             .filter(|f| *f > 0.);
 
+        let text_scale = self.shared_backend_data.text_scale();
         if let Some(sf) = overriding_scale_factor {
             apply_scale_factor_to_logical_sizes_in_attributes(&mut window_attributes, sf as f64)
+        } else if text_scale != 1.0 {
+            // Still logical: winit multiplies by the window system's factor when it creates the window.
+            let fixup = |size: &mut Option<winit::dpi::Size>| {
+                if let Some(winit::dpi::Size::Logical(logical)) = size.as_mut() {
+                    logical.width *= text_scale as f64;
+                    logical.height *= text_scale as f64;
+                }
+            };
+            fixup(&mut window_attributes.inner_size);
+            fixup(&mut window_attributes.min_inner_size);
+            fixup(&mut window_attributes.max_inner_size);
         }
 
         // Work around issue with menu bar appearing translucent in fullscreen (#8793)
@@ -504,8 +516,8 @@ impl WinitWindowAdapter {
             }
         }
 
-        let scale_factor =
-            overriding_scale_factor.unwrap_or_else(|| winit_window.scale_factor() as f32);
+        let scale_factor = overriding_scale_factor
+            .unwrap_or_else(|| winit_window.scale_factor() as f32 * text_scale);
         self.window().try_dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor })?;
 
         #[cfg(target_os = "ios")]

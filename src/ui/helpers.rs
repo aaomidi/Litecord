@@ -318,6 +318,11 @@ pub fn populate_video_interface_settings(ui: &AppWindow) {
     let notice = video_settings::get_enable_self_preview_notice();
     let show_hw = video_settings::get_show_hardware_monitor();
     ui.set_use_gpu_renderer(video_settings::get_use_gpu_renderer());
+    let ui_scale = video_settings::get_ui_scale_percent();
+    ui.set_selected_ui_scale(ui_scale.to_string().into());
+    // No restart note when the environment variable decides the scale whatever is picked.
+    let (scale_at_start, scale_from_env) = video_settings::ui_scale_at_start();
+    ui.set_ui_scale_restart_needed(!scale_from_env && ui_scale != scale_at_start);
     let use_light_theme = video_settings::get_use_light_theme();
 
     ui.set_selected_video_encoder(enc.clone().into());

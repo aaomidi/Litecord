@@ -64,6 +64,8 @@ export component SettingsView inherits Rectangle {
     in property <bool> enable_self_preview_notice;
     in property <bool> show_hardware_monitor;
     in property <bool> use_gpu_renderer;
+    in property <string> selected_ui_scale: "0";   // percent, "0" for the system's own
+    in property <bool> ui_scale_restart_needed;
     in property <bool> net_diag_running;
     in property <int> net_diag_verdict: -1; // -1 not run, 0 direct, 1 symmetric, 2 varying IP, 3 UDP blocked
     in property <bool> net_diag_signaling_ok: true;
@@ -101,6 +103,7 @@ export component SettingsView inherits Rectangle {
     callback toggle_enable_self_preview_notice();
     callback toggle_hardware_monitor();
     callback toggle_gpu_renderer();
+    callback select_ui_scale(string);
     callback run_network_diagnostics();
     callback copy_network_diagnostics();
     callback select_proxy_mode(string);
@@ -191,7 +194,7 @@ export component SettingsView inherits Rectangle {
 
                 // Navigation, grouped: calls first, then the app itself.
                 Rectangle {
-                    width: 220px;
+                    width: 236px;   // "Appearance and language" in full
                     background: AppTheme.surface-sidebar;
                     VerticalLayout {
                         padding: 12px;
@@ -385,6 +388,24 @@ export component SettingsView inherits Rectangle {
 
                             SettingsSection {
                                 title: Tr.stream_ui_title;
+                                VerticalLayout {
+                                    spacing: 6px;
+                                    Text { text: Tr.ui_scale; color: AppTheme.text-strong; font-size: TypeScale.body; font-weight: 600; }
+                                    OptionSelect {
+                                        options: [
+                                            { id: "0", name: Tr.ui_scale_auto },
+                                            { id: "100", name: "100%" },
+                                            { id: "125", name: "125%" },
+                                            { id: "150", name: "150%" },
+                                            { id: "175", name: "175%" },
+                                            { id: "200", name: "200%" },
+                                        ];
+                                        selected-id: root.selected_ui_scale;
+                                        picked(id) => { root.select_ui_scale(id); }
+                                    }
+                                    Text { text: Tr.ui_scale_desc; color: AppTheme.text-muted; font-size: TypeScale.small; wrap: word-wrap; }
+                                    if root.ui_scale_restart_needed: Text { text: Tr.ui_scale_restart; color: AppTheme.accent; font-size: TypeScale.small; font-weight: 600; wrap: word-wrap; }
+                                }
                                 SettingsSwitchRow {
                                     title: Tr.economy_notice;
                                     desc: Tr.economy_notice_desc;

@@ -16,7 +16,10 @@
 //! {"cmd":"drag","x":30,"y":100,"to_x":30,"to_y":220}  press, move in steps, release
 //! {"cmd":"type","text":"hello"}
 //! {"cmd":"key","key":"Return"}               Return, Escape, Tab, Backspace, arrows...
+//! {"cmd":"key","key":"c","ctrl":true}        a shortcut: Ctrl+C
 //! {"cmd":"set","prop":"show_settings_modal","value":true}
+//! {"cmd":"set","prop":"login_alert_message","value":"text"}  also login_alert_is_error,
+//!                                            web_share_active, web_share_url
 //! {"cmd":"set_language","code":"de"}
 //! {"cmd":"video_encoder_options"}           choices and the current capture path
 //! {"cmd":"select_video_encoder","id":"auto"} same callback as the settings radio button
@@ -143,8 +146,11 @@ fn execute(ui: &AppWindow, cmd: &Value) -> Result<Value, String> {
         "size" => {
             let size = window.size();
             let scale = window.scale_factor();
+            use i_slint_backend_winit::WinitWindowAccessor;
             Ok(json!({
                 "ok": true,
+                "focused": window.with_winit_window(|w| w.has_focus()),
+                "system_scale": window.with_winit_window(|w| w.scale_factor()),
                 "physical": [size.width, size.height],
                 "logical": [size.width as f32 / scale, size.height as f32 / scale],
                 "scale": scale,
@@ -204,6 +210,14 @@ fn execute(ui: &AppWindow, cmd: &Value) -> Result<Value, String> {
         }
         "key" => {
             let key = cmd["key"].as_str().ok_or("missing \"key\"")?;
+            if cmd["ctrl"].as_bool().unwrap_or(false) {
+                // A shortcut such as Ctrl+C: the key is the letter.
+                let control = SharedString::from(char::from(Key::Control).to_string());
+                window.dispatch_event(WindowEvent::KeyPressed { text: control.clone() });
+                press(ui, key.into());
+                window.dispatch_event(WindowEvent::KeyReleased { text: control });
+                return Ok(json!({ "ok": true }));
+            }
             let key = match key {
                 "Return" | "Enter" => Key::Return,
                 "Escape" => Key::Escape,
@@ -228,12 +242,18 @@ fn execute(ui: &AppWindow, cmd: &Value) -> Result<Value, String> {
             let value = &cmd["value"];
             let as_bool = || value.as_bool().ok_or(format!("{prop} needs a boolean"));
             let as_int = || value.as_i64().map(|v| v as i32).ok_or(format!("{prop} needs an integer"));
+            let as_text = || value.as_str().map(SharedString::from).ok_or(format!("{prop} needs a string"));
             match prop {
                 "show_settings_modal" => ui.set_show_settings_modal(as_bool()?),
                 "settings_active_tab" => ui.set_settings_active_tab(as_int()?),
                 "show_stream_modal" => ui.set_show_stream_modal(as_bool()?),
                 "show_web_share_modal" => ui.set_show_web_share_modal(as_bool()?),
                 "show_user_menu" => ui.set_show_user_menu(as_bool()?),
+                // Dialogs that otherwise need an account or a running share.
+                "login_alert_message" => ui.set_login_alert_message(as_text()?),
+                "login_alert_is_error" => ui.set_login_alert_is_error(as_bool()?),
+                "web_share_active" => ui.set_web_share_active(as_bool()?),
+                "web_share_url" => ui.set_web_share_url(as_text()?),
                 other => return Err(format!("property {other} is not settable from automation")),
             }
             Ok(json!({ "ok": true }))
@@ -451,6 +471,8 @@ fn state(ui: &AppWindow) -> Value {
         "settings_active_tab": ui.get_settings_active_tab(),
         "show_stream_modal": ui.get_show_stream_modal(),
         "show_web_share_modal": ui.get_show_web_share_modal(),
+        "web_share_copied": ui.get_web_share_copied(),
+        "net_diag_copied": ui.get_net_diag_copied(),
         "voice": {
             "is_in_voice": ui.get_is_in_voice(),
             "is_connecting": ui.get_is_voice_connecting(),

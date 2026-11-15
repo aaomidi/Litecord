@@ -492,7 +492,8 @@ impl winit::application::ApplicationHandler<SlintEvent> for EventLoopState {
                     self.loop_error = window
                         .window()
                         .try_dispatch_event(corelib::platform::WindowEvent::ScaleFactorChanged {
-                            scale_factor: scale_factor as f32,
+                            scale_factor: scale_factor as f32
+                                * window.shared_backend_data.text_scale(),
                         })
                         .err();
                     // TODO: send a resize event or try to keep the logical size the same.

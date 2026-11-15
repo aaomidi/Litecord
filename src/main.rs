@@ -115,8 +115,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var_os("SLINT_BACKEND").is_none() && !video_settings::get_use_gpu_renderer() {
         std::env::set_var("SLINT_BACKEND", "winit-software");
     }
-    info!("🖥️ Inicializando Slint AppWindow (renderizador: {})...",
-        std::env::var("SLINT_BACKEND").unwrap_or_else(|_| "GPU".to_string()));
+    // Interface scale: a fixed percentage replaces the window system's scale factor.
+    // Automatic leaves it alone (under Wayland the backend also applies the desktop's
+    // text scaling). An explicit SLINT_SCALE_FACTOR still wins.
+    let (ui_scale, scale_from_env) = video_settings::ui_scale_at_start();
+    if !scale_from_env && ui_scale != 0 {
+        std::env::set_var("SLINT_SCALE_FACTOR", format!("{}", ui_scale as f32 / 100.0));
+    }
+    info!("🖥️ Inicializando Slint AppWindow (renderizador: {}, escala da interface: {})...",
+        std::env::var("SLINT_BACKEND").unwrap_or_else(|_| "GPU".to_string()),
+        std::env::var("SLINT_SCALE_FACTOR").unwrap_or_else(|_| "automática".to_string()));
     let app = match AppWindow::new() {
         Ok(app) => {
             info!("🖥️ Exibindo janela principal (app.show())...");
@@ -210,8 +218,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let refresh_main = refresh_gpu_video.clone();
         let main_had_area = std::cell::Cell::new(true);
+        let main_fitted = std::cell::Cell::new(false);
         let main_weak = app_weak.clone();
         app.window().on_winit_window_event(move |window, ev| {
+            // First event: the window exists now, at its preferred size times the scale.
+            // Not on Windows, where window_place::restore sizes it (a saved size may span monitors).
+            if cfg!(not(windows)) && !main_fitted.replace(true) {
+                if let Some(size) = window.with_winit_window(crate::ui::window_place::size_fitting_monitor).flatten() {
+                    window.set_size(slint::PhysicalSize::new(size.width, size.height));
+                }
+            }
             if let Some(has) = has_area(window, ev) {
                 if has && !main_had_area.replace(has) {
                     i_slint_backend_winit::redraw_whole_window(window);
@@ -272,7 +288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ui) = app_weak_init.upgrade() {
             ui.window().with_winit_window(|winit_win| {
                 info!("🖥️ [EVENT LOOP] Configurando janela Winit no evento inicial...");
-                if crate::ui::window_place::restore(winit_win) {
+                if crate::ui::window_place::restore(winit_win, ui.window().scale_factor()) {
                     ui.set_is_maximized(true);
                 }
                 winit_win.set_visible(true);
@@ -290,8 +306,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(pop_win) = popout_weak_init.upgrade() {
                     pop_win.window().with_winit_window(|winit_pop| {
                         winit_pop.set_decorations(false);
-                        let _ = winit_pop.request_inner_size(winit::dpi::LogicalSize::new(640.0, 360.0));
-                        winit_pop.set_min_inner_size(Some(winit::dpi::LogicalSize::new(180.0, 100.0)));
+                        // In interface pixels: the scale setting can differ from the system's scale.
+                        let k = pop_win.window().scale_factor() as f64 / winit_pop.scale_factor();
+                        let _ = winit_pop.request_inner_size(winit::dpi::LogicalSize::new(640.0 * k, 360.0 * k));
+                        winit_pop.set_min_inner_size(Some(winit::dpi::LogicalSize::new(180.0 * k, 100.0 * k)));
                         winit_pop.set_visible(false);
                         #[cfg(target_os = "windows")]
                         {
@@ -601,6 +619,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                 } else {
                     pop_win.set_show_self_preview_notice(false);
+                }
+                // The window is created hidden at its minimum size and its first show() does not
+                // apply the preferred size (on Windows the startup callback sizes it).
+                #[cfg(not(windows))]
+                {
+                    static SIZED: AtomicBool = AtomicBool::new(false);
+                    if !SIZED.swap(true, Ordering::Relaxed) {
+                        let scale = pop_win.window().scale_factor();
+                        pop_win.window().set_size(slint::PhysicalSize::new((640.0 * scale) as u32, (360.0 * scale) as u32));
+                    }
                 }
                 let _ = pop_win.show();
                 #[cfg(target_os = "windows")]
@@ -1230,9 +1258,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.on_copy_web_share_link(move || {
         if let Some(ui) = copy_web_weak.upgrade() {
             let link = ui.get_web_share_url().to_string();
-            let copied = !link.is_empty() && copypasta::ClipboardContext::new()
-                .and_then(|mut ctx| copypasta::ClipboardProvider::set_contents(&mut ctx, link)).is_ok();
-            ui.set_web_share_copied(copied);
+            ui.set_web_share_copied(false);
+            if !link.is_empty() {
+                utils::clipboard::copy_text(&ui, link, |ui, copied| ui.set_web_share_copied(copied));
+            }
         }
     });
 
@@ -2312,11 +2341,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_weak_net_copy = app.as_weak();
     app.on_copy_network_diagnostics(move || {
         let report = net_diag_report.lock().unwrap().clone();
-        let copied = copypasta::ClipboardContext::new()
-            .and_then(|mut ctx| copypasta::ClipboardProvider::set_contents(&mut ctx, report))
-            .is_ok();
         if let Some(ui) = app_weak_net_copy.upgrade() {
-            ui.set_net_diag_copied(copied);
+            ui.set_net_diag_copied(false);
+            utils::clipboard::copy_text(&ui, report, |ui, copied| ui.set_net_diag_copied(copied));
         }
     });
 
@@ -2330,6 +2357,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let new_val = video_settings::toggle_use_gpu_renderer();
         if let Some(ui) = app_weak_gpu.upgrade() {
             ui.set_use_gpu_renderer(new_val);
+        }
+    });
+
+    let app_weak_scale = app_weak.clone();
+    app.on_select_ui_scale(move |id: SharedString| {
+        video_settings::set_ui_scale_percent(id.parse().unwrap_or(0));
+        if let Some(ui) = app_weak_scale.upgrade() {
+            populate_video_interface_settings(&ui);
         }
     });
 

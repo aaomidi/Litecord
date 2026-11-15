@@ -329,6 +329,8 @@ export component AppWindow inherits Window {
     in-out property <bool> enable_self_preview_notice: true;
     in-out property <bool> show_hardware_monitor: true;
     in-out property <bool> use_gpu_renderer: false;
+    in-out property <string> selected_ui_scale: "0";
+    in-out property <bool> ui_scale_restart_needed: false;
     in-out property <bool> net_diag_running: false;
     in-out property <int> net_diag_verdict: -1;
     in-out property <bool> net_diag_signaling_ok: true;
@@ -353,6 +355,7 @@ export component AppWindow inherits Window {
     callback toggle_enable_self_preview_notice();
     callback toggle_hardware_monitor();
     callback toggle_gpu_renderer();
+    callback select_ui_scale(string);
     in-out property <length> channel_sidebar_width: 230px;
     callback channel_sidebar_width_committed(length);
     callback run_network_diagnostics();
@@ -763,25 +766,34 @@ export component AppWindow inherits Window {
         if !root.is_logged_in: Rectangle {
             background: AppTheme.surface-input;
 
+            // Centred by spacers and not by `alignment: center`, under which the content keeps
+            // its preferred size and runs off the edge of a small window instead of shrinking.
             VerticalLayout {
-                alignment: center;
-                spacing: 12px;
+                spacing: 8px;
+                Rectangle { }
 
                 HorizontalLayout {
-                    alignment: center;
+                    vertical-stretch: 0;
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    Rectangle { }
 
                     VerticalLayout {
                         spacing: 10px;
-                        width: 720px;
+                        preferred-width: 720px;
+                        max-width: 720px;
+                        horizontal-stretch: 0;
 
                         // Alert / Status Banner on Login Screen
                         if root.login_alert_message != "": Rectangle {
-                            min-height: 38px;
+                            // The height of the wrapped text does not reach this box through the
+                            // nested layouts (it stayed one line high and cut the text), so it
+                            // is taken from the text itself.
+                            height: Math.max(38px, alert_text.preferred-height + 16px);
                             background: alert_ta.has-hover ? (root.login_alert_is_error ? AppTheme.danger-action-faint : AppTheme.accent-faint) : (root.login_alert_is_error ? AppTheme.danger-action-subtle : AppTheme.accent-subtle);
                             border-radius: 8px;
                             border-width: 1px;
                             border-color: root.login_alert_is_error ? AppTheme.danger-action-border : AppTheme.accent-border-muted;
-                            clip: true;
 
                             HorizontalLayout {
                                 padding-left: 12px;
@@ -801,7 +813,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
 
-                                Text {
+                                alert_text := Text {
                                     horizontal-stretch: 1;
                                     text: root.login_alert_message;
                                     color: root.login_alert_is_error ? AppTheme.danger : AppTheme.text-primary;
@@ -835,15 +847,17 @@ export component AppWindow inherits Window {
 
 
                         Rectangle {
-                            height: 400px;
+                            // Gives way when the banner above needs the room in a small window.
+                            preferred-height: 400px;
                             background: AppTheme.surface-sidebar;
                             border-radius: 12px;
                             border-width: 1px;
                             border-color: AppTheme.border-subtle;
 
                         HorizontalLayout {
-                            padding: 32px;
-                            spacing: 32px;
+                            // 24px and not 32px: both columns fit the narrowest window (680px).
+                            padding: 24px;
+                            spacing: 24px;
 
                             // Left Column: Token / Auto-Detect Login
                             VerticalLayout {
@@ -1021,7 +1035,7 @@ export component AppWindow inherits Window {
                                     alignment: center;
                                     Rectangle {
                                         height: 30px;
-                                        width: 150px;
+                                        min-width: 150px;
                                         background: re_qr_ta.has-hover ? AppTheme.interactive-hover : AppTheme.surface-input;
                                         border-radius: 6px;
                                         border-width: 1px;
@@ -1030,6 +1044,8 @@ export component AppWindow inherits Window {
 
                                         HorizontalLayout {
                                             alignment: center;
+                                            padding-left: 10px;
+                                            padding-right: 10px;
                                             spacing: 6px;
                                             VerticalLayout {
                                                 alignment: center;
@@ -1060,7 +1076,11 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+
+                    Rectangle { }
             }
+
+                Rectangle { }
         }
     }
 
@@ -3146,6 +3166,8 @@ export component AppWindow inherits Window {
         enable_self_preview_notice: root.enable_self_preview_notice;
         show_hardware_monitor: root.show_hardware_monitor;
         use_gpu_renderer: root.use_gpu_renderer;
+        selected_ui_scale: root.selected_ui_scale;
+        ui_scale_restart_needed: root.ui_scale_restart_needed;
         net_diag_running: root.net_diag_running;
         net_diag_verdict: root.net_diag_verdict;
         net_diag_signaling_ok: root.net_diag_signaling_ok;
@@ -3182,6 +3204,7 @@ export component AppWindow inherits Window {
         toggle_enable_self_preview_notice => { root.toggle_enable_self_preview_notice(); }
         toggle_hardware_monitor => { root.toggle_hardware_monitor(); }
         toggle_gpu_renderer => { root.toggle_gpu_renderer(); }
+        select_ui_scale(arg0) => { root.select_ui_scale(arg0); }
         run_network_diagnostics => { root.run_network_diagnostics(); }
         copy_network_diagnostics => { root.copy_network_diagnostics(); }
         select_proxy_mode(arg0) => { root.select_proxy_mode(arg0); }

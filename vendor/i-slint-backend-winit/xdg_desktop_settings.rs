@@ -26,6 +26,8 @@ pub(crate) struct DesktopSettings {
     /// True while the appearance query is in flight; the backend holds the first
     /// windows in `inactive_windows` until it clears, to avoid a default flash.
     appearance_pending: Cell<bool>,
+    /// GNOME's text scaling factor (1.0 when there is none), see `SharedBackendData::text_scale`.
+    text_scaling_factor: Cell<f32>,
 }
 
 impl DesktopSettings {
@@ -34,7 +36,12 @@ impl DesktopSettings {
             cursor_blink_enabled: Cell::new(true),
             cursor_blink_time: Cell::new(crate::DEFAULT_CURSOR_FLASH_CYCLE),
             appearance_pending: Cell::new(false),
+            text_scaling_factor: Cell::new(1.0),
         }
+    }
+
+    pub(crate) fn text_scaling_factor(&self) -> f32 {
+        self.text_scaling_factor.get()
     }
 
     /// The cursor blink period, or zero when blinking is disabled.
@@ -85,6 +92,11 @@ static SETTINGS: &[SettingDescriptor] = &[
         namespace: GNOME_INTERFACE,
         key: "cursor-blink-time",
         apply: apply_cursor_blink_time_value,
+    },
+    SettingDescriptor {
+        namespace: GNOME_INTERFACE,
+        key: "text-scaling-factor",
+        apply: apply_text_scaling_value,
     },
 ];
 
@@ -163,6 +175,19 @@ fn apply_cursor_blink_time_value(value: zbus::zvariant::OwnedValue, cx: &Setting
         && let Some(shared) = cx.shared.upgrade()
     {
         shared.desktop_settings.cursor_blink_time.set(Duration::from_millis(ms as u64));
+    }
+}
+
+/// Taken only from the initial read, while the first windows are still held back: every
+/// window of a run uses one factor. A value that arrives after they were released (a slow
+/// portal, or a change made while the application runs) shows on the next start.
+fn apply_text_scaling_value(value: zbus::zvariant::OwnedValue, cx: &SettingsContext) {
+    if let Ok(factor) = value.downcast_ref::<f64>()
+        && (0.5..=3.0).contains(&factor)
+        && let Some(shared) = cx.shared.upgrade()
+        && shared.desktop_settings.appearance_pending.get()
+    {
+        shared.desktop_settings.text_scaling_factor.set(factor as f32);
     }
 }
 
