@@ -24,9 +24,9 @@ use log::{info, warn};
 use std::time::{Duration, Instant};
 
 /// Preferred first; `vah264lpenc` is the only one Intel's low-power encoders register.
-const ENCODER_ELEMENTS: [&str; 2] = ["vah264enc", "vah264lpenc"];
+pub(crate) const ENCODER_ELEMENTS: [&str; 2] = ["vah264enc", "vah264lpenc"];
 /// Streams start at this rate (types::REQUESTED_BITRATE_BPS).
-const INITIAL_BITRATE_BPS: u32 = 8_000_000;
+pub(crate) const INITIAL_BITRATE_BPS: u32 = 8_000_000;
 /// A new pipeline creates the VA context and compiles the conversion on its first frame.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(1000);
 const FRAME_TIMEOUT: Duration = Duration::from_millis(100);
@@ -35,7 +35,7 @@ const FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_FAILURES: u32 = 3;
 /// vah264enc starts a new sequence (an IDR) whenever its bitrate changes, so a new rate
 /// waits for the next keyframe the caller asks for (at least every 2 s), up to this long.
-const BITRATE_MAX_WAIT: Duration = Duration::from_millis(3000);
+pub(crate) const BITRATE_MAX_WAIT: Duration = Duration::from_millis(3000);
 const PROBE_SIZE: (u32, u32) = (640, 360);
 
 /// Test hook: `LITECORD_VAAPI_TEST_FAIL=init` fails construction, `after:N` makes every GPU
@@ -64,7 +64,7 @@ use crate::screen_capture::hw_decode::h264_state::nal_ranges;
 /// The access unit without filler data NAL units (type 12): in CBR mode radeonsi pads
 /// every picture smaller than the frame budget with them, megabits of nothing on a still
 /// screen.
-fn without_filler(au: Vec<u8>) -> Vec<u8> {
+pub(crate) fn without_filler(au: Vec<u8>) -> Vec<u8> {
     let ranges = nal_ranges(&au);
     if !ranges.iter().any(|r| au[r.start] & 0x1f == 12) {
         return au;
@@ -83,11 +83,11 @@ fn without_filler(au: Vec<u8>) -> Vec<u8> {
 
 /// The pipeline from colour conversion to the encoded access units. The bitrate, keyframe
 /// requests and the output only touch this part, so the frame source can be replaced.
-struct EncodeChain {
-    pipeline: gst::Pipeline,
-    bus: gst::Bus,
-    encoder: gst::Element,
-    sink: gst_app::AppSink,
+pub(crate) struct EncodeChain {
+    pub(crate) pipeline: gst::Pipeline,
+    pub(crate) bus: gst::Bus,
+    pub(crate) encoder: gst::Element,
+    pub(crate) sink: gst_app::AppSink,
 }
 
 enum PullError {
@@ -97,12 +97,19 @@ enum PullError {
 
 impl EncodeChain {
     fn description(element: &str, bitrate_bps: u32) -> String {
+        Self::description_scaled(element, bitrate_bps, None)
+    }
+
+    /// With `scale_to`, vapostproc also scales to that size (whatever feeds it, stretched
+    /// to fill it): the in-process screen capture hands it pictures of the monitor's size.
+    pub(crate) fn description_scaled(element: &str, bitrate_bps: u32, scale_to: Option<(u32, u32)>) -> String {
+        let size = scale_to.map(|(w, h)| format!(",width={w},height={h},pixel-aspect-ratio=1/1")).unwrap_or_default();
         // Experiments only: vah264enc properties (gst-launch syntax) replacing or joining ours.
         let extra = std::env::var("LITECORD_VAAPI_ENC_PROPS").unwrap_or_default();
         let key = |prop: &str| prop.split('=').next().unwrap_or("").to_string();
         let props: Vec<&str> = ENCODER_PROPS.split_whitespace().filter(|p| !extra.split_whitespace().any(|e| key(e) == key(p))).collect();
         format!(
-            "vapostproc ! video/x-raw(memory:VAMemory),format=NV12,colorimetry=(string)2:4:7:1 \
+            "vapostproc ! video/x-raw(memory:VAMemory),format=NV12,colorimetry=(string)2:4:7:1{size} \
              ! {element} name=enc {} bitrate={} cpb-size={} {extra} \
              ! video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au \
              ! appsink name=sink sync=false async=false max-buffers=4 drop=false emit-signals=false enable-last-sample=false",
@@ -112,7 +119,7 @@ impl EncodeChain {
         )
     }
 
-    fn from_pipeline(pipeline: gst::Pipeline) -> Result<Self, String> {
+    pub(crate) fn from_pipeline(pipeline: gst::Pipeline) -> Result<Self, String> {
         let bus = pipeline.bus().ok_or("pipeline without bus")?;
         let encoder = pipeline.by_name("enc").ok_or("encoder element missing")?;
         let sink = pipeline.by_name("sink").and_then(|e| e.downcast::<gst_app::AppSink>().ok()).ok_or("appsink missing")?;
@@ -120,7 +127,7 @@ impl EncodeChain {
     }
 
     /// Takes effect on the next frame, which the encoder turns into an IDR.
-    fn set_bitrate(&self, bitrate_bps: u32) {
+    pub(crate) fn set_bitrate(&self, bitrate_bps: u32) {
         for (name, value) in [("bitrate", bitrate_bps / 1000), ("cpb-size", cpb_size_kbit(bitrate_bps))] {
             // set_property panics on a missing property or another type.
             if self.encoder.find_property(name).map(|p| p.value_type() == u32::static_type()).unwrap_or(false) {
@@ -130,11 +137,11 @@ impl EncodeChain {
     }
 
     /// The next frame entering the encoder becomes an IDR with SPS and PPS.
-    fn request_keyframe(&self) -> bool {
+    pub(crate) fn request_keyframe(&self) -> bool {
         self.sink.send_event(gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build())
     }
 
-    fn bus_error(&self) -> Option<String> {
+    pub(crate) fn bus_error(&self) -> Option<String> {
         let msg = self.bus.pop_filtered(&[gst::MessageType::Error])?;
         match msg.view() {
             gst::MessageView::Error(e) => Some(format!("{} ({})", e.error(), e.debug().map(|d| d.to_string()).unwrap_or_default())),
@@ -463,7 +470,7 @@ impl VaapiEncoder {
 
 /// An access unit that opens a stream the receivers accept: Annex B, IDR with SPS and PPS,
 /// Constrained Baseline.
-fn check_keyframe(au: &[u8]) -> Result<(), String> {
+pub(crate) fn check_keyframe(au: &[u8]) -> Result<(), String> {
     if !matches!(au, [0, 0, 1, ..] | [0, 0, 0, 1, ..]) {
         return Err("saída sem start code".into());
     }

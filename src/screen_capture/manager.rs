@@ -181,6 +181,8 @@ impl ScreenCaptureManager {
                 if let Ok(mut cb_slot) = PORTAL_LOCAL_CB.lock() {
                     *cb_slot = None;
                 }
+                #[cfg(feature = "vaapi")]
+                super::linux_gpu_tx::end();
             }
         }
         if self.is_running.swap(false, Ordering::SeqCst) {
@@ -885,7 +887,15 @@ impl ScreenCaptureManager {
                     }
                     #[cfg(windows)]
                     let gpu_path = super::gpu_tx::active();
-                    #[cfg(not(windows))]
+                    // Linux: the capture is encoded on the GPU as it arrives; this loop pulls
+                    // finished access units instead of frames.
+                    #[cfg(all(target_os = "linux", feature = "vaapi"))]
+                    let gpu_path = camera_index.is_none() && super::linux_gpu_tx::active();
+                    #[cfg(all(target_os = "linux", feature = "vaapi"))]
+                    if gpu_path {
+                        new_captures += super::linux_gpu_tx::take_new_pictures();
+                    }
+                    #[cfg(not(any(windows, all(target_os = "linux", feature = "vaapi"))))]
                     let gpu_path = false;
 
                     // Drena quadros novos da GPU para sempre ter o frame mais atualizado
@@ -928,16 +938,30 @@ impl ScreenCaptureManager {
                     // Nobody watching: the preview's pace (a new viewer is noticed within it).
                     let frame_target_interval = if was_watched { frame_target_interval } else { IDLE_FRAME_INTERVAL };
                     let now = Instant::now();
+                    // Linux GPU capture: the wait ends as soon as an access unit is finished.
+                    let au_paced = cfg!(all(target_os = "linux", feature = "vaapi")) && gpu_path && was_watched;
                     if now < next_tick {
                         let sleep_dur = (next_tick - now).min(frame_target_interval);
+                        #[cfg(all(target_os = "linux", feature = "vaapi"))]
+                        if au_paced {
+                            super::linux_gpu_tx::wait_ready(sleep_dur);
+                        }
                         // Woken early when a viewer arrives (wake_tx), instead of a full idle tick.
-                        std::thread::park_timeout(sleep_dur);
+                        if !au_paced {
+                            std::thread::park_timeout(sleep_dur);
+                        }
                         total_park_asked_us += sleep_dur.as_micros();
                         total_park_us += now.elapsed().as_micros();
                     }
                     next_tick += frame_target_interval;
                     if now > next_tick + frame_target_interval * 2 {
                         next_tick = now + frame_target_interval;
+                    }
+                    // Woken by access units and not by the clock, the loop turns more often than
+                    // once per interval: the schedule must not run ahead of the clock, or the
+                    // CPU-frame path would be late by that much after a fallback.
+                    if au_paced {
+                        next_tick = next_tick.min(Instant::now() + frame_target_interval);
                     }
 
                     // On the GPU path the pictures (and the preview) stay on the GPU: the loop goes
@@ -1030,6 +1054,8 @@ impl ScreenCaptureManager {
                     if watched != was_watched {
                         was_watched = watched;
                         TX_WATCHED.store(watched, Ordering::Relaxed);
+                        #[cfg(all(target_os = "linux", feature = "vaapi"))]
+                        super::linux_gpu_tx::set_watched(watched);
                         info!("👀 [ASSISTIR SOB DEMANDA] {}", if watched { "Alguém começou a assistir: codificando." } else { "Ninguém assistindo: codificação pausada." });
                     }
 
@@ -1057,7 +1083,15 @@ impl ScreenCaptureManager {
                                 finished_on_gpu(&mut gpu_encoder)
                             }
                         }
-                        #[cfg(not(windows))]
+                        #[cfg(all(target_os = "linux", feature = "vaapi"))]
+                        {
+                            let want_idr = KEYFRAME_REQUESTED.swap(false, Ordering::Relaxed) || last_idr.elapsed() >= Duration::from_millis(2000);
+                            if want_idr {
+                                last_idr = Instant::now();
+                            }
+                            super::linux_gpu_tx::next_au(REQUESTED_BITRATE_BPS.load(Ordering::Relaxed), want_idr)
+                        }
+                        #[cfg(not(any(windows, all(target_os = "linux", feature = "vaapi"))))]
                         None
                     } else if let Some((bgra_slice, cur_w, cur_h, _, _)) = cpu_frame.filter(|_| encode_now) {
                         let enc = h264_encoder.get_or_insert_with(|| crate::encoder::create_best_encoder(target_fps as u32, camera_index.is_none()));
@@ -1076,6 +1110,9 @@ impl ScreenCaptureManager {
                     let enc_dur = enc_start.elapsed().as_micros();
                     total_encode_us += enc_dur;
 
+                    // The Linux GPU capture's turns follow its access units, with turns in between
+                    // that find none: only the ones that sent a picture count as frames.
+                    let counts_as_frame = !(cfg!(all(target_os = "linux", feature = "vaapi")) && gpu_path && watched) || frame_bytes_opt.is_some();
                     if let Some(raw_frame_bytes) = frame_bytes_opt {
                         // Browsers watching over WebRTC get the same encoded frame.
                         super::web_share::offer_frame(&raw_frame_bytes);
@@ -1167,7 +1204,9 @@ impl ScreenCaptureManager {
                         total_net_us += t_net_us;
                     }
 
-                    tx_frame_count += 1;
+                    if counts_as_frame {
+                        tx_frame_count += 1;
+                    }
                     let turn_us = turn_start.elapsed().as_micros();
                     turn_start = Instant::now();
                     max_turn_us = max_turn_us.max(turn_us);
