@@ -188,7 +188,8 @@ Exit status 1 when a hard check fails, 2 when the encoder cannot be created.";
             bits |= 0x0000_4210; // a stem, so glyphs are not just dust
             for row in 0..7 {
                 for col in 0..5 {
-                    if bits >> (row * 5 + col) & 1 == 1 {
+                    // (Shifts past 31 wrap, as release builds do: the same glyphs in a debug build.)
+                    if bits.wrapping_shr((row * 5 + col) as u32) & 1 == 1 {
                         self.rect(x + col * scale, y + row * scale, scale, scale, bgr);
                     }
                 }
