@@ -236,6 +236,15 @@ pub struct AccountVault {
 }
 
 pub fn load_account_vault() -> AccountVault {
+    // A test build uses the saved accounts only when LITECORD_TEST_ACCOUNT names one. The
+    // vault is found under the home directory whatever the working directory is, so without
+    // this a test instance started anywhere logs into the installed app's account by itself.
+    #[cfg(feature = "automation")]
+    if crate::utils::test_hooks::test_account().is_none() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| log::warn!("🧪 [TESTE] Build de teste sem LITECORD_TEST_ACCOUNT: as contas salvas não são lidas nem gravadas (instância deslogada)"));
+        return AccountVault::default();
+    }
     let (primary_path, fallback_path) = get_secure_token_paths();
     let raw = match std::fs::read_to_string(&primary_path).or_else(|_| std::fs::read_to_string(&fallback_path)) {
         Ok(s) => s,
@@ -305,10 +314,10 @@ pub fn load_account_vault() -> AccountVault {
 }
 
 pub fn save_account_vault(vault: &AccountVault) {
-    // A test instance logged in with LITECORD_TEST_ACCOUNT must not change which account
-    // the installed app opens with.
-    #[cfg(feature = "automation")]
-    if crate::utils::test_hooks::test_account().is_some() {
+    // A test build never writes the vault (nor its copy in the working directory): it must
+    // not change which account the installed app opens with, logged in with
+    // LITECORD_TEST_ACCOUNT or by hand.
+    if cfg!(feature = "automation") {
         return;
     }
     let (primary_path, fallback_path) = get_secure_token_paths();
@@ -392,8 +401,7 @@ pub fn remove_single_account(user_id_or_token: &str) -> AccountVault {
 
 pub fn delete_secure_token() {
     // A failed login of a test instance must not wipe the accounts of the installed app.
-    #[cfg(feature = "automation")]
-    if crate::utils::test_hooks::test_account().is_some() {
+    if cfg!(feature = "automation") {
         return;
     }
     let (primary_path, fallback_path) = get_secure_token_paths();

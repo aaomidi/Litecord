@@ -37,6 +37,43 @@ struct ResumeSession {
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=9&encoding=json";
 
+/// The client whose connection `say_goodbye` closes: the one started last.
+static RUNNING: std::sync::Mutex<Option<(tokio::runtime::Handle, std::sync::Weak<GatewayClient>)>> = std::sync::Mutex::new(None);
+
+/// For a process about to exit: leaves the voice channel (OP 4 with no channel) and closes
+/// the gateway connection with a normal close, waiting at most `wait` for both to be
+/// written. A process that just exits leaves the socket to time out on Discord's side, and
+/// the account stays shown in its voice channel meanwhile (105 s measured). Any thread.
+pub fn say_goodbye(wait: std::time::Duration) {
+    let Some((handle, client)) = RUNNING.lock().ok().and_then(|running| running.clone()) else { return };
+    let Some(client) = client.upgrade() else { return };
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<bool>();
+    handle.spawn(async move {
+        let Some(tx) = client.ws_tx.lock().await.clone() else { return };
+        let channel = client.voice_channel_id.lock().unwrap().clone();
+        let in_voice = channel.is_some() || is_connected_to_voice();
+        if in_voice {
+            let guild = client.voice_guild_id.lock().unwrap().clone().filter(|g| !g.trim().is_empty() && g != "@me");
+            let payload = serde_json::json!({
+                "op": 4,
+                "d": { "guild_id": guild, "channel_id": null, "self_mute": false, "self_deaf": false }
+            });
+            let _ = tx.send(Message::Text(payload.to_string().into())).await;
+        }
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+        let _ = tx.send(Message::Close(Some(CloseFrame { code: CloseCode::Normal, reason: "".into() }))).await;
+        // (The writer stops after a close frame: its end of the channel going away says
+        // that everything before it has been written.)
+        tx.closed().await;
+        let _ = done_tx.send(in_voice);
+    });
+    match done_rx.recv_timeout(wait) {
+        Ok(true) => info!("👋 Saída do canal de voz e fechamento da Gateway enviados ao Discord antes de sair"),
+        Ok(false) => info!("👋 Fechamento da Gateway enviado ao Discord antes de sair"),
+        Err(_) => warn!("⚠️ A Gateway não confirmou o envio da despedida em {} ms; saindo assim mesmo", wait.as_millis()),
+    }
+}
+
 /// Close codes after which the session cannot be resumed (Discord gateway docs).
 fn close_ends_session(code: u16) -> bool {
     matches!(code, 4004 | 4007 | 4009 | 4010 | 4011 | 4012 | 4013 | 4014)
@@ -193,6 +230,9 @@ impl GatewayClient {
     }
 
     pub async fn start(self: Arc<Self>, mut cmd_rx: mpsc::Receiver<GatewayCommand>) {
+        if let Ok(mut running) = RUNNING.lock() {
+            *running = Some((tokio::runtime::Handle::current(), Arc::downgrade(&self)));
+        }
         // Spawn GatewayCommand listener loop (permanece vivo entre reconexões do WebSocket)
         let client_cmd = Arc::clone(&self);
         tokio::spawn(async move {
@@ -325,8 +365,13 @@ impl GatewayClient {
                     // Worker para envio ordenado de mensagens no WebSocket
                     let writer_task = tokio::spawn(async move {
                         while let Some(msg) = ws_out_rx.recv().await {
+                            let closing = matches!(msg, Message::Close(_));
                             if let Err(e) = write.send(msg).await {
                                 warn!("Falha ao enviar mensagem no WebSocket: {:?}", e);
+                                break;
+                            }
+                            // (A close frame is the last thing written: see `say_goodbye`.)
+                            if closing {
                                 break;
                             }
                         }
@@ -957,6 +1002,8 @@ impl GatewayClient {
                     let id = v["d"]["id"].as_str().unwrap_or("").to_string();
                     let name = v["d"]["name"].as_str().unwrap_or(crate::utils::i18n_ui::pick("Server", "Servidor")).to_string();
                     let mut channels = Vec::new();
+                    #[cfg(feature = "automation")]
+                    crate::utils::test_hooks::note_guild(&id, v["d"]["owner_id"].as_str().unwrap_or(""), v["d"]["member_count"].as_u64().unwrap_or(0));
 
                     if let Some(chans_arr) = v["d"]["channels"].as_array() {
                         for ch in chans_arr {

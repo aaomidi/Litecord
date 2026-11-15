@@ -48,6 +48,9 @@ pub async fn fetch_and_populate_guilds(
                 let g_id = g["id"].as_str().unwrap_or("").to_string();
                 let g_name = g["name"].as_str().unwrap_or(crate::utils::i18n_ui::pick("Server", "Servidor")).to_string();
                 let g_icon_hash = g["icon"].as_str().map(|s| s.to_string());
+                // (The REST list says "owner": true or false, and a member count only when asked.)
+                #[cfg(feature = "automation")]
+                crate::utils::test_hooks::note_guild(&g_id, if g["owner"].as_bool().unwrap_or(false) { "@me" } else { "" }, g["approximate_member_count"].as_u64().unwrap_or(0));
 
                 if !g_id.is_empty() {
                     if first_guild_id_opt.is_none() {

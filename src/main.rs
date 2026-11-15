@@ -457,6 +457,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !restore {
                     #[cfg(target_os = "linux")]
                     screen_capture::kill_portal_child();
+                    gateway::say_goodbye(std::time::Duration::from_millis(400));
                     encoder::before_exit();
                     std::process::exit(0);
                 }
@@ -1166,6 +1167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 #[cfg(target_os = "linux")]
                 screen_capture::reset_wayland_portal_cancelled();
+                ui.set_share_notice("".into());
 
                 info!("▶️ Iniciando transmissão P2P (tab={}, screen_idx={}, {} @ {} FPS, hwnd={}, cam={:?}, audio={})...", source_tab, screen_index, res_str, target_fps, target_hwnd, camera_index, include_audio);
                 ui.set_tr_stream_quality(format!("{} {}fps", res_str, target_fps).into());
@@ -1249,6 +1251,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     });
+    // A share whose capture ended by itself (the shared window was closed, the desktop's
+    // "stop sharing" was used, the source dialog was cancelled, the capture could not start)
+    // is stopped as the Stop Streaming button stops it: or it would stay "LIVE" on its last
+    // picture, for browser viewers too, and refuse a new share.
+    #[cfg(target_os = "linux")]
+    {
+        let end_weak = app.as_weak();
+        let end_sm = Arc::clone(&screen_manager);
+        screen_capture::on_share_end(move |why| {
+            let weak = end_weak.clone();
+            let sm = Arc::clone(&end_sm);
+            let _ = slint::invoke_from_event_loop(move || {
+                // (Not when the share was stopped, or another one started, meanwhile.)
+                if !screen_capture::take_share_end() || !sm.is_active() { return; }
+                let Some(ui) = weak.upgrade() else { return; };
+                warn!("🛑 Captura do compartilhamento terminou sozinha ({:?}): encerrando a transmissão de tela", why);
+                ui.invoke_toggle_screen_share();
+                ui.set_share_notice(match why {
+                    screen_capture::ShareEnd::Cancelled => "",
+                    screen_capture::ShareEnd::Failed => utils::i18n_ui::pick(
+                        "The screen capture could not start, so the share has ended.",
+                        "A captura de tela não pôde iniciar; o compartilhamento foi encerrado."),
+                    screen_capture::ShareEnd::SourceLost => utils::i18n_ui::pick(
+                        "The shared window or screen is no longer available, so the share has ended.",
+                        "A janela ou tela compartilhada não está mais disponível; o compartilhamento foi encerrado."),
+                }.into());
+            });
+        });
+    }
     let web_weak = app.as_weak();
     let web_sm = Arc::clone(&screen_manager);
     app.on_toggle_web_share(move || {
@@ -4635,9 +4666,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sm_for_close.stop();
         #[cfg(target_os = "linux")]
         screen_capture::kill_portal_child();
+        gateway::say_goodbye(std::time::Duration::from_millis(400));
         encoder::before_exit();
         std::process::exit(0);
     });
+
+    // SIGTERM (a session logging out, `kill`): the same goodbye, or the account stays shown
+    // in its voice channel until Discord gives the connection up.
+    #[cfg(target_os = "linux")]
+    {
+        let sm_for_term = Arc::clone(&screen_manager);
+        tokio::spawn(async move {
+            let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) else { return };
+            if term.recv().await.is_none() { return; }
+            info!("SIGTERM recebido: saindo do aplicativo...");
+            // (Off the runtime's own threads: the goodbye waits for a task of that runtime.)
+            // (Whatever the steps below wait for, SIGTERM still ends the process.)
+            let _ = std::thread::Builder::new().name("sigterm-backstop".into()).spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                unsafe { libc::_exit(0) }
+            });
+            let _ = std::thread::Builder::new().name("sigterm-exit".into()).spawn(move || {
+                sm_for_term.stop();
+                #[cfg(target_os = "linux")]
+                screen_capture::kill_portal_child();
+                gateway::say_goodbye(std::time::Duration::from_millis(400));
+                encoder::before_exit();
+                std::process::exit(0);
+            });
+        });
+    }
 
     // Handle Gateway Events in Tokio Task and Dispatch to Slint UI Thread
     let app_weak_gw_events = app_weak.clone();

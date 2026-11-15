@@ -30,6 +30,12 @@
 //! {"cmd":"open_channel","name":"general"}    select a channel of the open server by exact
 //!                                            name (a voice channel joins it); errors if absent
 //! {"cmd":"leave_voice"}                      same as the leave button
+//! {"cmd":"set_voice_flags","muted":true,"deafened":true}  the mute and deafen states a voice
+//!                                            channel is joined with; only while in no channel
+//!                                            (in one, the buttons tell Discord as well)
+//! {"cmd":"stream_quality","min_qp":30,"max_bitrate":8}  the settings sliders' callbacks (either
+//!                                            or both); replies with the values now in force
+//! {"cmd":"quit"}                             same as the title bar's close button
 //! {"cmd":"start_screen_share","res":"1080p","fps":60,"screen":0,"audio":false}
 //! {"cmd":"stop_screen_share"}
 //! {"cmd":"watch_stream","user_id":"123"}     Watch a peer's stream and open it in the main view
@@ -533,6 +539,43 @@ fn execute(ui: &AppWindow, cmd: &Value) -> Result<Value, String> {
             ui.invoke_leave_voice();
             Ok(json!({ "ok": true }))
         }
+        "set_voice_flags" => {
+            if ui.get_is_in_voice() {
+                return Err("already in a voice channel".into());
+            }
+            if let Some(muted) = cmd["muted"].as_bool() {
+                ui.set_is_muted(muted);
+            }
+            if let Some(deafened) = cmd["deafened"].as_bool() {
+                ui.set_is_deafened(deafened);
+                crate::gateway::set_self_deaf(deafened);
+            }
+            Ok(json!({ "ok": true, "is_muted": ui.get_is_muted(), "is_deafened": ui.get_is_deafened() }))
+        }
+        "stream_quality" => {
+            let quality = ui.global::<crate::StreamQuality>();
+            if let Some(qp) = cmd["min_qp"].as_i64() {
+                quality.set_min_qp(qp as f32);
+                quality.invoke_set_min_qp(qp as i32);
+            }
+            if let Some(mbps) = cmd["max_bitrate"].as_i64() {
+                quality.set_max_bitrate(mbps as f32);
+                quality.invoke_set_max_bitrate(mbps as i32);
+            }
+            Ok(json!({
+                "ok": true,
+                "min_qp": crate::video_settings::get_stream_min_qp(),
+                "max_bitrate": crate::video_settings::get_stream_max_bitrate_mbps(),
+                "profile": format!("{:?}", crate::video_settings::get_stream_profile()),
+                "ui_min_qp": quality.get_min_qp(),
+                "ui_max_bitrate": quality.get_max_bitrate(),
+            }))
+        }
+        "quit" => {
+            // The reply is not sent: the close handler exits the process.
+            ui.invoke_close_window();
+            Ok(json!({ "ok": true }))
+        }
         "start_screen_share" => {
             if ui.get_is_screen_sharing() {
                 return Err("already sharing".into());
@@ -774,8 +817,37 @@ fn state(ui: &AppWindow) -> Value {
         .and_then(|g| g.as_ref().map(|m| m.iter().map(|(uid, addr)| json!({ "uid": uid.to_string(), "addr": addr.to_string() })).collect()))
         .unwrap_or_default();
 
-    json!({
+    let my_id = crate::gateway::get_my_user_id().to_string();
+    let facts = crate::utils::test_hooks::guild_facts().lock().map(|f| f.clone()).unwrap_or_default();
+    let guilds: Vec<Value> = ui
+        .get_guilds()
+        .iter()
+        .map(|g| {
+            let fact = facts.get(g.id.as_str());
+            json!({
+                "id": g.id.to_string(),
+                "name": g.name.to_string(),
+                "owned": fact.map(|f| f.0 == "@me" || (!my_id.is_empty() && f.0 == my_id)),
+                "members": fact.map(|f| f.1).filter(|n| *n > 0),
+            })
+        })
+        .collect();
+    let channels: Vec<Value> = ui
+        .get_channels()
+        .iter()
+        .map(|c| json!({ "id": c.id.to_string(), "name": c.name.to_string(), "voice": c.is_voice, "category": c.is_category, "voice_count": c.voice_count, "voice_member": c.is_voice_member }))
+        .collect();
+    let people: Vec<Value> = ui
+        .get_voice_participants()
+        .iter()
+        .map(|p| json!({ "id": p.user_id.to_string(), "self": p.is_self, "muted": p.is_muted, "streaming": p.is_streaming }))
+        .collect();
+
+    let mut state = json!({
         "ok": true,
+        "guilds": guilds,
+        "channels": channels,
+        "voice_participants": people,
         "version": env!("CARGO_PKG_VERSION"),
         "language": ui.get_current_language_code().to_string(),
         "is_logged_in": ui.get_is_logged_in(),
@@ -821,6 +893,9 @@ fn state(ui: &AppWindow) -> Value {
             "peers_streaming": peer_streams,
             "peers_seen": peer_addrs,
         },
-    })
+    });
+    // (Added here: one more key would take `json!` past the macro recursion limit.)
+    state["stream"]["share_notice"] = json!(ui.get_share_notice().to_string());
+    state
 }
 
