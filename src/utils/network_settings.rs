@@ -169,6 +169,7 @@ pub fn is_proxy_error(err_str: &str) -> bool {
         || lower.contains("proxy")
         || lower.contains("socks")
         || lower.contains("erro de rede")
+        || lower.contains("network error")
         || lower.contains("reset by peer")
         || lower.contains("failed to lookup")
         || lower.contains("websocket")
@@ -182,12 +183,12 @@ pub fn format_proxy_alert_message() -> String {
     let settings = get_network_settings();
     let mode = settings.proxy_mode.to_uppercase();
     if settings.proxy_mode == "system" {
-        "Falha de conexão via Proxy do Sistema! Clique aqui ou na engrenagem no topo para abrir as Configurações e desativá-lo.".to_string()
+        crate::utils::i18n_ui::pick("Connection through the system proxy failed! Click here or on the gear at the top to open Settings and turn it off.", "Falha de conexão via Proxy do Sistema! Clique aqui ou na engrenagem no topo para abrir as Configurações e desativá-lo.").to_string()
     } else {
-        format!(
-            "O Proxy ({}: {}:{}) está inacessível ou recusando conexão! Clique aqui ou na engrenagem no topo para abrir as Configurações e desativá-lo.",
-            mode, settings.proxy_host, settings.proxy_port
-        )
+        crate::utils::i18n_ui::pick(
+            "The proxy ({proxy}) is unreachable or refusing connections! Click here or on the gear at the top to open Settings and turn it off.",
+            "O Proxy ({proxy}) está inacessível ou recusando conexão! Clique aqui ou na engrenagem no topo para abrir as Configurações e desativá-lo.",
+        ).replace("{proxy}", &format!("{}: {}:{}", mode, settings.proxy_host, settings.proxy_port))
     }
 }
 

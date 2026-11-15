@@ -69,6 +69,25 @@ pub fn get_audio_devices_cache() -> Arc<std::sync::Mutex<Option<(Vec<String>, Ve
     CACHED_AUDIO_DEVICES.get_or_init(|| Arc::new(std::sync::Mutex::new(None))).clone()
 }
 
+/// Identifiers of the "system default" entries listed when no device is found. They are
+/// stored in the saved audio settings and recognised with `contains("Padrão")` (here, in
+/// sound_effects.rs and in gateway/voice.rs), so they never change with the language;
+/// `device_display_name` gives the text to show.
+pub const DEFAULT_INPUT_DEVICE_ID: &str = "Microfone Padrão do Sistema";
+pub const DEFAULT_OUTPUT_DEVICE_ID: &str = "Alto-falantes Padrão do Sistema";
+
+/// The name to show for a device identifier: the default entries in the UI language, real
+/// devices as they are.
+pub fn device_display_name(id: &str) -> String {
+    if id == DEFAULT_INPUT_DEVICE_ID {
+        crate::utils::i18n_ui::pick("System Default Microphone", DEFAULT_INPUT_DEVICE_ID).to_string()
+    } else if id == DEFAULT_OUTPUT_DEVICE_ID {
+        crate::utils::i18n_ui::pick("System Default Speakers", DEFAULT_OUTPUT_DEVICE_ID).to_string()
+    } else {
+        id.to_string()
+    }
+}
+
 pub fn enumerate_audio_devices() -> (Vec<String>, Vec<String>) {
     let host = cpal::default_host();
     let mut inputs = Vec::new();
@@ -95,11 +114,11 @@ pub fn enumerate_audio_devices() -> (Vec<String>, Vec<String>) {
     }
 
     if inputs.is_empty() {
-        inputs.push("Microfone Padrão do Sistema".to_string());
+        inputs.push(DEFAULT_INPUT_DEVICE_ID.to_string());
     }
 
     if outputs.is_empty() {
-        outputs.push("Alto-falantes Padrão do Sistema".to_string());
+        outputs.push(DEFAULT_OUTPUT_DEVICE_ID.to_string());
     }
 
     let result = (inputs, outputs);

@@ -330,7 +330,7 @@ export component DeviceSelect inherits VerticalLayout {
                     desc: "";
                     selected: d.is_selected;
                     clicked => {
-                        root.picked(d.name);
+                        root.picked(d.id);
                         popup.close();
                     }
                 }

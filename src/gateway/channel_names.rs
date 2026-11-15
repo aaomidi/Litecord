@@ -25,7 +25,7 @@ pub fn lookup(channel_id: &str) -> Option<(String, String)> {
 }
 
 /// Rewrites `<#id>` mentions as links to the channel, `[#name](https://discord.com/channels/guild/id)`,
-/// so the line parser shows them as clickable links. Unknown channels read `#canal`, as before.
+/// so the line parser shows them as clickable links. Unknown channels read `#channel` (`#canal` in Portuguese).
 pub fn link_channel_mentions(input: &str) -> String {
     if !input.contains("<#") {
         return input.to_string();
@@ -44,7 +44,7 @@ pub fn link_channel_mentions(input: &str) -> String {
                         let label = name.replace(']', ")");
                         out.push_str(&format!("[#{label}](https://discord.com/channels/{guild_id}/{id})"));
                     }
-                    None => out.push_str("#canal"),
+                    None => out.push_str(crate::utils::i18n_ui::pick("#channel", "#canal")),
                 }
                 rest = &after[end + 1..];
             }
@@ -81,7 +81,7 @@ mod tests {
         remember("900", [("901", "🔗|links-úteis")]);
         assert_eq!(
             link_channel_mentions("<#901> Para encontrar <#999> e <#abc>"),
-            "[#🔗|links-úteis](https://discord.com/channels/900/901) Para encontrar #canal e <#abc>"
+            "[#🔗|links-úteis](https://discord.com/channels/900/901) Para encontrar #channel e <#abc>"
         );
     }
 

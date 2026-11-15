@@ -39,7 +39,7 @@ pub fn start_hardware_monitor_loop(
                 // Hidden in the tray nobody sees the HUD or the title: leave a plain
                 // tooltip and sleep until `wake_hardware_monitor`.
                 if !crate::ui::helpers::APP_IS_VISIBLE.load(Ordering::Relaxed) {
-                    crate::utils::tray::update_tray_tooltip("Litecord - Discord Client Ultra-Leve");
+                    crate::utils::tray::update_tray_tooltip(crate::utils::i18n_ui::pick("Litecord - Ultra-Lightweight Discord Client", "Litecord - Discord Client Ultra-Leve"));
                     last_tooltip.clear();
                     while !crate::ui::helpers::APP_IS_VISIBLE.load(Ordering::Relaxed) {
                         std::thread::park();

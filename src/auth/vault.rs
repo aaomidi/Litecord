@@ -293,9 +293,9 @@ pub fn load_account_vault() -> AccountVault {
             accounts: vec![SavedAccount {
                 token: clean,
                 user_id: String::new(),
-                username: "Conta 1".to_string(),
-                tag: "Conta 1".to_string(),
-                avatar_initials: "C".to_string(),
+                username: crate::utils::i18n_ui::pick("Account 1", "Conta 1").to_string(),
+                tag: crate::utils::i18n_ui::pick("Account 1", "Conta 1").to_string(),
+                avatar_initials: crate::utils::i18n_ui::pick("A", "C").to_string(),
                 is_active: true,
             }],
         }

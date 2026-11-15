@@ -39,14 +39,16 @@ impl DiscordHttpClient {
                     if let Ok(json) = resp.json::<serde_json::Value>().await {
                         return Ok(json);
                     }
-                    Err("Falha ao ler JSON da resposta".to_string())
+                    Err(crate::utils::i18n_ui::pick("Could not read the JSON response", "Falha ao ler JSON da resposta").to_string())
                 } else if status.as_u16() == 401 {
-                    Err("HTTP 401 Unauthorized: Token recusado pelo Discord!".to_string())
+                    // Read by is_proxy_error: keep "401" and no "connect"/"refused" in either text.
+                    Err(crate::utils::i18n_ui::pick("HTTP 401 Unauthorized: Discord rejected the token!", "HTTP 401 Unauthorized: Token recusado pelo Discord!").to_string())
                 } else {
-                    Err(format!("Status HTTP {}", status))
+                    Err(format!("{} {}", crate::utils::i18n_ui::pick("HTTP status", "Status HTTP"), status))
                 }
             }
-            Err(e) => Err(format!("Erro de rede HTTP: {:?}", e)),
+            // is_proxy_error looks for "network error" / "erro de rede" in this text.
+            Err(e) => Err(format!("{}: {:?}", crate::utils::i18n_ui::pick("HTTP network error", "Erro de rede HTTP"), e)),
         }
     }
 
@@ -82,9 +84,9 @@ impl DiscordHttpClient {
                     }
                 }
                 let transient = status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
-                (Err(format!("Status HTTP {}", status)), transient)
+                (Err(format!("{} {}", crate::utils::i18n_ui::pick("HTTP status", "Status HTTP"), status)), transient)
             }
-            Err(e) => (Err(format!("Erro HTTP: {:?}", e)), true),
+            Err(e) => (Err(format!("{}: {:?}", crate::utils::i18n_ui::pick("HTTP error", "Erro HTTP"), e)), true),
         }
     }
 
@@ -98,9 +100,9 @@ impl DiscordHttpClient {
                         return Ok(settings);
                     }
                 }
-                Err(format!("Status HTTP {}", status))
+                Err(format!("{} {}", crate::utils::i18n_ui::pick("HTTP status", "Status HTTP"), status))
             }
-            Err(e) => Err(format!("Erro HTTP: {:?}", e)),
+            Err(e) => Err(format!("{}: {:?}", crate::utils::i18n_ui::pick("HTTP error", "Erro HTTP"), e)),
         }
     }
 
@@ -114,9 +116,9 @@ impl DiscordHttpClient {
                         return Ok(dms);
                     }
                 }
-                Err(format!("Status HTTP {}", status))
+                Err(format!("{} {}", crate::utils::i18n_ui::pick("HTTP status", "Status HTTP"), status))
             }
-            Err(e) => Err(format!("Erro HTTP: {:?}", e)),
+            Err(e) => Err(format!("{}: {:?}", crate::utils::i18n_ui::pick("HTTP error", "Erro HTTP"), e)),
         }
     }
 
@@ -130,9 +132,9 @@ impl DiscordHttpClient {
                         return Ok(channels);
                     }
                 }
-                Err(format!("Status HTTP {}", status))
+                Err(format!("{} {}", crate::utils::i18n_ui::pick("HTTP status", "Status HTTP"), status))
             }
-            Err(e) => Err(format!("Erro HTTP: {:?}", e)),
+            Err(e) => Err(format!("{}: {:?}", crate::utils::i18n_ui::pick("HTTP error", "Erro HTTP"), e)),
         }
     }
 
@@ -176,9 +178,9 @@ impl DiscordHttpClient {
                         return Ok(msgs);
                     }
                 }
-                Err(format!("Status HTTP {}", status))
+                Err(format!("{} {}", crate::utils::i18n_ui::pick("HTTP status", "Status HTTP"), status))
             }
-            Err(e) => Err(format!("Erro HTTP: {:?}", e)),
+            Err(e) => Err(format!("{}: {:?}", crate::utils::i18n_ui::pick("HTTP error", "Erro HTTP"), e)),
         }
     }
 
@@ -192,9 +194,9 @@ impl DiscordHttpClient {
                         return Ok(msgs);
                     }
                 }
-                Err(format!("Status HTTP {}", status))
+                Err(format!("{} {}", crate::utils::i18n_ui::pick("HTTP status", "Status HTTP"), status))
             }
-            Err(e) => Err(format!("Erro HTTP: {:?}", e)),
+            Err(e) => Err(format!("{}: {:?}", crate::utils::i18n_ui::pick("HTTP error", "Erro HTTP"), e)),
         }
     }
 
@@ -207,9 +209,9 @@ impl DiscordHttpClient {
                         return Ok(bytes.to_vec());
                     }
                 }
-                Err(format!("Status HTTP {}", status))
+                Err(format!("{} {}", crate::utils::i18n_ui::pick("HTTP status", "Status HTTP"), status))
             }
-            Err(e) => Err(format!("Erro HTTP: {:?}", e)),
+            Err(e) => Err(format!("{}: {:?}", crate::utils::i18n_ui::pick("HTTP error", "Erro HTTP"), e)),
         }
     }
 
@@ -266,10 +268,10 @@ impl DiscordHttpClient {
     /// A scheduled event of a server the user is in, with its interested count.
     pub async fn get_scheduled_event(&self, guild_id: &str, event_id: &str) -> Result<serde_json::Value, String> {
         let url = format!("https://discord.com/api/v10/guilds/{guild_id}/scheduled-events/{event_id}?with_user_count=true");
-        let resp = self.client.get(&url).send().await.map_err(|e| format!("Erro HTTP: {:?}", e))?;
+        let resp = self.client.get(&url).send().await.map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("HTTP error", "Erro HTTP"), e))?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(format!("Status HTTP {}", status));
+            return Err(format!("{} {}", crate::utils::i18n_ui::pick("HTTP status", "Status HTTP"), status));
         }
         resp.json::<serde_json::Value>().await.map_err(|e| format!("JSON: {:?}", e))
     }
@@ -284,7 +286,7 @@ impl DiscordHttpClient {
                         return Ok(user);
                     }
                 }
-                Err(format!("Status HTTP {}", status))
+                Err(format!("{} {}", crate::utils::i18n_ui::pick("HTTP status", "Status HTTP"), status))
             }
             Err(e) => Err(format!("Erro HTTP ao buscar usuário: {:?}", e)),
         }
@@ -300,7 +302,7 @@ impl DiscordHttpClient {
                         return Ok(member);
                     }
                 }
-                Err(format!("Status HTTP {}", status))
+                Err(format!("{} {}", crate::utils::i18n_ui::pick("HTTP status", "Status HTTP"), status))
             }
             Err(e) => Err(format!("Erro HTTP ao buscar membro do servidor: {:?}", e)),
         }
@@ -316,7 +318,7 @@ impl DiscordHttpClient {
                         return Ok(members);
                     }
                 }
-                Err(format!("Status HTTP {}", status))
+                Err(format!("{} {}", crate::utils::i18n_ui::pick("HTTP status", "Status HTTP"), status))
             }
             Err(e) => Err(format!("Erro HTTP ao buscar membros do servidor: {:?}", e)),
         }
@@ -332,7 +334,7 @@ impl DiscordHttpClient {
                         return Ok(data);
                     }
                 }
-                Err(format!("Status HTTP {}", status))
+                Err(format!("{} {}", crate::utils::i18n_ui::pick("HTTP status", "Status HTTP"), status))
             }
             Err(e) => Err(format!("Erro HTTP ao buscar índice de comandos do servidor: {:?}", e)),
         }

@@ -1801,14 +1801,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let username = if is_self {
                         let resolved = if my_user_id != 0 { gateway::get_user_name(my_user_id) } else { String::new() };
-                        if resolved.is_empty() || resolved.starts_with("Participante #") {
-                            "Você".to_string()
+                        if resolved.is_empty() || resolved.starts_with(gateway::UNRESOLVED_NAME_PREFIX) {
+                            crate::utils::i18n_ui::pick("You", "Você").to_string()
                         } else {
                             resolved
                         }
                     } else {
                         let uname = gateway::get_user_name(user_id);
-                        if uname.starts_with("Participante #") {
+                        if uname.starts_with(gateway::UNRESOLVED_NAME_PREFIX) {
                             if let Ok(http_opt) = http_client_voice_loop_inner.try_lock() {
                                 if let Some(http) = http_opt.clone() {
                                     static FETCHING_USERS: std::sync::OnceLock<Arc<Mutex<std::collections::HashSet<u64>>>> = std::sync::OnceLock::new();
@@ -1867,7 +1867,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
-                        uname
+                        // The stored placeholder is an identifier; show it in the UI language.
+                        gateway::display_user_name(&uname)
                     };
 
                     let avatar_text = username.chars().next().unwrap_or('U').to_uppercase().to_string();
@@ -2155,7 +2156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let is_sel = if cur_input.is_empty() { idx == 0 } else { name == &cur_input };
                     AudioDeviceItem {
                         id: name.clone().into(),
-                        name: name.clone().into(),
+                        name: crate::audio::device_display_name(name).into(),
                         is_selected: is_sel,
                     }
                 }).collect();
@@ -2164,7 +2165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let is_sel = if cur_output.is_empty() { idx == 0 } else { name == &cur_output };
                     AudioDeviceItem {
                         id: name.clone().into(),
-                        name: name.clone().into(),
+                        name: crate::audio::device_display_name(name).into(),
                         is_selected: is_sel,
                     }
                 }).collect();
@@ -2190,7 +2191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let is_sel = if cur_in.is_empty() { idx == 0 } else { name == &cur_in };
                     AudioDeviceItem {
                         id: name.clone().into(),
-                        name: name.clone().into(),
+                        name: crate::audio::device_display_name(name).into(),
                         is_selected: is_sel,
                     }
                 }).collect();
@@ -2199,7 +2200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let is_sel = if cur_out.is_empty() { idx == 0 } else { name == &cur_out };
                     AudioDeviceItem {
                         id: name.clone().into(),
-                        name: name.clone().into(),
+                        name: crate::audio::device_display_name(name).into(),
                         is_selected: is_sel,
                     }
                 }).collect();
@@ -2246,7 +2247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(ui) = app_weak_select_input.upgrade() {
             let current_devs: Vec<AudioDeviceItem> = ui.get_input_devices().iter().map(|mut item| {
-                item.is_selected = item.name.as_str() == name_str;
+                item.is_selected = item.id.as_str() == name_str;
                 item
             }).collect();
             ui.set_input_devices(std::rc::Rc::new(slint::VecModel::from(current_devs)).into());
@@ -2268,7 +2269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(ui) = app_weak_select_output.upgrade() {
             let current_devs: Vec<AudioDeviceItem> = ui.get_output_devices().iter().map(|mut item| {
-                item.is_selected = item.name.as_str() == name_str;
+                item.is_selected = item.id.as_str() == name_str;
                 item
             }).collect();
             ui.set_output_devices(std::rc::Rc::new(slint::VecModel::from(current_devs)).into());
@@ -2656,18 +2657,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(resp) => {
                     let ms = start.elapsed().as_millis();
                     if resp.status().is_success() {
-                        (format!("Sucesso! Conectado ao Discord via proxy em {}ms (Status {})", ms, resp.status()), true)
+                        (crate::utils::i18n_ui::pick("Success! Connected to Discord through the proxy in {ms}ms (Status {status})", "Sucesso! Conectado ao Discord via proxy em {ms}ms (Status {status})").replace("{ms}", &ms.to_string()).replace("{status}", &resp.status().to_string()), true)
                     } else {
-                        (format!("Proxy respondeu em {}ms, mas retornou status HTTP {}", ms, resp.status()), false)
+                        (crate::utils::i18n_ui::pick("The proxy answered in {ms}ms but returned HTTP status {status}", "Proxy respondeu em {ms}ms, mas retornou status HTTP {status}").replace("{ms}", &ms.to_string()).replace("{status}", &resp.status().to_string()), false)
                     }
                 }
                 Err(e) => {
                     let friendly = if e.is_connect() {
-                        "Falha de conexão: o proxy recusou a conexão ou está offline.".to_string()
+                        crate::utils::i18n_ui::pick("Connection failed: the proxy refused the connection or is offline.", "Falha de conexão: o proxy recusou a conexão ou está offline.").to_string()
                     } else if e.is_timeout() {
-                        "Tempo esgotado: o servidor proxy demorou para responder.".to_string()
+                        crate::utils::i18n_ui::pick("Timed out: the proxy server took too long to answer.", "Tempo esgotado: o servidor proxy demorou para responder.").to_string()
                     } else {
-                        format!("Erro ao conectar via proxy: {}", e)
+                        format!("{}: {}", crate::utils::i18n_ui::pick("Error connecting through the proxy", "Erro ao conectar via proxy"), e)
                     };
                     (friendly, false)
                 }
@@ -2774,7 +2775,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 current_msgs.push(ChatMessage {
                     id: "".into(),
                     author: "Litecord Voice".into(),
-                    content: "🔴 Desconectado da sala de voz.".into(),
+                    content: crate::utils::i18n_ui::pick("🔴 Disconnected from the voice room.", "🔴 Desconectado da sala de voz.").into(),
                     commands: slint::ModelRc::default(),
                     content_lines: slint::ModelRc::default(),
                     embed_content: "".into(),
@@ -3012,7 +3013,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(e) = updater::download_and_install_update(rel.download_url, prog_tx).await {
                     error!("Erro ao atualizar Litecord: {}", e);
                     let app_w = app_w_fail.clone();
-                    let err_msg = format!("Falha na atualização: {}", e);
+                    let err_msg = format!("{}: {}", crate::utils::i18n_ui::pick("Update failed", "Falha na atualização"), e);
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = app_w.upgrade() {
                             ui.set_is_updating(false);
@@ -3076,7 +3077,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         Err(e) => {
-                            ui.set_update_check_feedback(format!("Erro: {}", e).into());
+                            ui.set_update_check_feedback(format!("{}: {}", crate::utils::i18n_ui::pick("Error", "Erro"), e).into());
                         }
                     }
                 }
@@ -3156,7 +3157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         links: slint::ModelRc::from(links_model),
                                         buttons: map_message_buttons(&buttons, &ch_id_clone, &app_w_inner),
                                         attachments: map_message_attachments(&attachments, &app_w_inner),
-                                        timestamp: "Anterior".into(),
+                                        timestamp: crate::utils::i18n_ui::pick("Earlier", "Anterior").into(),
                                         ..Default::default()
                                     };
                                     apply_message_metadata(&mut message, m);
@@ -3293,7 +3294,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ui.set_login_alert_message(crate::utils::i18n_ui::ui_text().qr_captcha.into());
                                 ui.set_login_alert_is_error(true);
                             } else {
-                                ui.set_login_alert_message(format!("Falha no QR Code: {}", err_clone).into());
+                                ui.set_login_alert_message(format!("{}: {}", crate::utils::i18n_ui::pick("QR Code login failed", "Falha no QR Code"), err_clone).into());
                                 ui.set_login_alert_is_error(true);
                             }
                         }
@@ -3703,7 +3704,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ui.set_login_alert_message(crate::utils::format_proxy_alert_message().into());
                             } else {
                                 ui.set_connection_status(format!("❌ {}", err_clone).into());
-                                ui.set_login_alert_message(format!("Token recusado pelo Discord: {}", err_clone).into());
+                                ui.set_login_alert_message(format!("{}: {}", crate::utils::i18n_ui::pick("Token rejected by Discord", "Token recusado pelo Discord"), err_clone).into());
                             }
                             ui.set_login_alert_is_error(true);
                         }
@@ -4043,7 +4044,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|g| g.channels.iter().find(|c| c.id == ch_id).cloned());
 
         let is_voice = target_channel.as_ref().map(|c| c.is_voice).unwrap_or(false);
-        let ch_name = target_channel.as_ref().map(|c| c.name.clone()).unwrap_or_else(|| "canal".to_string());
+        let ch_name = target_channel.as_ref().map(|c| c.name.clone()).unwrap_or_else(|| crate::utils::i18n_ui::pick("channel", "canal").to_string());
 
         if let Some(ui) = app_weak_chan_select.upgrade() {
             if is_voice {
@@ -4087,7 +4088,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 current_msgs.push(ChatMessage {
                     id: "".into(),
                     author: "Litecord Voice".into(),
-                    content: format!("🔊 Entrou no canal de voz: {}", ch_name).into(),
+                    content: format!("{}: {}", crate::utils::i18n_ui::pick("🔊 Joined voice channel", "🔊 Entrou no canal de voz"), ch_name).into(),
                     commands: slint::ModelRc::default(),
                     content_lines: slint::ModelRc::default(),
                     embed_content: "".into(),
@@ -4319,7 +4320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui.set_active_command_name(found.name.clone().into());
                 ui.set_active_param_name(found.param_name.clone().into());
                 let pdesc = if found.param_desc.is_empty() {
-                    if found.param_name.is_empty() { format!("Pressione Enter para executar {}", found.name) } else { found.desc.clone() }
+                    if found.param_name.is_empty() { format!("{}{}", crate::utils::i18n_ui::ui_text().press_enter_run, found.name) } else { found.desc.clone() }
                 } else {
                     found.param_desc.clone()
                 };
@@ -4330,7 +4331,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 ui.set_active_command_name(clean_cmd.clone().into());
                 ui.set_active_param_name("".into());
-                ui.set_active_param_desc(format!("Pressione Enter para executar {}", clean_cmd).into());
+                ui.set_active_param_desc(format!("{}{}", crate::utils::i18n_ui::ui_text().press_enter_run, clean_cmd).into());
                 ui.set_active_command_app_id("".into());
                 ui.set_active_command_cmd_id("".into());
                 ui.set_active_command_version("".into());
@@ -4358,7 +4359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ui.set_active_command_name(found.name.clone().into());
                         ui.set_active_param_name(found.param_name.clone().into());
                         let pdesc = if found.param_desc.is_empty() {
-                            if found.param_name.is_empty() { format!("Pressione Enter para executar {}", found.name) } else { found.desc.clone() }
+                            if found.param_name.is_empty() { format!("{}{}", crate::utils::i18n_ui::ui_text().press_enter_run, found.name) } else { found.desc.clone() }
                         } else {
                             found.param_desc.clone()
                         };
@@ -4688,11 +4689,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = app_weak_inner.upgrade() {
                             let clean_reason = if reason_clone.contains("10054") || reason_clone.contains("ConnectionReset") || reason_clone.contains("reset by peer") {
-                                "Conexão reiniciada".to_string()
+                                crate::utils::i18n_ui::pick("Connection reset", "Conexão reiniciada").to_string()
                             } else if reason_clone.contains("timeout") || reason_clone.contains("TimedOut") {
-                                "Sem internet / Timeout".to_string()
+                                crate::utils::i18n_ui::pick("No internet / Timeout", "Sem internet / Timeout").to_string()
                             } else {
-                                format!("Desconectado ({})", reason_clone)
+                                format!("{} ({})", crate::utils::i18n_ui::pick("Disconnected", "Desconectado"), reason_clone)
                             };
                             ui.set_titlebar_error(clean_reason.into());
                         }
@@ -4986,7 +4987,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 resolved_name = if !caller_raw.is_empty() && caller_raw != "Alguém" {
                                     caller_raw
                                 } else {
-                                    "Amigo".to_string()
+                                    crate::utils::i18n_ui::pick("Friend", "Amigo").to_string()
                                 };
                             }
 

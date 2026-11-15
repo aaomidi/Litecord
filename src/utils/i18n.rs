@@ -134,7 +134,7 @@ pub const EN_TRANSLATIONS: Translations = Translations {
     chat_placeholder_prefix: "Message ",
     send: "Send",
     settings_title: "Voice & Audio Settings",
-    settings_language_label: "LANGUAGE / IDIOMA",
+    settings_language_label: "LANGUAGE",
     settings_input_device: "INPUT DEVICE (MICROPHONE)",
     settings_output_device: "OUTPUT DEVICE (SPEAKERS / HEADPHONES)",
     settings_threshold: "VOICE DETECTION SENSITIVITY (THRESHOLD)",

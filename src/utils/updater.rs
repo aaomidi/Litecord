@@ -147,17 +147,17 @@ pub async fn check_version_status_detailed(respect_ignored: bool) -> Result<Deta
         .user_agent("Litecord-App-Updater")
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| format!("Erro ao inicializar cliente HTTP: {:?}", e))?;
+        .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Failed to initialize the HTTP client", "Erro ao inicializar cliente HTTP"), e))?;
 
     let resp = client.get(&url).send().await
-        .map_err(|e| format!("Falha de conexão com o GitHub: {:?}", e))?;
+        .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Could not connect to GitHub", "Falha de conexão com o GitHub"), e))?;
 
     if !resp.status().is_success() {
-        return Err(format!("API do GitHub retornou status HTTP {}", resp.status()));
+        return Err(format!("{} {}", crate::utils::i18n_ui::pick("GitHub API returned HTTP status", "API do GitHub retornou status HTTP"), resp.status()));
     }
 
     let json: serde_json::Value = resp.json().await
-        .map_err(|e| format!("Erro ao decodificar JSON do GitHub: {:?}", e))?;
+        .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Failed to decode GitHub's JSON", "Erro ao decodificar JSON do GitHub"), e))?;
 
     let tag_name = json["tag_name"].as_str().unwrap_or("v0.0.0").to_string();
     let remote_version = tag_name.trim_start_matches('v').to_string();
@@ -196,30 +196,30 @@ pub async fn check_version_status_detailed(respect_ignored: bool) -> Result<Deta
     let (status, formatted_status) = if is_newer_version(&remote_version, &local_version) {
         (
             VersionComparisonStatus::Outdated,
-            format!("Desatualizado (v{} disponível no GitHub)", remote_version),
+            crate::utils::i18n_ui::pick("Outdated (v{} available on GitHub)", "Desatualizado (v{} disponível no GitHub)").replace("{}", &remote_version.to_string()),
         )
     } else if is_newer_version(&local_version, &remote_version) {
         if is_dirty {
             (
                 VersionComparisonStatus::Modified,
-                format!("Dev / Modificado ({}-modified • release v{})", local_hash, remote_version),
+                format!("{} ({}-modified • release v{})", crate::utils::i18n_ui::pick("Dev / Modified", "Dev / Modificado"), local_hash, remote_version),
             )
         } else {
             (
                 VersionComparisonStatus::AheadOfRelease,
-                format!("Atualizado / Dev ({} • à frente da release v{})", local_hash, remote_version),
+                format!("{} ({} • {} v{})", crate::utils::i18n_ui::pick("Up to date / Dev", "Atualizado / Dev"), local_hash, crate::utils::i18n_ui::pick("ahead of release", "à frente da release"), remote_version),
             )
         }
     } else {
         if is_dirty {
             (
                 VersionComparisonStatus::Modified,
-                format!("Modificado ({}-modified • base v{})", local_hash, remote_version),
+                format!("{} ({}-modified • base v{})", crate::utils::i18n_ui::pick("Modified", "Modificado"), local_hash, remote_version),
             )
         } else {
             (
                 VersionComparisonStatus::UpToDate,
-                format!("Atualizado (v{} • {})", local_version, local_hash),
+                format!("{} (v{} • {})", crate::utils::i18n_ui::pick("Up to date", "Atualizado"), local_version, local_hash),
             )
         }
     };
@@ -271,19 +271,19 @@ pub async fn download_and_install_update(
         && !download_url.starts_with("https://objects.githubusercontent.com/")
         && !download_url.starts_with("https://github-releases.githubusercontent.com/")
     {
-        return Err("URL de atualização rejeitada por segurança: domínio não oficial.".to_string());
+        return Err(crate::utils::i18n_ui::pick("Update URL rejected for security: unofficial domain.", "URL de atualização rejeitada por segurança: domínio não oficial.").to_string());
     }
 
     let client = reqwest::Client::builder()
         .user_agent("Litecord-App-Updater")
         .build()
-        .map_err(|e| format!("Erro ao criar cliente HTTP: {:?}", e))?;
+        .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Failed to create the HTTP client", "Erro ao criar cliente HTTP"), e))?;
 
     let mut response = client.get(&download_url).send().await
-        .map_err(|e| format!("Falha na conexão de download: {:?}", e))?;
+        .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Download connection failed", "Falha na conexão de download"), e))?;
 
     if !response.status().is_success() {
-        return Err(format!("Download falhou com status HTTP {}", response.status()));
+        return Err(format!("{} {}", crate::utils::i18n_ui::pick("Download failed with HTTP status", "Download falhou com status HTTP"), response.status()));
     }
 
     let total_size = response.content_length().unwrap_or(0);
@@ -292,13 +292,13 @@ pub async fn download_and_install_update(
     if cfg!(target_os = "windows") {
         let installer_path = temp_dir.join("Litecord-Update-Setup.exe");
         let mut file = tokio::fs::File::create(&installer_path).await
-            .map_err(|e| format!("Falha ao criar arquivo temporário: {:?}", e))?;
+            .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Failed to create the temporary file", "Falha ao criar arquivo temporário"), e))?;
 
         let mut downloaded: u64 = 0;
 
-        while let Some(chunk) = response.chunk().await.map_err(|e| format!("Erro no download: {:?}", e))? {
+        while let Some(chunk) = response.chunk().await.map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Download error", "Erro no download"), e))? {
             tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await
-                .map_err(|e| format!("Erro ao gravar dados: {:?}", e))?;
+                .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Failed to write data", "Erro ao gravar dados"), e))?;
 
             downloaded += chunk.len() as u64;
             if total_size > 0 {
@@ -308,16 +308,16 @@ pub async fn download_and_install_update(
         }
 
         tokio::io::AsyncWriteExt::flush(&mut file).await
-            .map_err(|e| format!("Erro no flush do arquivo: {:?}", e))?;
+            .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Failed to flush the file", "Erro no flush do arquivo"), e))?;
         drop(file);
 
         if total_size > 0 && downloaded != total_size {
             let _ = tokio::fs::remove_file(&installer_path).await;
-            return Err(format!("Download incompleto (recebidos {} de {} bytes). O instalador não foi executado.", downloaded, total_size));
+            return Err(format!("{} ({} / {} bytes). {}", crate::utils::i18n_ui::pick("Incomplete download", "Download incompleto"), downloaded, total_size, crate::utils::i18n_ui::pick("The installer was not run.", "O instalador não foi executado.")));
         }
         if downloaded < 500_000 {
             let _ = tokio::fs::remove_file(&installer_path).await;
-            return Err(format!("Download truncado ou corrompido (apenas {} bytes recebidos).", downloaded));
+            return Err(format!("{} ({} bytes).", crate::utils::i18n_ui::pick("Download truncated or corrupted", "Download truncado ou corrompido"), downloaded));
         }
 
         let _ = progress_tx.try_send(1.0);
@@ -377,13 +377,13 @@ pub async fn download_and_install_update(
         // Linux: Download .tar.gz and extract binary to ~/.local/bin/litecord
         let tar_path = temp_dir.join("litecord-update.tar.gz");
         let mut file = tokio::fs::File::create(&tar_path).await
-            .map_err(|e| format!("Falha ao criar arquivo temporário: {:?}", e))?;
+            .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Failed to create the temporary file", "Falha ao criar arquivo temporário"), e))?;
 
         let mut downloaded: u64 = 0;
 
-        while let Some(chunk) = response.chunk().await.map_err(|e| format!("Erro no download: {:?}", e))? {
+        while let Some(chunk) = response.chunk().await.map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Download error", "Erro no download"), e))? {
             tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await
-                .map_err(|e| format!("Erro ao gravar dados: {:?}", e))?;
+                .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Failed to write data", "Erro ao gravar dados"), e))?;
 
             downloaded += chunk.len() as u64;
             if total_size > 0 {
@@ -393,16 +393,16 @@ pub async fn download_and_install_update(
         }
 
         tokio::io::AsyncWriteExt::flush(&mut file).await
-            .map_err(|e| format!("Erro no flush do arquivo: {:?}", e))?;
+            .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Failed to flush the file", "Erro no flush do arquivo"), e))?;
         drop(file);
 
         if total_size > 0 && downloaded != total_size {
             let _ = tokio::fs::remove_file(&tar_path).await;
-            return Err(format!("Download incompleto (recebidos {} de {} bytes). A extração foi cancelada.", downloaded, total_size));
+            return Err(format!("{} ({} / {} bytes). {}", crate::utils::i18n_ui::pick("Incomplete download", "Download incompleto"), downloaded, total_size, crate::utils::i18n_ui::pick("Extraction was cancelled.", "A extração foi cancelada.")));
         }
         if downloaded < 500_000 {
             let _ = tokio::fs::remove_file(&tar_path).await;
-            return Err(format!("Download truncado ou corrompido (apenas {} bytes recebidos).", downloaded));
+            return Err(format!("{} ({} bytes).", crate::utils::i18n_ui::pick("Download truncated or corrupted", "Download truncado ou corrompido"), downloaded));
         }
 
         let _ = progress_tx.try_send(1.0);
@@ -503,7 +503,7 @@ pub async fn download_and_install_update(
                 }
             }
         }
-        Err("Falha ao descompactar e instalar a atualização no Linux.".to_string())
+        Err(crate::utils::i18n_ui::pick("Failed to unpack and install the update on Linux.", "Falha ao descompactar e instalar a atualização no Linux.").to_string())
     }
 }
 
