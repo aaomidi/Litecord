@@ -62,6 +62,7 @@ export component SettingsView inherits Rectangle {
     in property <[SettingOptionItem]> video_capture_options;
     in property <[SettingOptionItem]> audio_loopback_options;
     in property <bool> enable_self_preview_notice;
+    in property <bool> allow_web_link_requests;
     in property <bool> show_hardware_monitor;
     in property <bool> use_gpu_renderer;
     in property <bool> net_diag_running;
@@ -99,6 +100,7 @@ export component SettingsView inherits Rectangle {
     callback select_video_capture_backend(string);
     callback select_audio_loopback_backend(string);
     callback toggle_enable_self_preview_notice();
+    callback toggle_allow_web_link_requests();
     callback toggle_hardware_monitor();
     callback toggle_gpu_renderer();
     callback run_network_diagnostics();
@@ -390,6 +392,12 @@ export component SettingsView inherits Rectangle {
                                     desc: Tr.economy_notice_desc;
                                     checked: root.enable_self_preview_notice;
                                     toggled => { root.toggle_enable_self_preview_notice(); }
+                                }
+                                SettingsSwitchRow {
+                                    title: Tr.web_link_allow;
+                                    desc: Tr.web_link_allow_desc;
+                                    checked: root.allow_web_link_requests;
+                                    toggled => { root.toggle_allow_web_link_requests(); }
                                 }
                                 if root.stream_capture_status != "": Text {
                                     text: root.stream_capture_status;

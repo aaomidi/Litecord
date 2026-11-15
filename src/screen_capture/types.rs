@@ -28,6 +28,11 @@ pub const OP_WATCH: u8 = 9;
 pub const OP_UNWATCH: u8 = 10;
 /// Sender -> viewer: viewer uid (8) + sender public key (32) + stream key wrapped with the pair key (60).
 pub const OP_WATCH_ACK: u8 = 11;
+// "Open in browser" (see web_link.rs). Clients without it ignore both.
+/// Viewer -> sender: target uid (8) + viewer X25519 public key (32) + request id (16).
+pub const OP_WEB_LINK_REQ: u8 = 12;
+/// Sender -> viewer: viewer uid (8) + sender public key (32) + answer sealed with the pair key.
+pub const OP_WEB_LINK_REPLY: u8 = 13;
 
 static PROCESS_INSTANCE_ID: OnceLock<u32> = OnceLock::new();
 

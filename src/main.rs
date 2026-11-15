@@ -53,6 +53,21 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 slint::include_modules!();
 
+/// Hands an http(s) URL to the default browser. The caller validates it, and logs it
+/// only if it may be logged (a stream link is a secret).
+fn open_in_default_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        let op: Vec<u16> = "open\0".encode_utf16().collect();
+        let file: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+        ShellExecuteW(0, op.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1 /* SW_SHOWNORMAL */);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     commit_heap_pages_on_demand();
@@ -540,16 +555,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         info!("Abrindo link seguro no navegador padrão: {}", url);
-        #[cfg(target_os = "windows")]
-        unsafe {
-            let op: Vec<u16> = "open\0".encode_utf16().collect();
-            let file: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
-            ShellExecuteW(0, op.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1 /* SW_SHOWNORMAL */);
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
-        }
+        open_in_default_browser(&url);
     });
 
     let app_weak_dl = app_weak.clone();
@@ -1185,6 +1191,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !active {
                     ui.set_web_share_url("".into());
                     ui.set_web_share_error(screen_capture::web_share::last_error().into());
+                    // Or the link window would come back by itself the next time a
+                    // request from the call turns web sharing on.
+                    ui.set_show_web_share_modal(false);
                 }
             }
         });
@@ -1196,6 +1205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if ui.get_web_share_pending() { return; }
         if screen_capture::web_share::is_active() {
             screen_capture::web_share::stop();
+            screen_capture::web_link::stopped_by_hand();
             ui.set_web_share_active(false);
             ui.set_web_share_url("".into());
             ui.set_web_share_viewers(0);
@@ -1207,8 +1217,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.set_web_share_copied(false);
         let weak = web_weak.clone();
         let manager = Arc::clone(&web_sm);
+        screen_capture::web_link::starting_by_hand(false);
         std::thread::spawn(move || {
             let result = screen_capture::web_share::start();
+            screen_capture::web_link::starting_by_hand(true);
             if !manager.is_active() { screen_capture::web_share::stop(); }
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = weak.upgrade() {
@@ -1233,7 +1245,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let copied = !link.is_empty() && copypasta::ClipboardContext::new()
                 .and_then(|mut ctx| copypasta::ClipboardProvider::set_contents(&mut ctx, link)).is_ok();
             ui.set_web_share_copied(copied);
+            // A link they hand out themselves must not stop working after an idle while.
+            screen_capture::web_link::taken_over_by_hand();
         }
+    });
+    // Opening the link window is taking the link too (it can be selected and copied there).
+    app.on_web_share_link_shown(|| screen_capture::web_link::taken_over_by_hand());
+
+    // "Open in browser", sender side: a request from the call turned web sharing on.
+    let link_host_weak = app.as_weak();
+    screen_capture::web_link::on_host_event(move |event| {
+        let weak = link_host_weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = weak.upgrade() else { return; };
+            use screen_capture::web_link::HostEvent;
+            match event {
+                HostEvent::Starting => ui.set_web_share_pending(true),
+                HostEvent::Started(url) => {
+                    ui.set_web_share_pending(false);
+                    if ui.get_is_screen_sharing() && screen_capture::web_share::is_active() {
+                        ui.set_show_web_share_modal(false);
+                        ui.set_web_share_copied(false);
+                        ui.set_web_share_url(url.into());
+                        ui.set_web_share_active(true);
+                    }
+                },
+                HostEvent::NotStarted => ui.set_web_share_pending(false),
+                // The status callback above already turned the indicator off.
+                HostEvent::StoppedIdle => {},
+            }
+        });
+    });
+
+    // "Open in browser", viewer side: ask, then open the link or say why not.
+    let link_ask_weak = app.as_weak();
+    app.on_open_stream_in_browser(move |uid_str: SharedString| {
+        let Some(ui) = link_ask_weak.upgrade() else { return; };
+        if screen_capture::web_link::request(uid_str.parse().unwrap_or(0)) {
+            info!("🌐 [ABRIR NO NAVEGADOR] Pedindo o link da transmissão de UID={}...", uid_str);
+            ui.set_web_share_error("".into());
+            ui.set_web_link_pending_uid(uid_str);
+        }
+    });
+    let link_outcome_weak = app.as_weak();
+    let link_pop_weak = popout_weak.clone();
+    screen_capture::web_link::on_outcome(move |uid, outcome| {
+        let (weak, pop_weak) = (link_outcome_weak.clone(), link_pop_weak.clone());
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = weak.upgrade() else { return; };
+            use screen_capture::web_link::Outcome;
+            ui.set_web_link_pending_uid("".into());
+            // Out of the call meanwhile (by any way, not only the Leave button): nothing
+            // to open and nothing to report.
+            if !ui.get_is_in_voice() { return; }
+            let text = crate::utils::i18n_ui::ui_text();
+            let message = match outcome {
+                Outcome::Link(url) => {
+                    // Never logged: whoever has the link can watch.
+                    info!("🌐 [ABRIR NO NAVEGADOR] Link da transmissão de UID={} recebido: abrindo no navegador padrão.", uid);
+                    open_in_default_browser(&url);
+                    // Moved to the browser: stop receiving and decoding it here (and close
+                    // its detached window, which would stay on the last picture).
+                    if screen_capture::watch::is_wanted(uid) {
+                        let uid_str = uid.to_string();
+                        if ui.get_popped_out_stream_uid() == uid_str.as_str() {
+                            if let Some(pop) = pop_weak.upgrade() {
+                                pop.invoke_close_popout();
+                            }
+                        }
+                        ui.invoke_hide_stream(uid_str.into());
+                    }
+                    return;
+                },
+                Outcome::Refused => text.web_link_refused,
+                Outcome::Full => text.web_link_full,
+                Outcome::Unavailable => text.web_link_unavailable,
+                Outcome::NoAnswer => text.web_link_no_answer,
+                Outcome::BadLink => text.web_link_bad_link,
+            };
+            info!("🌐 [ABRIR NO NAVEGADOR] Transmissão de UID={} não aberta no navegador: {:?}", uid, outcome);
+            ui.set_web_share_error(message.into());
+        });
     });
 
     let app_weak_browser = app_weak.clone();
@@ -2274,6 +2366,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let app_weak_web_link = app_weak.clone();
+    app.on_toggle_allow_web_link_requests(move || {
+        let new_val = video_settings::toggle_allow_web_link_requests();
+        if !new_val {
+            // Browser access they never set up ends with the setting (the status callback
+            // of web sharing turns the indicator off).
+            screen_capture::web_link::disallowed(&screen_capture::web_link::AppWebShare);
+        }
+        if let Some(ui) = app_weak_web_link.upgrade() {
+            ui.set_allow_web_link_requests(new_val);
+        }
+    });
+
     let app_weak_hw = app_weak.clone();
     app.on_toggle_hardware_monitor(move || {
         let new_val = video_settings::toggle_show_hardware_monitor();
@@ -2524,6 +2629,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         screen_capture::clear_stream_audio_queue();
         hidden_streams_leave.lock().unwrap().clear();
         screen_capture::watch::clear_wanted();
+        screen_capture::web_link::cancel();
         // Do this even if the window has gone away: the next call starts with fresh audio.
         if let Ok(mut queues) = gateway::get_speaker_pcm_queues().lock() {
             queues.clear();
@@ -2542,6 +2648,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_web_share_active(false);
             ui.set_web_share_url("".into());
             ui.set_web_share_viewers(0);
+            ui.set_web_link_pending_uid("".into());
             ui.set_local_preview_fps("".into());
             ui.set_remote_stream_fps("".into());
             ui.set_has_active_stream(false);

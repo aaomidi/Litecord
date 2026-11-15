@@ -31,6 +31,10 @@ pub struct VideoSettings {
     /// Where the main window was when it last moved or resized. None until it does.
     #[serde(default)]
     pub window: Option<WindowGeometry>,
+    /// While streaming, people in the call may ask for a browser link to the stream
+    /// (screen_capture::web_link); web sharing is turned on for them if needed.
+    #[serde(default = "default_true")]
+    pub allow_web_link_requests: bool,   // default true
 }
 
 /// Position in physical pixels (a logical position is ambiguous across monitors with
@@ -82,6 +86,7 @@ impl Default for VideoSettings {
             echo_cancellation: false,
             automatic_gain_control: false,
             window: None,
+            allow_web_link_requests: true,
         }
     }
 }
@@ -155,6 +160,18 @@ pub fn toggle_enable_self_preview_notice() -> bool {
     new_val
 }
 
+
+pub fn get_allow_web_link_requests() -> bool {
+    get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner()).allow_web_link_requests
+}
+
+pub fn toggle_allow_web_link_requests() -> bool {
+    let mut store = get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner());
+    store.allow_web_link_requests = !store.allow_web_link_requests;
+    let new_val = store.allow_web_link_requests;
+    save_video_settings(&store);
+    new_val
+}
 
 pub fn get_show_hardware_monitor() -> bool {
     get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner()).show_hardware_monitor

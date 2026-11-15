@@ -11,6 +11,7 @@ pub mod manager;
 pub mod net_diagnostics;
 pub mod web_share;
 pub mod watch;
+pub mod web_link;
 pub mod stream_audio;
 pub mod gpu_encode_worker;
 #[cfg(windows)]

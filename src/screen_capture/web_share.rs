@@ -84,7 +84,7 @@ pub fn start() -> io::Result<String> {
         let page = std::env::temp_dir().join("litecord-web-manual.html");
         std::fs::write(&page, include_str!("../../assets/web/watch.html"))?;
         format!("file:///{}#manual", page.to_string_lossy().replace('\\', "/"))
-    } else { format!("{}/watch#room={room}&key={}", http_base(&base), hex(&key)) };
+    } else { format!("{}{room}&key={}", link_prefix_of(&base), hex(&key)) };
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     // A picture leaves the encoder as one burst of packets (a keyframe is hundreds of them);
     // with Windows' default send buffer the socket refused a third of a 1080p60 stream.
@@ -196,6 +196,18 @@ pub fn is_active() -> bool {
     HAS_SESSION.load(Ordering::Acquire) && SESSION.lock().unwrap().as_ref()
         .is_some_and(|s| s.state.active.load(Ordering::Acquire))
 }
+/// The link of the session that is on.
+pub fn active_url() -> Option<String> {
+    SESSION.lock().unwrap().as_ref().filter(|s| s.state.active.load(Ordering::Acquire)).map(|s| s.url.clone())
+}
+/// What every link made here starts with; the room and the key (hex) follow.
+pub fn link_prefix() -> String {
+    let base = std::env::var("LITECORD_WEB_SIGNALING_URL").ok()
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(super::signaling::signaling_base_url);
+    link_prefix_of(&base)
+}
+fn link_prefix_of(base: &str) -> String { format!("{}/watch#room=", http_base(base)) }
 pub fn viewer_count() -> usize {
     SESSION.lock().unwrap().as_ref().map_or(0, |s| s.state.viewers.load(Ordering::Relaxed))
 }
