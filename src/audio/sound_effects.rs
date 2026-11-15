@@ -65,162 +65,176 @@ pub fn play_ui_sound(sound: UiSound) {
     }
 }
 
+/// UI tones, "soft mallet" set: every sound is two gentle strikes of a felted
+/// mallet on a wooden bar ("tok-dong"). The second strike is the one that lands.
+///
+/// Falling pitch means switching off or leaving, rising pitch means switching on
+/// or arriving. The two sounds of a pair are identical except that the two pitches
+/// swap places. The three pairs differ in interval, register and pace, so they can
+/// be told apart by ear:
+///
+/// | pair              | interval    | pitches   | character                        |
+/// |-------------------|-------------|-----------|----------------------------------|
+/// | Mute / Unmute     | major third | B4 <-> G4 | quick and dry                    |
+/// | Deafen / Undeafen | octave      | D5 <-> D4 | slow, dark and felted            |
+/// | Leave / Join      | fourth      | G5 <-> D5 | unhurried, highest and brightest |
+///
+/// All five pitches belong to one justly tuned G major chord (3 : 4 : 5 : 6 : 8
+/// over 99 Hz), so strikes that ring into each other never beat or clash.
+///
+/// Quiet and soft-edged on purpose, because these play on top of a voice call:
+/// peak below 0.17 of full scale (the previous set peaked at 0.6-0.75),
+/// raised-cosine onsets that take 16-26 ms to reach 90 %, no pitch sweeps, and
+/// every strike fades to exactly zero. The two strikes overlap by summing; the
+/// buffer is never split at a note boundary. It starts with 5 ms and ends with
+/// 15 ms of exact silence so that opening and closing the output stream cannot
+/// click. Everything is in seconds and Hz, so the result is the same at any
+/// sample rate.
 fn generate_sound_samples(sound: UiSound, sample_rate: u32) -> Vec<f32> {
-    let dt = 1.0 / sample_rate as f32;
-    let mut samples = Vec::new();
+    // Exact silence after the last strike has faded out.
+    const LEAD_OUT: f64 = 0.015;
 
-    match sound {
-        UiSound::Mute => {
-            // Descending tactile blip: 540Hz -> 280Hz (~120ms)
-            let duration = 0.12;
-            let total = (sample_rate as f32 * duration) as usize;
-            let mut phase = 0.0f32;
-            for i in 0..total {
-                let t = i as f32 / total as f32;
-                let freq = 540.0 - 260.0 * (t * t);
-                phase += 2.0 * std::f32::consts::PI * freq * dt;
+    let rate = f64::from(sample_rate.max(1));
+    let voices = mallet_voices(sound);
+    let total = voices[1].start + voices[1].len + LEAD_OUT;
+    let count = (total * rate).ceil() as usize;
 
-                let attack = (i as f32 / (sample_rate as f32 * 0.006)).min(1.0);
-                let decay = (-t * 3.8).exp();
-                let wave = (phase.sin() + 0.20 * (phase * 2.0).sin()) * 0.70 * attack * decay;
-                samples.push(wave);
-            }
+    (0..count)
+        .map(|i| {
+            let t = i as f64 / rate;
+            (mallet_sample(&voices[0], t, rate) + mallet_sample(&voices[1], t, rate)) as f32
+        })
+        .collect()
+}
+
+/// One strike of the mallet. Times in seconds, frequencies in Hz, full scale = 1.0.
+#[derive(Clone, Copy)]
+struct MalletVoice {
+    /// Onset, measured from the start of the buffer.
+    start: f64,
+    /// Fundamental.
+    freq: f64,
+    /// Peak level of the fundamental divided by the peak of the raw envelope.
+    gain: f64,
+    /// Raised-cosine rise time from 0 to 100 % (90 % of the peak comes at about 0.7x this).
+    attack: f64,
+    /// Time constant of the exponential decay of the fundamental.
+    tau: f64,
+    /// The strike is exactly zero again this long after its onset.
+    len: f64,
+    /// Level of the 2nd harmonic relative to the fundamental; it dies 1.5x faster.
+    second_partial: f64,
+    /// Level of the 3rd harmonic relative to the fundamental; it dies 3x faster.
+    third_partial: f64,
+}
+
+/// The two strikes that make up `sound`.
+fn mallet_voices(sound: UiSound) -> [MalletVoice; 2] {
+    // (attack, tau, len) of one strike.
+    type Strike = (f64, f64, f64);
+    // (time between the two onsets, first strike, second strike, 2nd partial, 3rd partial)
+    type Motif = (f64, Strike, Strike, f64, f64);
+
+    // Quick, dry double tap.
+    #[rustfmt::skip]
+    const TAP: Motif = (0.080, (0.024, 0.040, 0.150), (0.026, 0.050, 0.190), 0.10, 0.02);
+    // Slow, dark and felted: softest onset, longest ring, almost a pure sine.
+    #[rustfmt::skip]
+    const DROP: Motif = (0.145, (0.030, 0.055, 0.200), (0.034, 0.075, 0.280), 0.05, 0.0);
+    // Unhurried, with a touch more "wood" in the onset.
+    #[rustfmt::skip]
+    const CHIME: Motif = (0.125, (0.024, 0.050, 0.180), (0.026, 0.070, 0.290), 0.12, 0.035);
+
+    // Just intonation over 99 Hz.
+    const D4: f64 = 297.0;
+    const G4: f64 = 396.0;
+    const B4: f64 = 495.0;
+    const D5: f64 = 594.0;
+    const G5: f64 = 792.0;
+
+    // Exact silence before the first strike.
+    const LEAD_IN: f64 = 0.005;
+
+    // Inside a pair only the order of the two pitches differs.
+    let (first_freq, second_freq, motif) = match sound {
+        UiSound::Mute => (B4, G4, TAP),
+        UiSound::Unmute => (G4, B4, TAP),
+        UiSound::Deafen => (D5, D4, DROP),
+        UiSound::Undeafen => (D4, D5, DROP),
+        UiSound::LeaveChannel => (G5, D5, CHIME),
+        UiSound::JoinChannel => (D5, G5, CHIME),
+    };
+    let (gap, first, second, second_partial, third_partial) = motif;
+
+    let voice = |start: f64, freq: f64, weight: f64, (attack, tau, len): Strike| {
+        // Lower bars are struck a little harder and higher ones a little softer so that
+        // all notes sound about equally loud (the ear is less sensitive towards 300 Hz).
+        let level = weight * 0.15 * (G4 / freq).powf(0.35);
+        // The raw envelope (window * decay) peaks where rise * decay peaks; dividing by
+        // its value there makes `level` the real peak of the fundamental.
+        let peak_at =
+            2.0 * attack / std::f64::consts::PI * (std::f64::consts::PI * tau / attack).atan();
+        let raw_peak = mallet_window(peak_at, attack, len) * (-peak_at / tau).exp();
+        MalletVoice {
+            start,
+            freq,
+            gain: level / raw_peak,
+            attack,
+            tau,
+            len,
+            second_partial,
+            third_partial,
         }
-        UiSound::Unmute => {
-            // Ascending bright chirp: 320Hz -> 640Hz (~120ms)
-            let duration = 0.12;
-            let total = (sample_rate as f32 * duration) as usize;
-            let mut phase = 0.0f32;
-            for i in 0..total {
-                let t = i as f32 / total as f32;
-                let freq = 320.0 + 320.0 * t.sqrt();
-                phase += 2.0 * std::f32::consts::PI * freq * dt;
+    };
 
-                let attack = (i as f32 / (sample_rate as f32 * 0.006)).min(1.0);
-                let decay = (-t * 3.5).exp();
-                let wave = (phase.sin() + 0.22 * (phase * 2.0).sin()) * 0.75 * attack * decay;
-                samples.push(wave);
-            }
-        }
-        UiSound::Deafen => {
-            // Two-step downward tone: Note 1 (480Hz->380Hz, 85ms), Note 2 (340Hz->200Hz, 100ms)
-            let duration = 0.19;
-            let total = (sample_rate as f32 * duration) as usize;
-            let split = (sample_rate as f32 * 0.085) as usize;
-            let mut phase1 = 0.0f32;
-            let mut phase2 = 0.0f32;
+    [
+        // The first strike is a lighter pickup; the second one lands.
+        voice(LEAD_IN, first_freq, 0.8, first),
+        voice(LEAD_IN + gap, second_freq, 1.0, second),
+    ]
+}
 
-            for i in 0..total {
-                let wave = if i < split {
-                    let t = i as f32 / split as f32;
-                    let freq = 480.0 - 100.0 * t;
-                    phase1 += 2.0 * std::f32::consts::PI * freq * dt;
-                    let attack = (i as f32 / (sample_rate as f32 * 0.005)).min(1.0);
-                    let decay = (-t * 2.8).exp();
-                    (phase1.sin() + 0.18 * (phase1 * 2.0).sin()) * 0.70 * attack * decay
-                } else {
-                    let j = i - split;
-                    let rem = total - split;
-                    let t = j as f32 / rem as f32;
-                    let freq = 340.0 - 140.0 * (t * t);
-                    phase2 += 2.0 * std::f32::consts::PI * freq * dt;
-                    let attack = (j as f32 / (sample_rate as f32 * 0.005)).min(1.0);
-                    let decay = (-t * 3.2).exp();
-                    (phase2.sin() + 0.18 * (phase2 * 2.0).sin()) * 0.75 * attack * decay
-                };
-                samples.push(wave);
-            }
-        }
-        UiSound::Undeafen => {
-            // Two-step upward chime: Note 1 (260Hz->380Hz, 85ms), Note 2 (420Hz->700Hz, 100ms)
-            let duration = 0.19;
-            let total = (sample_rate as f32 * duration) as usize;
-            let split = (sample_rate as f32 * 0.085) as usize;
-            let mut phase1 = 0.0f32;
-            let mut phase2 = 0.0f32;
+/// Raised-cosine rise over `attack` times a cos^2 fade over the whole strike, `x`
+/// seconds after the onset. Smooth (value and slope) at 0, at `attack` and at `len`.
+fn mallet_window(x: f64, attack: f64, len: f64) -> f64 {
+    use std::f64::consts::{FRAC_PI_2, PI};
 
-            for i in 0..total {
-                let wave = if i < split {
-                    let t = i as f32 / split as f32;
-                    let freq = 260.0 + 120.0 * t;
-                    phase1 += 2.0 * std::f32::consts::PI * freq * dt;
-                    let attack = (i as f32 / (sample_rate as f32 * 0.005)).min(1.0);
-                    let decay = (-t * 2.8).exp();
-                    (phase1.sin() + 0.18 * (phase1 * 2.0).sin()) * 0.70 * attack * decay
-                } else {
-                    let j = i - split;
-                    let rem = total - split;
-                    let t = j as f32 / rem as f32;
-                    let freq = 420.0 + 280.0 * t.sqrt();
-                    phase2 += 2.0 * std::f32::consts::PI * freq * dt;
-                    let attack = (j as f32 / (sample_rate as f32 * 0.005)).min(1.0);
-                    let decay = (-t * 3.0).exp();
-                    (phase2.sin() + 0.22 * (phase2 * 2.0).sin()) * 0.78 * attack * decay
-                };
-                samples.push(wave);
-            }
-        }
-        UiSound::JoinChannel => {
-            // Ascending warm chime: Note 1 (440Hz, 85ms), Note 2 (660Hz, 130ms)
-            let duration = 0.215;
-            let total = (sample_rate as f32 * duration) as usize;
-            let split = (sample_rate as f32 * 0.085) as usize;
-            let mut phase1 = 0.0f32;
-            let mut phase2 = 0.0f32;
+    let rise = if x < attack {
+        0.5 - 0.5 * (PI * x / attack).cos()
+    } else {
+        1.0
+    };
+    let fade = (FRAC_PI_2 * x / len).cos();
+    rise * fade * fade
+}
 
-            for i in 0..total {
-                let wave = if i < split {
-                    let t = i as f32 / split as f32;
-                    let freq = 440.0;
-                    phase1 += 2.0 * std::f32::consts::PI * freq * dt;
-                    let attack = (i as f32 / (sample_rate as f32 * 0.005)).min(1.0);
-                    let decay = (-t * 2.5).exp();
-                    (phase1.sin() + 0.15 * (phase1 * 2.0).sin()) * 0.75 * attack * decay
-                } else {
-                    let j = i - split;
-                    let rem = total - split;
-                    let t = j as f32 / rem as f32;
-                    let freq = 660.0;
-                    phase2 += 2.0 * std::f32::consts::PI * freq * dt;
-                    let attack = (j as f32 / (sample_rate as f32 * 0.005)).min(1.0);
-                    let decay = (-t * 3.0).exp();
-                    (phase2.sin() + 0.18 * (phase2 * 2.0).sin()) * 0.80 * attack * decay
-                };
-                samples.push(wave);
-            }
-        }
-        UiSound::LeaveChannel => {
-            // Descending warm chime: Note 1 (660Hz, 85ms), Note 2 (440Hz, 130ms)
-            let duration = 0.215;
-            let total = (sample_rate as f32 * duration) as usize;
-            let split = (sample_rate as f32 * 0.085) as usize;
-            let mut phase1 = 0.0f32;
-            let mut phase2 = 0.0f32;
-
-            for i in 0..total {
-                let wave = if i < split {
-                    let t = i as f32 / split as f32;
-                    let freq = 660.0;
-                    phase1 += 2.0 * std::f32::consts::PI * freq * dt;
-                    let attack = (i as f32 / (sample_rate as f32 * 0.005)).min(1.0);
-                    let decay = (-t * 2.8).exp();
-                    (phase1.sin() + 0.15 * (phase1 * 2.0).sin()) * 0.75 * attack * decay
-                } else {
-                    let j = i - split;
-                    let rem = total - split;
-                    let t = j as f32 / rem as f32;
-                    let freq = 440.0;
-                    phase2 += 2.0 * std::f32::consts::PI * freq * dt;
-                    let attack = (j as f32 / (sample_rate as f32 * 0.005)).min(1.0);
-                    let decay = (-t * 3.2).exp();
-                    (phase2.sin() + 0.15 * (phase2 * 2.0).sin()) * 0.75 * attack * decay
-                };
-                samples.push(wave);
-            }
-        }
+/// Value of one strike at time `t` (seconds from the start of the buffer); exactly
+/// zero before its onset and from `len` after it.
+///
+/// envelope = window (see `mallet_window`) * exponential decay. It reaches true zero
+/// at `len` and has no step or kink anywhere, so there is no click at the onset, at
+/// the peak or at the end.
+fn mallet_sample(voice: &MalletVoice, t: f64, rate: f64) -> f64 {
+    let x = t - voice.start;
+    if x <= 0.0 || x >= voice.len {
+        return 0.0;
     }
 
-    samples
+    let decay = (-x / voice.tau).exp();
+    let (sin, cos) = (std::f64::consts::TAU * voice.freq * x).sin_cos();
+    let mut wave = sin;
+    // A little 2nd and 3rd harmonic that is gone within the first few tens of ms:
+    // the "wood" of the strike. Left out if the device rate could not carry it.
+    if voice.second_partial > 0.0 && 2.0 * voice.freq < 0.45 * rate {
+        // sin(2a) = 2 sin(a) cos(a); the extra sqrt(decay) makes it die 1.5x faster.
+        wave += voice.second_partial * decay.sqrt() * 2.0 * sin * cos;
+    }
+    if voice.third_partial > 0.0 && 3.0 * voice.freq < 0.45 * rate {
+        // sin(3a) = sin(a) (3 - 4 sin^2(a)); the extra decay^2 makes it die 3x faster.
+        wave += voice.third_partial * decay * decay * sin * (3.0 - 4.0 * sin * sin);
+    }
+
+    voice.gain * mallet_window(x, voice.attack, voice.len) * decay * wave
 }
 
 fn play_sound_cpal(sound: UiSound) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -247,15 +261,19 @@ fn play_sound_cpal(sound: UiSound) -> Result<(), Box<dyn std::error::Error + Sen
 
     let current_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let playback_finished = Arc::new(AtomicBool::new(false));
+    // Most frames the device has asked for in one go, i.e. how far ahead it buffers.
+    let largest_request = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let idx_cb = Arc::clone(&current_idx);
     let finish_cb = Arc::clone(&playback_finished);
+    let request_cb = Arc::clone(&largest_request);
     let smp_cb = Arc::clone(&samples_arc);
 
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => device.build_output_stream(
             &config.into(),
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                request_cb.fetch_max(data.len() / channels, Ordering::Relaxed);
                 for frame in data.chunks_mut(channels) {
                     let idx = idx_cb.fetch_add(1, Ordering::Relaxed);
                     let val = if idx < total_samples {
@@ -275,6 +293,7 @@ fn play_sound_cpal(sound: UiSound) -> Result<(), Box<dyn std::error::Error + Sen
         cpal::SampleFormat::I16 => device.build_output_stream(
             &config.into(),
             move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                request_cb.fetch_max(data.len() / channels, Ordering::Relaxed);
                 for frame in data.chunks_mut(channels) {
                     let idx = idx_cb.fetch_add(1, Ordering::Relaxed);
                     let val = if idx < total_samples {
@@ -297,14 +316,28 @@ fn play_sound_cpal(sound: UiSound) -> Result<(), Box<dyn std::error::Error + Sen
 
     stream.play()?;
 
-    // Wait until playback completes with 250ms timeout safety
-    let max_wait = ((total_samples as f32 / sample_rate as f32) * 1000.0) as u64 + 40;
+    // Wait until the device has taken the whole tone. The timeout is only a safety net for
+    // a device that never asks for data.
+    let rate = f64::from(sample_rate.max(1));
+    let tone = Duration::from_secs_f64(total_samples as f64 / rate);
     let start = std::time::Instant::now();
-    while !playback_finished.load(Ordering::Relaxed) && start.elapsed() < Duration::from_millis(max_wait) {
+    while !playback_finished.load(Ordering::Relaxed) && start.elapsed() < tone + Duration::from_millis(500) {
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    std::thread::sleep(Duration::from_millis(10));
+    // "Finished" only means the last sample has been handed over, not that it has been
+    // heard: the device buffers ahead (cpal's ALSA backend takes 100 ms up front and keeps
+    // that buffer full), and dropping the stream throws away whatever is still queued, which
+    // chops the end off the tone. Keep the stream open, playing silence, until the tail is
+    // out: the device was full (largest request) when it took the last sample, minus the
+    // silence it has taken since, and never sooner than the tone's own length.
+    if playback_finished.load(Ordering::Relaxed) {
+        let silence_taken = current_idx.load(Ordering::Relaxed).saturating_sub(total_samples);
+        let still_queued = largest_request.load(Ordering::Relaxed).saturating_sub(silence_taken);
+        let heard_at = (start.elapsed() + Duration::from_secs_f64(still_queued as f64 / rate)).max(tone)
+            + Duration::from_millis(30);
+        std::thread::sleep(heard_at.saturating_sub(start.elapsed()));
+    }
     drop(stream);
     Ok(())
 }
