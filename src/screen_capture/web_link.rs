@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use log::{info, warn};
 
-use super::crypto::{decrypt_signaling_payload, encrypt_signaling_payload, get_or_create_local_ecdh_keypair, pair_key, Identity};
+use super::crypto::{decrypt_signaling_payload, encrypt_signaling_payload, get_or_create_local_ecdh_keypair, pair_key, watch_pair_key, watch_public_key, Identity};
 use super::types::{MAGIC, OP_WEB_LINK_REPLY, OP_WEB_LINK_REQ};
 use super::watch::Verdict;
 
@@ -74,7 +74,7 @@ pub struct Endpoint<'a> {
 }
 
 impl Endpoint<'static> {
-    /// The app: the process-wide key pair.
+    /// The app: the process-wide key pair when streaming, the watch key pair when asking.
     pub fn local(instance_id: u32, cid: u64, uid: u64) -> Self {
         Self { instance_id, cid, uid, identity: None }
     }
@@ -94,6 +94,19 @@ impl<'a> Endpoint<'a> {
         match self.identity {
             Some(i) => Some(i.pair_key(peer_public, self.uid, peer_uid, self.cid)),
             None => pair_key(peer_public, self.uid, peer_uid, self.cid),
+        }
+    }
+
+    /// The viewer's side asks with the key it watches with: the streamer binds one key per
+    /// user for a whole share (`watch::admit`), and OP_WATCH carries the watch key.
+    fn viewer_public(&self) -> [u8; 32] {
+        self.identity.map_or_else(watch_public_key, |i| i.public())
+    }
+
+    fn viewer_pair_key(&self, sender_public: &[u8; 32], sender_uid: u64) -> Option<[u8; 32]> {
+        match self.identity {
+            Some(i) => Some(i.pair_key(sender_public, self.uid, sender_uid, self.cid)),
+            None => Some(watch_pair_key(sender_public, self.uid, sender_uid, self.cid)),
         }
     }
 
@@ -122,7 +135,7 @@ fn sender_of(pkt: &[u8], op: u8, cid: u64) -> Option<u64> {
 pub fn build_request(viewer: &Endpoint, target_uid: u64, request_id: &[u8; 16]) -> Vec<u8> {
     let mut pkt = viewer.header(OP_WEB_LINK_REQ, REQUEST_LEN);
     pkt.extend_from_slice(&target_uid.to_be_bytes());
-    pkt.extend_from_slice(&viewer.public());
+    pkt.extend_from_slice(&viewer.viewer_public());
     pkt.extend_from_slice(request_id);
     pkt
 }
@@ -756,7 +769,7 @@ pub fn handle_reply(pkt: &[u8], me: &Endpoint) {
     // Nothing asked, or asked of somebody else.
     let Some(p) = pending.as_mut().filter(|p| p.peer == sender_uid) else { return };
     let sender_public: [u8; 32] = pkt[33..65].try_into().unwrap();
-    let Some(plain) = me.pair_key(&sender_public, sender_uid).and_then(|k| decrypt_signaling_payload(&k, &pkt[SEALED_AT..])) else { return };
+    let Some(plain) = me.viewer_pair_key(&sender_public, sender_uid).and_then(|k| decrypt_signaling_payload(&k, &pkt[SEALED_AT..])) else { return };
     // Not an answer, or the answer to an earlier request.
     if plain.len() < 21 || &plain[..4] != REPLY_TAG || plain[4..20] != p.id {
         return;
