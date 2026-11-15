@@ -10,6 +10,8 @@ pub mod device;
 pub mod dxva;
 #[cfg(windows)]
 pub mod layers;
+#[cfg(all(target_os = "linux", feature = "vaapi"))]
+pub mod vaapi;
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -55,6 +57,8 @@ pub struct GpuDecoder {
     peer: u64,
     #[cfg(windows)]
     inner: dxva::DxvaDecoder,
+    #[cfg(all(target_os = "linux", feature = "vaapi"))]
+    inner: vaapi::VaapiDecoder,
 }
 
 impl GpuDecoder {
@@ -63,7 +67,11 @@ impl GpuDecoder {
         {
             Ok(Self { peer, inner: dxva::DxvaDecoder::new()? })
         }
-        #[cfg(not(windows))]
+        #[cfg(all(target_os = "linux", feature = "vaapi"))]
+        {
+            Ok(Self { peer, inner: vaapi::VaapiDecoder::new()? })
+        }
+        #[cfg(not(any(windows, all(target_os = "linux", feature = "vaapi"))))]
         {
             let _ = peer;
             Err(HwError::Unsupported("no GPU decoder on this platform yet".into()))
@@ -84,7 +92,13 @@ impl GpuDecoder {
             let (w, h) = fit(frame.info.width, frame.info.height);
             Ok(Some(GpuPicture::Rgba(self.inner.read_rgba(&frame, w, h)?, frame.info.width, frame.info.height)))
         }
-        #[cfg(not(windows))]
+        // Linux: vapostproc scales and converts on the GPU; the picture always comes back
+        // as RGBA (no window layers), so the stream is not marked as drawn by the GPU.
+        #[cfg(all(target_os = "linux", feature = "vaapi"))]
+        {
+            Ok(self.inner.decode(au, fit)?.map(|p| GpuPicture::Rgba(p.rgba, p.width, p.height)))
+        }
+        #[cfg(not(any(windows, all(target_os = "linux", feature = "vaapi"))))]
         {
             let _ = (au, fit);
             Err(HwError::Unsupported("no GPU decoder on this platform yet".into()))
