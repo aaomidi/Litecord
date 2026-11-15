@@ -4,7 +4,7 @@ import { Tr } from "tr.slint";
 import {
     SettingOptionItem, AudioDeviceItem, SettingsNavItem, SettingsNavGroup, SettingsPageTitle,
     SettingsSection, SettingsRow, SettingsSwitch, SettingsSwitchRow, SettingsButton,
-    OptionSelect, DeviceSelect, SettingsInput,
+    OptionSelect, DeviceSelect, SettingsInput, SettingsBlock,
 } from "settings_kit.slint";
 import { StreamQualitySection } from "stream_quality.slint";
 
@@ -250,9 +250,8 @@ export component SettingsView inherits Rectangle {
                         alignment: start;
 
                         // ── Voice and audio ─────────────────────────────────────
-                        if root.settings_active_tab == 0: VerticalLayout {
+                        if root.settings_active_tab == 0: SettingsBlock {
                             spacing: 28px;
-                            alignment: start;
                             SettingsPageTitle { title: root.tr_settings_tab_voice; }
 
                             SettingsSection {
@@ -384,9 +383,8 @@ export component SettingsView inherits Rectangle {
                         }
 
                         // ── Video and streaming ─────────────────────────────────
-                        if root.settings_active_tab == 5: VerticalLayout {
+                        if root.settings_active_tab == 5: SettingsBlock {
                             spacing: 28px;
-                            alignment: start;
                             SettingsPageTitle { title: root.tr_settings_tab_video_interface; }
 
                             SettingsSection {
@@ -467,9 +465,8 @@ export component SettingsView inherits Rectangle {
                         }
 
                         // ── Keybinds ────────────────────────────────────────────
-                        if root.settings_active_tab == 2: VerticalLayout {
+                        if root.settings_active_tab == 2: SettingsBlock {
                             spacing: 28px;
-                            alignment: start;
                             SettingsPageTitle { title: root.tr_settings_tab_keybinds; subtitle: root.tr_keybind_guide_desc; }
                             Rectangle {
                                 border-radius: 10px;
@@ -481,38 +478,40 @@ export component SettingsView inherits Rectangle {
                                     for kb in [
                                         { slot: 1, title: root.tr_keybind_mute_title, desc: root.tr_keybind_mute_desc, keys: root.keybind_mute_str },
                                         { slot: 2, title: root.tr_keybind_deafen_title, desc: root.tr_keybind_deafen_desc, keys: root.keybind_deafen_str },
-                                    ]: SettingsRow {
-                                        title: kb.title;
-                                        desc: kb.desc;
-                                        HorizontalLayout {
-                                            spacing: 8px;
-                                            Rectangle {
-                                                width: 168px;
-                                                height: 36px;
-                                                border-radius: 6px;
-                                                border-width: root.recording_keybind_for == kb.slot ? 2px : 1px;
-                                                border-color: root.recording_keybind_for == kb.slot ? AppTheme.accent : AppTheme.border-subtle;
-                                                background: root.recording_keybind_for == kb.slot ? AppTheme.surface-reply : (rec_ta.has-hover ? AppTheme.interactive-hover : AppTheme.surface-elevated);
-                                                Text {
-                                                    text: root.recording_keybind_for == kb.slot ? Tr.recording : (kb.keys != "" ? kb.keys : Tr.keybind_none);
-                                                    color: root.recording_keybind_for == kb.slot ? AppTheme.accent-soft : AppTheme.text-strong;
-                                                    font-size: TypeScale.small;
-                                                    font-weight: 600;
-                                                }
-                                                rec_ta := TouchArea {
-                                                    mouse-cursor: pointer;
-                                                    clicked => {
-                                                        if root.recording_keybind_for == kb.slot {
-                                                            root.start_recording_keybind(0);
-                                                        } else {
-                                                            root.start_recording_keybind(kb.slot);
+                                    ]: SettingsBlock {
+                                        SettingsRow {
+                                            title: kb.title;
+                                            desc: kb.desc;
+                                            HorizontalLayout {
+                                                spacing: 8px;
+                                                Rectangle {
+                                                    width: 168px;
+                                                    height: 36px;
+                                                    border-radius: 6px;
+                                                    border-width: root.recording_keybind_for == kb.slot ? 2px : 1px;
+                                                    border-color: root.recording_keybind_for == kb.slot ? AppTheme.accent : AppTheme.border-subtle;
+                                                    background: root.recording_keybind_for == kb.slot ? AppTheme.surface-reply : (rec_ta.has-hover ? AppTheme.interactive-hover : AppTheme.surface-elevated);
+                                                    Text {
+                                                        text: root.recording_keybind_for == kb.slot ? Tr.recording : (kb.keys != "" ? kb.keys : Tr.keybind_none);
+                                                        color: root.recording_keybind_for == kb.slot ? AppTheme.accent-soft : AppTheme.text-strong;
+                                                        font-size: TypeScale.small;
+                                                        font-weight: 600;
+                                                    }
+                                                    rec_ta := TouchArea {
+                                                        mouse-cursor: pointer;
+                                                        clicked => {
+                                                            if root.recording_keybind_for == kb.slot {
+                                                                root.start_recording_keybind(0);
+                                                            } else {
+                                                                root.start_recording_keybind(kb.slot);
+                                                            }
                                                         }
                                                     }
                                                 }
-                                            }
-                                            SettingsButton {
-                                                text: root.tr_keybind_btn_clear;
-                                                clicked => { root.reset_keybind(kb.slot); }
+                                                SettingsButton {
+                                                    text: root.tr_keybind_btn_clear;
+                                                    clicked => { root.reset_keybind(kb.slot); }
+                                                }
                                             }
                                         }
                                     }
@@ -522,9 +521,8 @@ export component SettingsView inherits Rectangle {
                         }
 
                         // ── Appearance and language ─────────────────────────────
-                        if root.settings_active_tab == 1: VerticalLayout {
+                        if root.settings_active_tab == 1: SettingsBlock {
                             spacing: 28px;
-                            alignment: start;
                             SettingsPageTitle { title: Tr.settings_tab_appearance; }
 
                             SettingsSection {
@@ -580,9 +578,8 @@ export component SettingsView inherits Rectangle {
                         }
 
                         // ── Network ─────────────────────────────────────────────
-                        if root.settings_active_tab == 6: VerticalLayout {
+                        if root.settings_active_tab == 6: SettingsBlock {
                             spacing: 28px;
-                            alignment: start;
                             SettingsPageTitle { title: root.tr_settings_tab_network_proxy; }
 
                             SettingsSection {
@@ -627,9 +624,10 @@ export component SettingsView inherits Rectangle {
                                     }
                                 }
                                 if root.proxy_test_status_text != "": Rectangle {
+                                    height: proxy_status_row.preferred-height;   // see SettingsBlock
                                     border-radius: 6px;
                                     background: root.proxy_test_is_success ? AppTheme.surface-success : AppTheme.surface-danger;
-                                    HorizontalLayout {
+                                    proxy_status_row := HorizontalLayout {
                                         padding: 10px;
                                         Text {
                                             text: root.proxy_test_status_text;
@@ -674,9 +672,8 @@ export component SettingsView inherits Rectangle {
                         }
 
                         // ── Privacy and about ───────────────────────────────────
-                        if root.settings_active_tab == 4 || root.settings_active_tab == 3: VerticalLayout {
+                        if root.settings_active_tab == 4 || root.settings_active_tab == 3: SettingsBlock {
                             spacing: 28px;
-                            alignment: start;
                             SettingsPageTitle { title: Tr.settings_tab_about; }
 
                             Rectangle {
@@ -711,21 +708,23 @@ export component SettingsView inherits Rectangle {
                                     { title: Tr.vault_title, desc: Tr.vault_desc },
                                     { title: Tr.dave_title, desc: Tr.dave_desc },
                                     { title: Tr.zero_intermediaries, desc: Tr.zero_intermediaries_desc },
-                                ]: HorizontalLayout {
-                                    spacing: 12px;
-                                    Path {
-                                        width: 16px;
-                                        height: 16px;
-                                        commands: "M 2 8 L 6 12 L 14 3";
-                                        stroke: AppTheme.success;
-                                        stroke-width: 2px;
-                                        fill: transparent;
-                                    }
-                                    VerticalLayout {
-                                        spacing: 2px;
-                                        horizontal-stretch: 1;
-                                        Text { text: item.title; color: AppTheme.text-strong; font-size: TypeScale.body; font-weight: 600; wrap: word-wrap; }
-                                        Text { text: item.desc; color: AppTheme.text-muted; font-size: TypeScale.small; wrap: word-wrap; }
+                                ]: SettingsBlock {
+                                    HorizontalLayout {
+                                        spacing: 12px;
+                                        Path {
+                                            width: 16px;
+                                            height: 16px;
+                                            commands: "M 2 8 L 6 12 L 14 3";
+                                            stroke: AppTheme.success;
+                                            stroke-width: 2px;
+                                            fill: transparent;
+                                        }
+                                        VerticalLayout {
+                                            spacing: 2px;
+                                            horizontal-stretch: 1;
+                                            Text { text: item.title; color: AppTheme.text-strong; font-size: TypeScale.body; font-weight: 600; wrap: word-wrap; }
+                                            Text { text: item.desc; color: AppTheme.text-muted; font-size: TypeScale.small; wrap: word-wrap; }
+                                        }
                                     }
                                 }
                             }
