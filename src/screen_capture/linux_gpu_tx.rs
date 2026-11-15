@@ -141,6 +141,12 @@
 //!   makes the NV12 in the encoder's colours. DMABuf only: on NVIDIA's EGL glupload from
 //!   system memory gave black pictures, so without DMABuf the share stays with gst-launch.
 //!   Found against Hyprland (xdg-desktop-portal-hyprland) on an RTX 2080 Ti, driver 615.
+//!   A window share from xdph comes as pictures of the window's own size (no crop region),
+//!   which gltransformation fits like a monitor's; a resize renegotiates the stream, which
+//!   ends this capture as for any source. The GL elements draw a whole buffer whatever its
+//!   crop region, so a window in a monitor-sized stream (Mutter's) would show the monitor:
+//!   such a stream is given up at its first cropped picture (`crop_refused`) and the share
+//!   goes to the window capture, which follows the crop.
 //!
 //! Threads: the portal thread calls `begin`, then `run_until_end` (which watches the
 //! pipeline's health) and takes the capture over with gst-launch when that reports a failure;
@@ -164,6 +170,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+const CROP_REFUSED: &str = "a janela vem recortada de um quadro do tamanho do monitor, e o caminho GL (NVENC) mostra o quadro inteiro";
 
 /// pipewiresrc pushes its last buffer again after this long without a new one.
 const KEEPALIVE_MS: u32 = 25;
@@ -389,6 +397,10 @@ struct Shared {
     /// The bars are painted by the CPU (vapostproc leaves them unwritten); gltransformation
     /// clears them itself.
     bars_by_cpu: bool,
+    /// The postproc takes each buffer's crop region (vapostproc); without that (the GL chain)
+    /// a buffer whose crop is a part of it is not shown and `crop_refused` is set.
+    follows_crop: bool,
+    crop_refused: AtomicBool,
     no_bars: bool,
     /// Milliseconds after `started` (never 0) at which the streaming thread began handing a
     /// picture to the encoder, while it has not come back from that; 0 otherwise. A thread
@@ -726,6 +738,8 @@ impl Stream {
             source_shut: AtomicBool::new(false),
             hang: AtomicBool::new(false),
             bars_by_cpu: backend == vaapi::Backend::Va,
+            follows_crop: backend == vaapi::Backend::Va,
+            crop_refused: AtomicBool::new(false),
             no_bars: test_fail == TestFail::NoBars,
             at_encoder_ms: AtomicU64::new(0),
             early_renegotiations: AtomicU64::new(0),
@@ -842,6 +856,9 @@ impl Stream {
             if self.shared.bars_failed.load(Ordering::Relaxed) > 0 {
                 // (Such a picture is not let into the encoder: none would ever come.)
                 return Err("as barras em volta da imagem não puderam ser pintadas".into());
+            }
+            if self.shared.crop_refused.load(Ordering::Relaxed) {
+                return Err(CROP_REFUSED.into());
             }
             if !is_playing {
                 match playing.try_recv() {
@@ -1348,6 +1365,9 @@ impl Stream {
             // Pictures with whatever the surfaces held around them: not to be shown.
             return Err("as barras em volta da imagem não puderam ser pintadas".into());
         }
+        if self.shared.crop_refused.load(Ordering::Relaxed) {
+            return Err(CROP_REFUSED.into());
+        }
         if self.shared.shape_refused.load(Ordering::Relaxed) {
             // Pictures that would be stretched over the frame: not shown either.
             return Err("o vapostproc recusou o formato da imagem depois de uma mudança de tamanho".into());
@@ -1744,6 +1764,14 @@ fn add_gate(queue: &gst::Element, shared: &Arc<Shared>, fps: u32, postproc: gst:
         let Some(pts) = buffer.pts() else { return gst::PadProbeReturn::Drop };
         // The part of the buffer that is the picture, when the buffer says so.
         let crop = buffer.meta::<gst_video::VideoCropMeta>().map(|meta| meta.rect()).filter(|r| r.2 > 0 && r.3 > 0).map(|r| (r.2, r.3));
+        if !shared.follows_crop {
+            let whole = lock(&shape).as_ref().map(|shape| shape.size);
+            if crop.is_some_and(|crop| whole.is_some_and(|whole| crop != whole)) {
+                // The whole monitor-sized buffer would be shown: see the module's notes.
+                shared.crop_refused.store(true, Ordering::Relaxed);
+                return gst::PadProbeReturn::Drop;
+            }
+        }
         let mut gate = lock(&gate);
         // When a window changes size in one step (maximised, restored, out of fullscreen)
         // Mutter now and then hands over one buffer whose rectangle is a frame ahead of
