@@ -686,10 +686,18 @@ impl Stream {
             vaapi::Backend::Va => format!("capssetter name=cap_set join=true replace=false caps=\"{relabel}\""),
             vaapi::Backend::Nvenc => "identity name=cap_set".to_string(),
         };
+        // xdg-desktop-portal-hyprland hands out 4 DMABufs unless asked for more. The keepalive
+        // holds one, the queue and the GL import one each: under load the compositor found
+        // none free and skipped pictures (19-60 FPS from one run to the next, 60 in every run
+        // with 8 asked for).
+        let buffers = match backend {
+            vaapi::Backend::Va => "",
+            vaapi::Backend::Nvenc => " min-buffers=8",
+        };
         // The queue keeps only the newest picture: when the encoder is behind, raw pictures
         // are skipped instead of latency building up.
         let description = format!(
-            "pipewiresrc name=cap_src {fd_prop} path={node} do-timestamp=true keepalive-time={KEEPALIVE_MS} provide-clock=false \
+            "pipewiresrc name=cap_src {fd_prop} path={node} do-timestamp=true keepalive-time={KEEPALIVE_MS} provide-clock=false{buffers} \
                on-disconnect=error stream-properties=\"props,node.dont-fallback=(string)true\" \
              ! capsfilter name=cap_filter \
              ! {set} \
