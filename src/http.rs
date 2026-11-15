@@ -74,6 +74,10 @@ impl DiscordHttpClient {
     }
 
     async fn get_user_guilds_once(&self) -> (Result<Vec<serde_json::Value>, String>, bool) {
+        // (A test build also asks for the member counts: the automation port lists them.)
+        #[cfg(feature = "automation")]
+        let url = "https://discord.com/api/v10/users/@me/guilds?with_counts=true";
+        #[cfg(not(feature = "automation"))]
         let url = "https://discord.com/api/v10/users/@me/guilds";
         match self.client.get(url).send().await {
             Ok(resp) => {

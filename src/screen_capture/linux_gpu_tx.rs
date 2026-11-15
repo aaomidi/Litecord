@@ -454,6 +454,8 @@ struct Tx {
     dropped_before_keyframe: u64,
     /// The encoder in the pipeline is a Main one (the same as `Stream::section`'s).
     main: bool,
+    /// The log line naming this encoder (profile, rate, quality floor) has been written.
+    encoder_said: bool,
     /// The encoder was replaced and its first keyframe has not been checked yet.
     first_keyframe_due: bool,
     /// The encoder was replaced and nothing has been taken from the new one yet: whatever
@@ -720,6 +722,7 @@ impl Stream {
                 delivered: 0,
                 dropped_before_keyframe: 0,
                 main: false,
+                encoder_said: false,
                 first_keyframe_due: false,
                 fresh: false,
                 main_failed: false,
@@ -1032,6 +1035,7 @@ impl Stream {
         tx.main = main;
         tx.ready.clear();
         tx.applied_bps = tx.requested_bps;
+        tx.encoder_said = false;
         tx.first_keyframe_due = true;
         tx.fresh = true;
         tx.await_keyframe = true;
@@ -1101,6 +1105,23 @@ impl Stream {
                 self.shared.guard_main.store(0, Ordering::SeqCst);
             }
             tx.main_wait = None;
+        }
+        if !std::mem::replace(&mut tx.encoder_said, true) {
+            // One line per encoder (the first of a share, and each one a change of profile
+            // puts in its place): what the viewers are being sent, read from its first SPS.
+            let profile = nal_ranges(&au).iter().map(|r| &au[r.clone()]).find(|n| n[0] & 0x1f == 7 && n.len() >= 3).map(|sps| match (sps[1], sps[2] & 0x40 != 0) {
+                (66, true) => "Constrained Baseline".to_string(),
+                (77, _) => "Main".to_string(),
+                (idc, _) => format!("profile_idc {}", idc),
+            });
+            info!(
+                "🎬 [VAAPI] Codificador da captura na GPU: {} H.264 {}, {:.2} Mbps pedidos, QP mínimo {}, primeiro keyframe com {} bytes",
+                self.element,
+                profile.as_deref().unwrap_or("sem SPS"),
+                tx.applied_bps as f64 / 1e6,
+                self.min_qp,
+                au.len()
+            );
         }
         tx.await_keyframe = false;
         tx.keyframe_asked_at = None;

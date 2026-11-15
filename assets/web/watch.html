@@ -154,13 +154,8 @@ async function connect() {
         offered = true;
         ping = setInterval(() => { if (ws.readyState === WebSocket.OPEN) ws.send('{"op":"ping"}'); }, 40000);
         await pc.setLocalDescription(await pc.createOffer());
-        // Complete gathering before sending SDP: no trickle-ICE messages are needed.
-        if (pc.iceGatheringState !== 'complete') await new Promise(resolve => {
-          const timer = setTimeout(done, 5000);
-          function done() { clearTimeout(timer); pc.removeEventListener('icegatheringstatechange', check); resolve(); }
-          function check() { if (pc.iceGatheringState === 'complete') done(); }
-          pc.addEventListener('icegatheringstatechange', check); check();
-        });
+        // The candidates go inside the SDP: no trickle-ICE messages are needed.
+        await gathered(pc);
         if (!ended) ws.send(JSON.stringify({op: 'offer', payload: await seal(key, pc.localDescription)}));
       } else if (message.op === 'answer') {
         await pc.setRemoteDescription(await open(key, message.payload));
@@ -175,6 +170,33 @@ async function connect() {
   window.addEventListener('pagehide', () => finish('ended'), {once: true});
 }
 
+// Resolves once the local description holds a way in from outside: when gathering is complete,
+// or a moment after the first server-reflexive candidate (the others of its kind come with
+// it), or after 2 s without one (no STUN answer: the local addresses have to do). Waiting for
+// "complete" took its whole 5 s on every view when one interface never hears from a STUN
+// server, and the picture started that much later.
+function gathered(pc) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise(resolve => {
+    let settle = null;
+    const limit = setTimeout(done, 2000);
+    function done() {
+      clearTimeout(limit); clearTimeout(settle);
+      pc.removeEventListener('icegatheringstatechange', check);
+      pc.removeEventListener('icecandidate', candidate);
+      resolve();
+    }
+    function check() { if (pc.iceGatheringState === 'complete') done(); }
+    function candidate(event) {
+      if (!event.candidate) done();
+      else if (event.candidate.type === 'srflx' && settle === null) settle = setTimeout(done, 250);
+    }
+    pc.addEventListener('icegatheringstatechange', check);
+    pc.addEventListener('icecandidate', candidate);
+    check();
+  });
+}
+
 async function connectManual() {
   const panel = document.getElementById('manual'); panel.hidden = false;
   pc = new RTCPeerConnection({iceServers: [{urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302']}]});
@@ -186,12 +208,7 @@ async function connectManual() {
   video.onplaying = () => { clearTimeout(deadline); say('playing'); if (video.muted) play.style.display = 'block'; };
   play.onclick = () => { video.muted = false; video.play().catch(() => {}); play.style.display = 'none'; };
   await pc.setLocalDescription(await pc.createOffer());
-  if (pc.iceGatheringState !== 'complete') await new Promise(resolve => {
-    const timeout = setTimeout(done, 5000);
-    function done() { clearTimeout(timeout); pc.removeEventListener('icegatheringstatechange', check); resolve(); }
-    function check() { if (pc.iceGatheringState === 'complete') done(); }
-    pc.addEventListener('icegatheringstatechange', check); check();
-  });
+  await gathered(pc);
   document.getElementById('manual-offer').value = JSON.stringify(pc.localDescription);
   document.getElementById('manual-connect').onclick = async () => {
     try {

@@ -17,20 +17,129 @@ static PORTAL_LAST_ATTEMPT: std::sync::Mutex<Option<std::time::Instant>> = std::
 pub static PORTAL_LOCAL_CB: std::sync::Mutex<Option<std::sync::Arc<dyn Fn(SharedPixelBuffer<Rgba8Pixel>) + Send + Sync + 'static>>> = std::sync::Mutex::new(None);
 #[cfg(target_os = "linux")]
 pub static PORTAL_CHILD: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
-/// Counts the portal threads started, so one can tell that PORTAL_INITIALIZED is still its own.
-#[cfg(all(target_os = "linux", feature = "vaapi"))]
+/// Goes up when a portal thread is started, and when a share starts or is stopped: a portal
+/// thread whose number is no longer this one belongs to a share that is over (its source
+/// dialog may still be open), and nothing it does or reports may touch the share of now.
+#[cfg(target_os = "linux")]
 static PORTAL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Held for every change of PORTAL_INITIALIZED, PORTAL_CANCELLED and SHARE_END_PENDING that
+/// depends on PORTAL_GENERATION or changes it, so "is this still my share? then ..." is one
+/// step. (Reading the flags alone needs no lock.)
+#[cfg(target_os = "linux")]
+static PORTAL_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// How long the portal may take over a step that asks the user nothing (connecting, creating
+/// the session, naming the kinds of source) before the share is given up as failed.
+#[cfg(target_os = "linux")]
+const PORTAL_ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Why a share's capture ended without the share being stopped.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShareEnd {
+    /// The source dialog was closed without choosing anything.
+    Cancelled,
+    /// The capture could not start.
+    Failed,
+    /// The shared window or screen went away (the window was closed, or the desktop's own
+    /// "stop sharing" was used).
+    SourceLost,
+}
+#[cfg(target_os = "linux")]
+type ShareEndCallback = std::sync::Arc<dyn Fn(ShareEnd) + Send + Sync>;
+#[cfg(target_os = "linux")]
+static SHARE_END_CB: std::sync::Mutex<Option<ShareEndCallback>> = std::sync::Mutex::new(None);
+/// Set while a `ShareEnd` told to the callback has not been acted on; a share that starts
+/// takes it back, so a late callback cannot end the next share.
+#[cfg(target_os = "linux")]
+static SHARE_END_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Called, on the capture's thread, when a share has lost its capture for good: the share
+/// is over and whoever shows it has to stop it (`take_share_end` says whether that still
+/// holds once on the UI thread). Nothing asks the portal again by itself: its dialog opening
+/// alone after a window was closed is not something anyone asked for.
+#[cfg(target_os = "linux")]
+pub fn on_share_end(callback: impl Fn(ShareEnd) + Send + Sync + 'static) {
+    *SHARE_END_CB.lock().unwrap() = Some(std::sync::Arc::new(callback));
+}
+
+/// True once per `ShareEnd`, and only while no other share has started since.
+#[cfg(target_os = "linux")]
+pub fn take_share_end() -> bool {
+    SHARE_END_PENDING.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The capture of portal thread `generation` is over though nobody stopped the share.
+#[cfg(target_os = "linux")]
+fn share_ended(generation: u64, why: ShareEnd) {
+    use std::sync::atomic::Ordering;
+    {
+        let _state = PORTAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        // (A thread of a share that was stopped, or replaced by another, has nothing to end.)
+        if PORTAL_GENERATION.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        // (The capture poll must not ask the portal again.)
+        PORTAL_CANCELLED.store(true, Ordering::SeqCst);
+        PORTAL_INITIALIZED.store(false, Ordering::SeqCst);
+        SHARE_END_PENDING.store(true, Ordering::SeqCst);
+    }
+    let callback = SHARE_END_CB.lock().unwrap().clone();
+    if let Some(callback) = callback {
+        callback(why);
+    }
+}
+
+/// A share is starting (of any kind: a camera share too): whatever portal thread is left
+/// from an earlier one is no longer anyone's, and the portal may be asked once.
 #[cfg(target_os = "linux")]
 pub fn reset_wayland_portal_cancelled() {
-    PORTAL_CANCELLED.store(false, std::sync::atomic::Ordering::SeqCst);
-    PORTAL_INITIALIZED.store(false, std::sync::atomic::Ordering::SeqCst);
+    use std::sync::atomic::Ordering;
+    let _state = PORTAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    PORTAL_GENERATION.fetch_add(1, Ordering::SeqCst);
+    PORTAL_CANCELLED.store(false, Ordering::SeqCst);
+    PORTAL_INITIALIZED.store(false, Ordering::SeqCst);
+    SHARE_END_PENDING.store(false, Ordering::SeqCst);
+}
+
+/// The share was stopped, or there is none (leaving the call, quitting): the portal thread
+/// of now, if any, is nobody's from here on, and the portal is not asked until a share starts
+/// (`reset_wayland_portal_cancelled`). Doing it again changes nothing.
+#[cfg(target_os = "linux")]
+pub fn share_stopped() {
+    use std::sync::atomic::Ordering;
+    let _state = PORTAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    PORTAL_GENERATION.fetch_add(1, Ordering::SeqCst);
+    // (Before PORTAL_INITIALIZED falls: the capture poll runs a little longer than the share
+    // and would otherwise take the lowered flag for "ask the portal".)
+    PORTAL_CANCELLED.store(true, Ordering::SeqCst);
+    PORTAL_INITIALIZED.store(false, Ordering::SeqCst);
+    SHARE_END_PENDING.store(false, Ordering::SeqCst);
+}
+
+/// Portal thread `generation` is done without anything to report: the flag is lowered if it
+/// is still that thread's.
+#[cfg(target_os = "linux")]
+fn release(generation: u64) {
+    use std::sync::atomic::Ordering;
+    let _state = PORTAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if PORTAL_GENERATION.load(Ordering::SeqCst) == generation {
+        PORTAL_INITIALIZED.store(false, Ordering::SeqCst);
+    }
+}
+
+/// How a source dialog that gave no source ended: closed by the user, or anything else (the
+/// portal's backend failed, the session was ended under it), which the user is told about.
+#[cfg(target_os = "linux")]
+fn dialog_end(error: &ashpd::Error) -> ShareEnd {
+    match error {
+        ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled) => ShareEnd::Cancelled,
+        _ => ShareEnd::Failed,
+    }
 }
 
 #[cfg(target_os = "linux")]
 pub fn kill_portal_child() {
-    PORTAL_INITIALIZED.store(false, std::sync::atomic::Ordering::SeqCst);
-    PORTAL_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
+    share_stopped();
     if let Ok(mut lock) = PORTAL_CHILD.lock() {
         if let Some(mut child) = lock.take() {
             let _ = child.kill();
@@ -240,7 +349,9 @@ impl Drop for WindowCapture {
 
 #[cfg(target_os = "linux")]
 pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: u64) {
-    if PORTAL_CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
+    use std::sync::atomic::Ordering;
+    // (Every capture poll comes through here: the usual answers without the lock.)
+    if PORTAL_CANCELLED.load(Ordering::SeqCst) || PORTAL_INITIALIZED.load(Ordering::SeqCst) {
         return;
     }
 
@@ -252,22 +363,27 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
         }
     }
 
-    if PORTAL_INITIALIZED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
-    }
-
+    // Under the lock: either the share is still wanted here and its thread gets a number
+    // that a later stop outdates, or the stop came first and nothing is started.
+    let generation = {
+        let _state = PORTAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if PORTAL_CANCELLED.load(Ordering::SeqCst) || PORTAL_INITIALIZED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        PORTAL_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+    };
     if let Ok(mut guard) = PORTAL_LAST_ATTEMPT.lock() {
         *guard = Some(std::time::Instant::now());
     }
-    #[cfg(feature = "vaapi")]
-    let generation = PORTAL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    // The share this thread was started for is still running, and this is its thread.
+    let mine = move || PORTAL_INITIALIZED.load(Ordering::Relaxed) && PORTAL_GENERATION.load(Ordering::Relaxed) == generation;
 
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
             Ok(r) => r,
             Err(e) => {
                 log::error!("Falha ao criar tokio runtime para Portal ScreenCast: {:?}", e);
-                PORTAL_INITIALIZED.store(false, std::sync::atomic::Ordering::SeqCst);
+                share_ended(generation, ShareEnd::Failed);
                 return;
             }
         };
@@ -275,6 +391,10 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
         let _guard = rt.enter();
 
         rt.block_on(async move {
+            // (Stopped before this thread got here: the portal is not asked at all.)
+            if !mine() {
+                return;
+            }
             use ashpd::desktop::{
                 PersistMode,
                 screencast::{
@@ -287,41 +407,76 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
             use std::process::{Command, Stdio};
             use std::io::Read;
 
+            // Test builds can name the source themselves (LITECORD_TEST_SHARE_NODE): a PipeWire
+            // node of the default remote stands in for everything the portal answers below,
+            // and the portal is not asked (its dialog needs a person).
+            #[cfg(feature = "automation")]
+            let test_source = crate::utils::test_hooks::share_node();
+            #[cfg(not(feature = "automation"))]
+            let test_source: Option<Option<(u32, bool)>> = None;
+            if test_source == Some(None) {
+                log::error!("🧪 [TESTE] LITECORD_TEST_SHARE_NODE não deu uma fonte: tratado como um diálogo do portal cancelado");
+                share_ended(generation, ShareEnd::Cancelled);
+                return;
+            }
+            let test_source = test_source.flatten();
+
+            let proxy = if test_source.is_some() {
+                None
+            } else {
             log::info!("📡 Solicitando sessão nativa do XDG Desktop Portal ScreenCast via conexão D-Bus dedicada...");
-            let conn = match ashpd::zbus::connection::Builder::session() {
-                Ok(b) => match b.build().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        log::error!("Falha ao estabelecer conexão D-Bus privada para Portal: {:?}", e);
-                        PORTAL_INITIALIZED.store(false, std::sync::atomic::Ordering::SeqCst);
+            // A portal that cannot be reached, refuses or does not answer: the share has no
+            // capture and ends as failed (`share_ended`), here and in the two steps below.
+            // Nothing asks again by itself.
+            let connecting = async {
+                let conn = ashpd::zbus::connection::Builder::session()
+                    .map_err(|e| format!("builder D-Bus: {:?}", e))?
+                    .build()
+                    .await
+                    .map_err(|e| format!("conexão D-Bus privada: {:?}", e))?;
+                Screencast::with_connection(conn).await.map_err(|e| format!("Screencast Portal: {:?}", e))
+            };
+            match tokio::time::timeout(PORTAL_ANSWER_TIMEOUT, connecting).await {
+                Ok(Ok(p)) => Some(p),
+                Ok(Err(e)) => {
+                    log::error!("Falha ao conectar no Portal ScreenCast ({})", e);
+                    share_ended(generation, ShareEnd::Failed);
+                    return;
+                }
+                Err(_) => {
+                    log::error!("O Portal ScreenCast não respondeu à conexão em {} s", PORTAL_ANSWER_TIMEOUT.as_secs());
+                    share_ended(generation, ShareEnd::Failed);
+                    return;
+                }
+            }
+            };
+
+            let session = match &proxy {
+                Some(proxy) => match tokio::time::timeout(PORTAL_ANSWER_TIMEOUT, proxy.create_session(CreateSessionOptions::default())).await {
+                    Ok(Ok(s)) => Some(s),
+                    Ok(Err(e)) => {
+                        log::error!("Falha ao criar sessão do ScreenCast: {:?}", e);
+                        share_ended(generation, ShareEnd::Failed);
+                        return;
+                    }
+                    Err(_) => {
+                        log::error!("O Portal ScreenCast não criou a sessão em {} s", PORTAL_ANSWER_TIMEOUT.as_secs());
+                        share_ended(generation, ShareEnd::Failed);
                         return;
                     }
                 },
-                Err(e) => {
-                    log::error!("Falha ao construir builder D-Bus para Portal: {:?}", e);
-                    PORTAL_INITIALIZED.store(false, std::sync::atomic::Ordering::SeqCst);
-                    return;
-                }
+                None => None,
             };
+            // Closes the portal's session (a test source has none).
+            macro_rules! close_session {
+                () => {
+                    if let Some(session) = &session {
+                        let _ = session.close().await;
+                    }
+                };
+            }
 
-            let proxy = match Screencast::with_connection(conn).await {
-                Ok(p) => p,
-                Err(e) => {
-                    log::error!("Falha ao conectar no Screencast Portal: {:?}", e);
-                    PORTAL_INITIALIZED.store(false, std::sync::atomic::Ordering::SeqCst);
-                    return;
-                }
-            };
-
-            let session = match proxy.create_session(CreateSessionOptions::default()).await {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!("Falha ao criar sessão do ScreenCast: {:?}", e);
-                    PORTAL_INITIALIZED.store(false, std::sync::atomic::Ordering::SeqCst);
-                    return;
-                }
-            };
-
+            let response = if let (Some(proxy), Some(session)) = (&proxy, &session) {
             let select_opts = SelectSourcesOptions::default()
                 .set_cursor_mode(CursorMode::Embedded)
                 .set_sources(SourceType::Monitor | SourceType::Window)
@@ -329,111 +484,159 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
                 .set_restore_token(None)
                 .set_persist_mode(PersistMode::DoNot);
 
-            if let Err(e) = proxy.select_sources(&session, select_opts).await {
-                log::error!("Falha ao selecionar fontes de captura no Portal: {:?}", e);
-                let _ = session.close().await;
-                PORTAL_INITIALIZED.store(false, std::sync::atomic::Ordering::SeqCst);
-                return;
+            match tokio::time::timeout(PORTAL_ANSWER_TIMEOUT, proxy.select_sources(session, select_opts)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    log::error!("Falha ao selecionar fontes de captura no Portal: {:?}", e);
+                    close_session!();
+                    share_ended(generation, ShareEnd::Failed);
+                    return;
+                }
+                Err(_) => {
+                    // (Not closed: a portal that does not answer would not answer that
+                    // either; the session goes with this thread's D-Bus connection.)
+                    log::error!("O Portal ScreenCast não respondeu à escolha dos tipos de fonte em {} s", PORTAL_ANSWER_TIMEOUT.as_secs());
+                    share_ended(generation, ShareEnd::Failed);
+                    return;
+                }
             }
 
-            let response = match proxy.start(&session, None, StartCastOptions::default()).await {
+            // The source dialog: open for as long as the user leaves it. Only its being
+            // closed by the user ends the share without a word (`dialog_end`).
+            match proxy.start(session, None, StartCastOptions::default()).await {
                 Ok(r) => match r.response() {
-                    Ok(resp) => resp,
+                    Ok(resp) => Some(resp),
                     Err(e) => {
                         log::error!("Resposta de erro do Portal ScreenCast: {:?}", e);
-                        let _ = session.close().await;
-                        PORTAL_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
-                        PORTAL_INITIALIZED.store(false, std::sync::atomic::Ordering::SeqCst);
+                        close_session!();
+                        share_ended(generation, dialog_end(&e));
                         return;
                     }
                 },
                 Err(e) => {
                     log::error!("Falha ao iniciar captura no Portal ScreenCast: {:?}", e);
-                    let _ = session.close().await;
-                    PORTAL_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
-                    PORTAL_INITIALIZED.store(false, std::sync::atomic::Ordering::SeqCst);
+                    close_session!();
+                    share_ended(generation, dialog_end(&e));
                     return;
-                }
-            };
-
-            let stream = match response.streams().first() {
-                Some(s) => s,
-                None => {
-                    log::error!("Nenhum stream retornado pelo Portal ScreenCast");
-                    let _ = session.close().await;
-                    PORTAL_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
-                    PORTAL_INITIALIZED.store(false, std::sync::atomic::Ordering::SeqCst);
-                    return;
-                }
-            };
-
-            let node_id = stream.pipe_wire_node_id();
-            let pw_fd = match proxy.open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default()).await {
-                Ok(fd) => fd,
-                Err(e) => {
-                    log::error!("Falha ao abrir PipeWire Remote: {:?}", e);
-                    let _ = session.close().await;
-                    PORTAL_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
-                    PORTAL_INITIALIZED.store(false, std::sync::atomic::Ordering::SeqCst);
-                    return;
-                }
-            };
-
-            let raw_fd = pw_fd.as_raw_fd();
-            unsafe {
-                let flags = libc::fcntl(raw_fd, libc::F_GETFD);
-                if flags >= 0 {
-                    libc::fcntl(raw_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
                 }
             }
+            } else {
+                None
+            };
+            // The dialog was answered for a share that was stopped meanwhile (it stays open
+            // when the share is stopped): nothing is captured, and the session is given back.
+            if !mine() {
+                log::info!("🛑 A fonte escolhida era de um compartilhamento já encerrado: sessão do portal fechada sem capturar");
+                close_session!();
+                return;
+            }
 
-            log::info!("🎉 Conectando GStreamer ao PipeWire Node ID={}, FD={} ({}x{} @ {} FPS)...", node_id, raw_fd, target_w, target_h, target_fps);
+            // The source: its node, whether it is a window, and a monitor's size (the portal
+            // gives that in the compositor's coordinates: its shape).
+            let (node_id, is_window, monitor_size) = match (&response, test_source) {
+                (Some(response), _) => match response.streams().first() {
+                    Some(stream) => (
+                        stream.pipe_wire_node_id(),
+                        stream.source_type() == Some(SourceType::Window),
+                        stream.size().filter(|_| stream.source_type() == Some(SourceType::Monitor)).map(|(w, h)| (w.max(0) as u32, h.max(0) as u32)),
+                    ),
+                    None => {
+                        log::error!("Nenhum stream retornado pelo Portal ScreenCast");
+                        close_session!();
+                        share_ended(generation, ShareEnd::Failed);
+                        return;
+                    }
+                },
+                (None, Some((node, window))) => {
+                    log::warn!("🧪 [TESTE] Fonte dada por LITECORD_TEST_SHARE_NODE: nó PipeWire {} ({}), sem portal", node, if window { "janela" } else { "monitor" });
+                    (node, window, None)
+                }
+                (None, None) => return,
+            };
+
+            let pw_fd = if let (Some(proxy), Some(session)) = (&proxy, &session) {
+                match proxy.open_pipe_wire_remote(session, OpenPipeWireRemoteOptions::default()).await {
+                    Ok(fd) => Some(fd),
+                    Err(e) => {
+                        log::error!("Falha ao abrir PipeWire Remote: {:?}", e);
+                        close_session!();
+                        share_ended(generation, ShareEnd::Failed);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
+            // (`None`: the default PipeWire remote, for a test source.)
+            let raw_fd: Option<i32> = pw_fd.as_ref().map(|fd| fd.as_raw_fd());
+            if let Some(raw_fd) = raw_fd {
+                unsafe {
+                    let flags = libc::fcntl(raw_fd, libc::F_GETFD);
+                    if flags >= 0 {
+                        libc::fcntl(raw_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                    }
+                }
+            }
+            // pipewiresrc properties naming the source. On the default remote `path=` alone is
+            // only a wish (with the node gone, the session manager links any video source it
+            // likes, a camera included), so there the stream is told not to fall back.
+            let source_props = |fd: Option<i32>| -> Vec<String> {
+                match fd {
+                    Some(fd) => vec![format!("fd={}", fd), format!("path={}", node_id)],
+                    None => vec![format!("path={}", node_id), "stream-properties=props,node.dont-fallback=(string)true".to_string()],
+                }
+            };
+
+            log::info!("🎉 Conectando GStreamer ao PipeWire Node ID={}, FD={} ({}x{} @ {} FPS)...", node_id, raw_fd.map_or("remoto padrão".to_string(), |fd| fd.to_string()), target_w, target_h, target_fps);
 
             // Capture and encode on the GPU inside this process when that works. If it cannot
             // start, or fails later, the gst-launch capture below runs on the same session.
             #[cfg(feature = "vaapi")]
             let (raw_fd, _gst_fd, gpu_ran) = {
                 use crate::screen_capture::linux_gpu_tx as gpu;
-                use std::sync::atomic::Ordering;
                 let mut fallback = (raw_fd, None, false);
-                // The share this thread was started for is still running.
-                let mine = move || PORTAL_INITIALIZED.load(Ordering::Relaxed) && PORTAL_GENERATION.load(Ordering::Relaxed) == generation;
-                if gpu::allowed(stream.source_type() == Some(SourceType::Window)) {
-                    let begun = gpu::begin(Some(raw_fd), node_id, target_w, target_h, target_fps as u32, &mine);
+                if gpu::allowed(is_window) {
+                    let begun = gpu::begin(raw_fd, node_id, target_w, target_h, target_fps as u32, &mine);
                     let ended = match begun {
                         Some(id) => gpu::run_until_end(id, &mine),
                         None => gpu::Ended::Failed,
                     };
                     if ended != gpu::Ended::Failed || !mine() {
-                        // The share was stopped, or the compositor ended the session. In the
-                        // second case the next capture poll asks the portal again, as it does
-                        // when the gst-launch capture ends.
-                        let _ = session.close().await;
-                        log::info!("🛑 Sessão do XDG Desktop Portal ScreenCast fechada com sucesso via D-Bus!");
-                        if ended == gpu::Ended::SourceGone && PORTAL_GENERATION.load(Ordering::Relaxed) == generation {
-                            PORTAL_INITIALIZED.store(false, Ordering::SeqCst);
+                        // The share was stopped, or the compositor ended the session (the
+                        // window was closed): in the second case the share is over too.
+                        close_session!();
+                        if session.is_some() {
+                            log::info!("🛑 Sessão do XDG Desktop Portal ScreenCast fechada com sucesso via D-Bus!");
+                        }
+                        if ended == gpu::Ended::SourceGone {
+                            share_ended(generation, ShareEnd::SourceLost);
                         }
                         return;
                     }
                     // gst-launch gets a PipeWire connection of its own. The pipeline that
                     // failed stops in the background and may never finish (a driver that
                     // hangs); two clients on one connection break it, so the old one is shut.
-                    match proxy.open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default()).await {
-                        Ok(fd) => {
-                            let new_fd = fd.as_raw_fd();
-                            unsafe {
-                                libc::shutdown(raw_fd, libc::SHUT_RDWR);
-                                let flags = libc::fcntl(new_fd, libc::F_GETFD);
-                                if flags >= 0 {
-                                    libc::fcntl(new_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                    match (&proxy, &session, raw_fd) {
+                        (Some(proxy), Some(session), Some(raw_fd)) => match proxy.open_pipe_wire_remote(session, OpenPipeWireRemoteOptions::default()).await {
+                            Ok(fd) => {
+                                let new_fd = fd.as_raw_fd();
+                                unsafe {
+                                    libc::shutdown(raw_fd, libc::SHUT_RDWR);
+                                    let flags = libc::fcntl(new_fd, libc::F_GETFD);
+                                    if flags >= 0 {
+                                        libc::fcntl(new_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                                    }
                                 }
+                                fallback = (Some(new_fd), Some(fd), begun.is_some());
                             }
-                            fallback = (new_fd, Some(fd), begun.is_some());
-                        }
-                        Err(e) => {
-                            log::warn!("⚠️ Falha ao abrir um segundo PipeWire Remote ({:?}); a captura por gst-launch usa a conexão anterior", e);
-                            fallback.2 = begun.is_some();
-                        }
+                            Err(e) => {
+                                log::warn!("⚠️ Falha ao abrir um segundo PipeWire Remote ({:?}); a captura por gst-launch usa a conexão anterior", e);
+                                fallback.2 = begun.is_some();
+                            }
+                        },
+                        // (A test source: each capture connects to the default remote itself.)
+                        _ => fallback.2 = begun.is_some(),
                     }
                 }
                 fallback
@@ -444,18 +647,16 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
             let (dst_w, dst_h) = (target_w, target_h);
             let frame_size = (dst_w * dst_h * 4) as usize;
 
-            // (The portal gives a monitor's size in the compositor's coordinates: its shape.)
-            let monitor = stream.size().filter(|_| stream.source_type() == Some(SourceType::Monitor)).map(|(w, h)| (w.max(0) as u32, h.max(0) as u32));
-            let gst_args = gst_launch_capture_args(&[format!("fd={}", raw_fd), format!("path={}", node_id)], dst_w, dst_h, target_fps, monitor);
+            let gst_args = gst_launch_capture_args(&source_props(raw_fd), dst_w, dst_h, target_fps, monitor_size);
 
             // A shared window: the same pipeline inside this process, which takes the
             // window out of the monitor-sized buffer (`WindowCapture`); gst-launch when
             // that does not start.
             #[cfg(feature = "vaapi")]
-            let window_capture = if stream.source_type() == Some(SourceType::Window) {
+            let window_capture = if is_window {
                 // (pipewiresrc closes the connection it is given: a copy of it.)
-                let own_fd = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 3) };
-                match WindowCapture::start(&[format!("fd={}", own_fd), format!("path={}", node_id)], dst_w, dst_h, target_fps) {
+                let own_fd = raw_fd.map(|fd| unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) });
+                match WindowCapture::start(&source_props(own_fd), dst_w, dst_h, target_fps) {
                     Ok(capture) => {
                         log::info!("🔧 Captura da janela no processo (videocrop pelo retângulo de cada quadro), sem gst-launch");
                         Some(capture)
@@ -474,6 +675,8 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
             let in_process = false;
 
             let mut stdout = None;
+            // (The gst-launch of this thread, to leave a newer share's alone at the end.)
+            let mut child_pid = None;
             if !in_process {
             log::info!("🔧 GStreamer pipeline args: {:?}", gst_args);
 
@@ -487,9 +690,8 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
                 Ok(c) => c,
                 Err(e) => {
                     log::error!("Falha ao iniciar pipeline GStreamer PipeWire: {:?}", e);
-                    let _ = session.close().await;
-                    PORTAL_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
-                    PORTAL_INITIALIZED.store(false, std::sync::atomic::Ordering::SeqCst);
+                    close_session!();
+                    share_ended(generation, ShareEnd::Failed);
                     return;
                 }
             };
@@ -514,24 +716,38 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
             stdout = match child.stdout.take() {
                 Some(s) => Some(s),
                 None => {
-                    let _ = session.close().await;
-                    PORTAL_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
-                    PORTAL_INITIALIZED.store(false, std::sync::atomic::Ordering::SeqCst);
+                    close_session!();
+                    share_ended(generation, ShareEnd::Failed);
                     return;
                 }
             };
 
-            if let Ok(mut lock) = PORTAL_CHILD.lock() {
-                if let Some(mut old) = lock.take() {
-                    let _ = old.kill();
+            // Handed over only while the share is this thread's: `stop` lowers the flags and
+            // then kills what is in the slot, so a child put there after this check is killed
+            // by it, and one of a share already over never takes a newer share's place.
+            child_pid = Some(child.id());
+            let handed_over = {
+                let mut lock = PORTAL_CHILD.lock().unwrap_or_else(|e| e.into_inner());
+                if mine() {
+                    if let Some(mut old) = lock.take() {
+                        let _ = old.kill();
+                    }
+                    *lock = Some(child);
+                    true
+                } else {
+                    let _ = child.kill();
+                    false
                 }
-                *lock = Some(child);
+            };
+            if !handed_over {
+                close_session!();
+                return;
             }
             }
             let mut next_frame = |frame: &mut [u8]| -> bool {
                 #[cfg(feature = "vaapi")]
                 if let Some(capture) = &window_capture {
-                    return capture.read(frame, &|| PORTAL_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed));
+                    return capture.read(frame, &mine);
                 }
                 stdout.as_mut().is_some_and(|s| s.read_exact(frame).is_ok())
             };
@@ -542,9 +758,19 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
             let mut last_local_preview_ts = std::time::Instant::now() - std::time::Duration::from_secs(1);
             let mut got_first_frame = false;
 
-            log::info!("⏳ Aguardando primeiro quadro do GStreamer PipeWire (timeout 10s)...");
+            // (No time limit: a source may have nothing to show for a while.)
+            log::info!("⏳ Aguardando primeiro quadro do GStreamer PipeWire...");
 
-            while PORTAL_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) && next_frame(&mut raw_buf) {
+            // (Left false by a share that was stopped; true when the capture ended by itself.)
+            let mut capture_ended = false;
+            loop {
+                if !mine() {
+                    break;
+                }
+                if !next_frame(&mut raw_buf) {
+                    capture_ended = mine();
+                    break;
+                }
                 if !got_first_frame {
                     got_first_frame = true;
                     log::info!("✅ Primeiro quadro do GStreamer PipeWire recebido com sucesso!");
@@ -591,9 +817,9 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
             }
 
             // (After a GPU capture that had been running, gst-launch delivering nothing is a
-            // capture that ended mid-share, not one that never started: the session is closed
-            // below and the next capture poll asks the portal again.)
-            if !got_first_frame && !gpu_ran {
+            // capture that ended mid-share, not one that never started.)
+            let never_started = capture_ended && !got_first_frame && !gpu_ran;
+            if never_started {
                 log::error!("❌ GStreamer PipeWire encerrou sem produzir nenhum quadro! Pipeline falhou.");
                 // Check if child exited with an error
                 if let Ok(mut lock) = PORTAL_CHILD.lock() {
@@ -605,17 +831,31 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
                         }
                     }
                 }
-                PORTAL_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
             }
 
             if let Ok(mut lock) = PORTAL_CHILD.lock() {
-                if let Some(mut child) = lock.take() {
-                    let _ = child.kill();
+                // (Only this thread's own: a newer share's gst-launch may be there by now.)
+                if child_pid.is_some() && lock.as_ref().map(|child| child.id()) == child_pid {
+                    if let Some(mut child) = lock.take() {
+                        let _ = child.kill();
+                    }
                 }
             }
-            let _ = session.close().await;
-            log::info!("🛑 Sessão do XDG Desktop Portal ScreenCast fechada com sucesso via D-Bus!");
-            PORTAL_INITIALIZED.store(false, std::sync::atomic::Ordering::SeqCst);
+            close_session!();
+            if session.is_some() {
+                log::info!("🛑 Sessão do XDG Desktop Portal ScreenCast fechada com sucesso via D-Bus!");
+            }
+            // (Each of these does nothing when a newer share has the flags by now.)
+            if never_started {
+                share_ended(generation, ShareEnd::Failed);
+            } else if capture_ended {
+                // The source went away while the share was running: the share is over. (The
+                // portal is not asked again; see `on_share_end`.)
+                log::warn!("⚠️ A captura terminou sozinha (a fonte deixou de existir); o compartilhamento terminou");
+                share_ended(generation, ShareEnd::SourceLost);
+            } else {
+                release(generation);
+            }
         });
     });
 }

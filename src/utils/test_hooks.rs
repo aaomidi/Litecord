@@ -3,7 +3,9 @@
 //! environment variable is set.
 //!
 //! ```text
-//! LITECORD_TEST_ACCOUNT=<user id or name>   log in with that saved account; never write the vault
+//! LITECORD_TEST_ACCOUNT=<user id or name>   log in with that saved account. Without it a test build
+//!                                          starts logged out: it does not read the saved accounts.
+//!                                          It never writes the vault either way.
 //! LITECORD_TEST_MIC=loopback               capture the default output device instead of a microphone
 //! LITECORD_TEST_TIMER_PACING=1            send voice on the old 20 ms timer with 1 ms resolution (A/B baseline)
 //! LITECORD_TEST_MUTE_OUTPUT=1              play nothing, UI sounds included (keeps a loopback "mic" clean)
@@ -15,6 +17,12 @@
 //! LITECORD_TEST_HIDE_OUTPUT_SECS=<s>       voice sees no output device for the first <s> seconds
 //! LITECORD_TEST_MIC=synth                  a generated voice-like tone instead of a microphone
 //! LITECORD_TEST_SILENT_PLAYBACK=1          mix received voice as usual (and log it), then play silence
+//! LITECORD_TEST_SHARE_NODE=<id>[,window]   a screen share captures that PipeWire node of the default
+//!                                          remote instead of asking the desktop portal (no dialog)
+//! LITECORD_TEST_SHARE_NODE=@<file>         the same, read from <file> ("<id>[,window]") when a share
+//!                                          asks for its source; the file is removed once read, as a
+//!                                          dialog answers once: without it the share gets a
+//!                                          "cancelled" answer. The portal is never asked.
 //! ```
 
 use std::io::Write;
@@ -252,5 +260,38 @@ pub fn voice_decoded(pairs: &[(f32, f32)]) {
             let _ = out.write_all(&((l + r) * 0.5).to_le_bytes());
         }
         let _ = out.flush();
+    }
+}
+
+/// What a screen share captures in place of the desktop portal's answer
+/// (LITECORD_TEST_SHARE_NODE): `None` when the hook is off, `Some(None)` when it is on and
+/// has no source to give (as a dialog that was cancelled), else the PipeWire node on the
+/// default remote and whether it is a window's stream.
+pub fn share_node() -> Option<Option<(u32, bool)>> {
+    let value = env("LITECORD_TEST_SHARE_NODE")?;
+    let text = match value.strip_prefix('@') {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).ok();
+            let _ = std::fs::remove_file(path);
+            text.unwrap_or_default()
+        }
+        None => value,
+    };
+    let mut parts = text.trim().split(',');
+    let node = parts.next().and_then(|n| n.trim().parse::<u32>().ok());
+    let window = parts.next().is_some_and(|w| w.trim() == "window");
+    Some(node.map(|node| (node, window)))
+}
+
+/// Who owns each server and how many members it has, as GUILD_CREATE said (the automation
+/// port's `state` lists them, to choose where a test may run).
+pub fn guild_facts() -> &'static Mutex<std::collections::HashMap<String, (String, u64)>> {
+    static FACTS: OnceLock<Mutex<std::collections::HashMap<String, (String, u64)>>> = OnceLock::new();
+    FACTS.get_or_init(Default::default)
+}
+
+pub fn note_guild(id: &str, owner_id: &str, member_count: u64) {
+    if let Ok(mut facts) = guild_facts().lock() {
+        facts.insert(id.to_string(), (owner_id.to_string(), member_count));
     }
 }

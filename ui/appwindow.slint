@@ -153,6 +153,8 @@ export component AppWindow inherits Window {
     in-out property <int> drop_target_guild_idx: -1;
     callback load_older_messages();
     callback toggle_screen_share();
+    // Ends the running share; nothing when there is none.
+    callback end_screen_share();
     callback toggle_web_share();
     callback copy_web_share_link();
     callback toggle_stream_fullscreen();
@@ -458,7 +460,10 @@ export component AppWindow inherits Window {
     // The user whose browser link is being asked for ("" when none).
     in-out property <string> web_link_pending_uid: "";
 
-    if root.web_share_error != "": Rectangle {
+    // Why a screen share ended by itself ("" when there is nothing to say).
+    in-out property <string> share_notice: "";
+
+    if root.web_share_error != "" || root.share_notice != "": Rectangle {
         z: 100;
         x: (root.width - self.width) / 2;
         y: 64px;
@@ -470,12 +475,12 @@ export component AppWindow inherits Window {
         border-radius: 8px;
         Text {
             x: 16px; y: 8px; width: parent.width - 32px; height: parent.height - 16px;
-            text: root.web_share_error;
+            text: root.share_notice != "" ? root.share_notice : root.web_share_error;
             color: AppTheme.text-strong;
             wrap: word-wrap;
             font-size: TypeScale.body;
         }
-        TouchArea { mouse-cursor: pointer; clicked => { root.web_share_error = ""; } }
+        TouchArea { mouse-cursor: pointer; clicked => { root.web_share_error = ""; root.share_notice = ""; } }
     }
     in-out property <bool> show_self_preview_notice: false;
     in-out property <bool> show_stream_modal: false;
