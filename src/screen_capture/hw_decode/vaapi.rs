@@ -562,8 +562,16 @@ impl Drop for Session {
         // Stopping waits for the streaming thread; if that one hangs in the driver (the
         // reason this pipeline is being dropped, perhaps), the decode thread must not hang too.
         let pipeline = self.pipeline.clone();
+        // Mesa's VA driver deadlocks when the process exits while a display closes: counted
+        // from here so that `before_exit` waits for it, and left alone once exiting.
+        let Some(stopping) = crate::encoder::vaapi::begin_teardown() else {
+            std::mem::forget(pipeline);
+            return;
+        };
         let stop = move || {
             let _ = pipeline.set_state(gst::State::Null);
+            drop(pipeline);
+            drop(stopping);
         };
         if let Err(e) = std::thread::Builder::new().name("vaapi-dec-teardown".into()).spawn(stop) {
             log::warn!("⚠️ [VAAPI DEC] Could not stop the pipeline in the background: {}", e);

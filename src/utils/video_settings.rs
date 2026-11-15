@@ -32,11 +32,11 @@ pub struct VideoSettings {
     #[serde(default)]
     pub window: Option<WindowGeometry>,
     /// Interface scale in percent (100 to 200), or 0 for the system's own.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_scale")]
     pub ui_scale_percent: u32,
     /// While streaming, people in the call may ask for a browser link to the stream
     /// (screen_capture::web_link); web sharing is turned on for them if needed.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", deserialize_with = "lenient_allow")]
     pub allow_web_link_requests: bool,   // default true
     /// Stream quality (advanced), read when a share starts. `stream_min_qp`: the VA-API
     /// encoder's QP floor. `stream_max_bitrate_mbps`: where a stream starts and climbs
@@ -94,6 +94,42 @@ fn lenient<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(d: 
     Ok(serde_json::Value::deserialize(d).ok().and_then(|v| serde_json::from_value(v).ok()))
 }
 
+fn lenient_scale<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    Ok(lenient::<D, u32>(d)?.unwrap_or(0))
+}
+
+/// Written but not as true or false: off. The default is on, and a hand-edited "false" or 0
+/// must not turn into it.
+fn lenient_allow<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    Ok(lenient::<D, bool>(d)?.unwrap_or(false))
+}
+
+/// The settings in `data`. A file that does not load as a whole keeps every setting that is
+/// readable on its own (the second value says so); one that is not even JSON gives the
+/// defaults, with browser link requests off: what the user chose there is unknown.
+fn parse_settings(data: &str) -> (VideoSettings, Option<String>) {
+    // Tolerate a BOM (editors on Windows add one) instead of silently resetting.
+    let data = data.trim_start_matches('\u{feff}');
+    let error = match serde_json::from_str::<VideoSettings>(data) {
+        Ok(settings) => return (settings, None),
+        Err(e) => e.to_string(),
+    };
+    let unknown = VideoSettings { allow_web_link_requests: false, ..VideoSettings::default() };
+    let (Ok(file), Ok(serde_json::Value::Object(mut kept))) = (serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(data), serde_json::to_value(VideoSettings::default())) else {
+        return (unknown, Some(error));
+    };
+    for (name, value) in file {
+        let before = kept.insert(name.clone(), value);
+        if serde_json::from_value::<VideoSettings>(serde_json::Value::Object(kept.clone())).is_err() {
+            match before {
+                Some(before) => kept.insert(name, before),
+                None => kept.remove(&name),
+            };
+        }
+    }
+    (serde_json::from_value(serde_json::Value::Object(kept)).unwrap_or(unknown), Some(error))
+}
+
 /// Which H.264 profile a stream uses where the encoder has a choice (VA-API).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamProfile {
@@ -134,8 +170,14 @@ static VIDEO_SETTINGS: OnceLock<Mutex<VideoSettings>> = OnceLock::new();
 pub fn get_video_settings_store() -> &'static Mutex<VideoSettings> {
     VIDEO_SETTINGS.get_or_init(|| {
         let settings = if let Ok(data) = std::fs::read_to_string(VIDEO_SETTINGS_FILE) {
-            // Tolerate a BOM (editors on Windows add one) instead of silently resetting.
-            serde_json::from_str::<VideoSettings>(data.trim_start_matches('\u{feff}')).unwrap_or_default()
+            let (settings, damaged) = parse_settings(&data);
+            if let Some(error) = damaged {
+                // The next save writes over the file: what the user wrote stays beside it.
+                let copy = format!("{VIDEO_SETTINGS_FILE}.bad");
+                let _ = std::fs::write(&copy, &data);
+                log::warn!("⚠️ Arquivo de configurações {} com erro ({}): só os valores legíveis foram mantidos; cópia do original em {}", VIDEO_SETTINGS_FILE, error, copy);
+            }
+            settings
         } else {
             VideoSettings::default()
         };
@@ -146,7 +188,14 @@ pub fn get_video_settings_store() -> &'static Mutex<VideoSettings> {
 
 pub fn save_video_settings(settings: &VideoSettings) {
     if let Ok(json) = serde_json::to_string_pretty(settings) {
-        let _ = std::fs::write(VIDEO_SETTINGS_FILE, json);
+        // Written beside the file and renamed over it: a crash in the middle of a write
+        // (the sliders save on every step) must not leave half a file. A file that is a
+        // link to somewhere else is written in place, so it stays a link.
+        let linked = std::fs::symlink_metadata(VIDEO_SETTINGS_FILE).is_ok_and(|m| m.file_type().is_symlink());
+        let beside = format!("{VIDEO_SETTINGS_FILE}.tmp");
+        if linked || std::fs::write(&beside, &json).and_then(|_| std::fs::rename(&beside, VIDEO_SETTINGS_FILE)).is_err() {
+            let _ = std::fs::write(VIDEO_SETTINGS_FILE, json);
+        }
     }
 }
 
@@ -383,4 +432,50 @@ pub fn set_stream_profile(val: String) {
     let mut store = get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner());
     store.stream_profile = Some(val);
     save_video_settings(&store);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str = r#""video_encoder":"openh264","video_capture_backend":"auto","audio_loopback_backend":"auto","enable_self_preview_notice":true,"use_light_theme":true,"noise_suppression":"standard""#;
+
+    fn load(rest: &str) -> (VideoSettings, bool) {
+        let (s, damaged) = parse_settings(&format!("{{{BASE}{rest}}}"));
+        (s, damaged.is_some())
+    }
+
+    #[test]
+    fn a_bad_value_costs_that_setting_only() {
+        for rest in [r#","ui_scale_percent":"150""#, r#","ui_scale_percent":1.5"#, r#","ui_scale_percent":-1"#, r#","ui_scale_percent":null"#] {
+            let (s, damaged) = load(&format!(r#","allow_web_link_requests":false{rest}"#));
+            assert!(!damaged, "{rest}");
+            assert_eq!((s.video_encoder.as_str(), s.use_light_theme, s.noise_suppression.as_str(), s.allow_web_link_requests, s.ui_scale_percent), ("openh264", true, "standard", false, 0), "{rest}");
+        }
+        let (s, _) = load(r#","ui_scale_percent":150"#);
+        assert_eq!((s.ui_scale_percent, s.allow_web_link_requests), (150, true));
+    }
+
+    #[test]
+    fn browser_links_stay_off_when_the_choice_is_unreadable() {
+        for rest in [r#","allow_web_link_requests":"false""#, r#","allow_web_link_requests":0"#, r#","allow_web_link_requests":null"#] {
+            let (s, _) = load(rest);
+            assert!(!s.allow_web_link_requests && s.use_light_theme, "{rest}");
+        }
+        // Cut short, and a trailing comma: not JSON.
+        let (s, damaged) = parse_settings(&format!(r#"{{{BASE},"allow_web_link_requests":false"#));
+        assert!(damaged.is_some() && !s.allow_web_link_requests);
+        let (s, damaged) = parse_settings(&format!(r#"{{{BASE},"allow_web_link_requests":false,}}"#));
+        assert!(damaged.is_some() && !s.allow_web_link_requests);
+    }
+
+    #[test]
+    fn readable_settings_survive_an_unreadable_one() {
+        let (s, damaged) = load(r#","allow_web_link_requests":false,"channel_sidebar_width":"wide","window":7,"stream_min_qp":24"#);
+        assert!(damaged);
+        assert_eq!((s.video_encoder.as_str(), s.use_light_theme, s.allow_web_link_requests, s.stream_min_qp, s.channel_sidebar_width, s.window), ("openh264", true, false, Some(24), default_channel_sidebar_width(), None));
+        // A file from upstream, without the fork's settings.
+        let (s, damaged) = load("");
+        assert!(!damaged && s.allow_web_link_requests && s.use_light_theme);
+    }
 }

@@ -272,6 +272,9 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 }
 
 fn main() {
+    // This test is about the CPU path: where a GPU decoder exists, `decode_video_frame`
+    // would take it, and its pictures are not byte-identical to the reference.
+    std::env::set_var("LITECORD_VAAPI_DECODE", "0");
     let args = match Args::parse() {
         Ok(a) if !a.has("help") && !a.files.is_empty() => a,
         Ok(_) => {

@@ -155,7 +155,7 @@ const LEVEL_MAX_KBPS: [(u8, u32); 16] = [
 /// 1080p30 comes out as level 4.0 and 720p60 as 3.2 (both end at 24 Mbps) whatever the
 /// bitrate. Every SPS of `au` whose level does not allow `bitrate_bps` is given the lowest
 /// one that does. Only that byte changes: the frame buffering is in the VUI.
-fn raise_level(au: &mut [u8], bitrate_bps: u32) {
+pub(crate) fn raise_level(au: &mut [u8], bitrate_bps: u32) {
     let allows = |max_kbps: u32| max_kbps as u64 * 1200 >= bitrate_bps as u64;
     for r in nal_ranges(au) {
         if au[r.start] & 0x1f != 7 || r.len() < 4 {

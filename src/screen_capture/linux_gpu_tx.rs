@@ -401,6 +401,8 @@ struct Tx {
     requested_bps: u32,
     asked_at: Instant,
     applied_bps: u32,
+    /// The highest rate applied so far: what the level in the SPS has to allow.
+    level_bps: u32,
     /// A keyframe was asked of the encoder and has not come out yet; and how many times it
     /// has been asked for.
     keyframe_asked_at: Option<Instant>,
@@ -664,6 +666,7 @@ impl Stream {
                 requested_bps: vaapi::INITIAL_BITRATE_BPS,
                 asked_at: Instant::now(),
                 applied_bps: vaapi::INITIAL_BITRATE_BPS,
+                level_bps: 0,
                 keyframe_asked_at: None,
                 keyframe_tries: 0,
                 await_keyframe: false,
@@ -1056,7 +1059,11 @@ impl Stream {
         tx.await_keyframe = false;
         tx.keyframe_asked_at = None;
         tx.keyframe_tries = 0;
-        Ok(Some(Picture { data: crate::encoder::h264_vui::declare_colour(&au, 1, 1, 6), idr, repeat, latency }))
+        // vah264enc takes the level from size and frame rate alone (same rule as VaapiEncoder).
+        tx.level_bps = tx.level_bps.max(tx.applied_bps);
+        let mut au = crate::encoder::h264_vui::declare_colour(&au, 1, 1, 6);
+        vaapi::raise_level(&mut au, tx.level_bps);
+        Ok(Some(Picture { data: au, idr, repeat, latency }))
     }
 
     /// The first error on the pipeline's bus. Errors of pipewiresrc about its PipeWire
