@@ -129,6 +129,8 @@ export component AppWindow inherits Window {
     callback set_user_volume(string /* user_id */, float /* volume */);
     callback set_user_priority(string /* user_id */, int /* priority */);
     callback toggle_voice_focus();
+    // Opens a voice channel's own text chat in the chat pane, without joining its call.
+    callback open_channel_chat(string /* channel_id */);
     callback open_link(string /* url */);
     callback download_attachment(string /* att_id */, string /* filename */, string /* url */);
     callback set_vad_threshold(float /* threshold */);
@@ -423,6 +425,12 @@ export component AppWindow inherits Window {
     in-out property <bool> is_voice_connecting: false;
     in-out property <string> current_voice_channel: "";
     in-out property <bool> is_voice_focused: false;
+    // Server voice channel of the call in progress ("" outside one and in a DM call).
+    in-out property <string> voice_channel_id: "";
+    // Set to the id of the open channel while the chat pane shows a voice channel's chat.
+    in-out property <string> voice_chat_channel_id: "";
+    // Messages that arrived in the call's chat while it was not on screen.
+    in-out property <int> voice_chat_unread: 0;
     in-out property <[VoiceParticipant]> voice_participants: [];
     in-out property <bool> is_in_dm_call: false; // true while a DM voice call is active
     in-out property <bool> has_incoming_call: false;  // true when receiving a DM call
@@ -1350,6 +1358,7 @@ export component AppWindow inherits Window {
                 user_avatar_img: root.user_avatar_img;
                 active_channel_id <=> root.active_channel_id;
                 select_channel(id) => { root.select_channel(id); }
+                open_channel_chat(id) => { root.open_channel_chat(id); }
                 toggle_category(id) => { root.toggle_category(id); }
                 reorder_channel(from, to) => { root.reorder_channel(from, to); }
                 channel_drop_row(from, dy) => { return root.channel_drop_row(from, dy); }
@@ -1548,12 +1557,38 @@ export component AppWindow inherits Window {
                                             font-weight: 600;
                                             vertical-alignment: center;
                                         }
+
+                                        // New messages in this call's chat since it was last on screen
+                                        if root.voice_chat_unread > 0: VerticalLayout {
+                                            alignment: center;
+                                            Rectangle {
+                                                width: root.voice_chat_unread > 99 ? 28px : (root.voice_chat_unread > 9 ? 24px : 20px);
+                                                height: 20px;
+                                                border-radius: 10px;
+                                                background: #ed4245;
+
+                                                Text {
+                                                    text: root.voice_chat_unread > 99 ? "99+" : "\{root.voice_chat_unread}";
+                                                    color: #ffffff;
+                                                    font-size: TypeScale.caption;
+                                                    font-weight: 700;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                        }
                                     }
 
                                     btn_chat_ta := TouchArea {
                                         mouse-cursor: pointer;
                                         clicked => {
-                                            root.toggle_voice_focus();
+                                            // A server voice channel has its own chat; a DM call
+                                            // goes back to the conversation that was open.
+                                            if (root.voice_channel_id != "") {
+                                                root.open_channel_chat(root.voice_channel_id);
+                                            } else {
+                                                root.toggle_voice_focus();
+                                            }
                                             root.scroll_chat_to_bottom();
                                         }
                                     }
@@ -2749,7 +2784,10 @@ export component AppWindow inherits Window {
                     spacing: 0px;
 
                     // Channel Header
-                    Rectangle {
+                    chat_header := Rectangle {
+                        // The chat pane shows a voice channel's own chat / the one of the call in progress
+                        property <bool> is_voice_chat: root.active_channel_id != "" && root.active_channel_id == root.voice_chat_channel_id;
+                        property <bool> is_call_chat: self.is_voice_chat && root.is_in_voice && root.active_channel_id == root.voice_channel_id;
                         height: 44px;
                         background: AppTheme.surface-sidebar;
 
@@ -2767,13 +2805,24 @@ export component AppWindow inherits Window {
                             padding-right: 16px;
                             spacing: 8px;
 
-                            // Show "@" prefix for DMs, "#" for regular channels
-                            Text {
+                            // Show "@" prefix for DMs, "#" for regular channels and the
+                            // speaker for the chat of a voice channel
+                            if !chat_header.is_voice_chat: Text {
                                 text: (root.active_guild_id == "@me") ? "@" : "#";
                                 color: AppTheme.text-subtle;
                                 font-size: TypeScale.heading;
                                 font-weight: 800;
                                 vertical-alignment: center;
+                            }
+                            if chat_header.is_voice_chat: VerticalLayout {
+                                alignment: center;
+                                Image {
+                                    source: @image-url("../assets/speaker.svg");
+                                    width: 16px;
+                                    height: 16px;
+                                    colorize: AppTheme.text-subtle;
+                                    image-fit: contain;
+                                }
                             }
 
                             Text {
@@ -2782,12 +2831,36 @@ export component AppWindow inherits Window {
                                 font-size: TypeScale.title;
                                 font-weight: 700;
                                 vertical-alignment: center;
+                                overflow: elide;
+                            }
+
+                            // Marks the chat of a voice channel, and the one of the call in progress
+                            if chat_header.is_voice_chat: VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    height: 20px;
+                                    border-radius: 10px;
+                                    background: chat_header.is_call_chat ? AppTheme.success-subtle : AppTheme.interactive-muted;
+
+                                    HorizontalLayout {
+                                        padding-left: 8px;
+                                        padding-right: 8px;
+                                        Text {
+                                            text: chat_header.is_call_chat ? Tr.call_chat : Tr.voice_channel_chat;
+                                            color: chat_header.is_call_chat ? AppTheme.success : AppTheme.text-muted;
+                                            font-size: TypeScale.caption;
+                                            font-weight: 700;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
                             }
 
                             Rectangle { horizontal-stretch: 1; }
 
-                            // DM Voice Call Button — visible only in Direct Messages
-                            if root.active_guild_id == "@me": VerticalLayout {
+                            // DM Voice Call Button — visible only in Direct Messages (not while the
+                            // chat of a server call is open over the DM list: it is not a DM to ring)
+                            if root.active_guild_id == "@me" && !chat_header.is_voice_chat: VerticalLayout {
                                 alignment: center;
                                 Rectangle {
                                     height: 32px;

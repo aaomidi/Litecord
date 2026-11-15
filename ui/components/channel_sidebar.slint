@@ -49,6 +49,8 @@ export component ChannelSidebar inherits Rectangle {
     in property <bool> user_avatar_has_image;
     in property <image> user_avatar_img;
     callback select_channel(string);
+    // Speech-bubble button of a voice channel row: its text chat, without joining the call.
+    callback open_channel_chat(string);
     callback toggle_category(string);
     callback leave_voice();
     callback toggle_user_menu();
@@ -301,6 +303,11 @@ export component ChannelSidebar inherits Rectangle {
                                     }
                                 }
                             }
+
+                            // Room for the chat button drawn over the hovered row (below)
+                            if channel.is_voice && touch_area.has_hover && root.dragging_channel_idx < 0 : Rectangle {
+                                width: 22px;
+                            }
                         }
 
                         // Participants remain separate rows under their voice channel.
@@ -380,6 +387,31 @@ export component ChannelSidebar inherits Rectangle {
                                         root.active_channel_id = channel.is_voice_member ? channel.parent_channel_id : channel.id;
                                         root.select_channel(channel.is_voice_member ? channel.parent_channel_id : channel.id);
                                     }
+                                }
+                            }
+
+                            // Chat of a voice channel, shown on hover. Inside the row's touch
+                            // area so the row stays hovered under it; a click here opens the
+                            // chat and does not reach the row (which would join the call).
+                            if channel.is_voice && touch_area.has_hover && root.dragging_channel_idx < 0 : Rectangle {
+                                x: parent.width - self.width - 8px;
+                                y: (parent.height - self.height) / 2;
+                                width: 22px;
+                                height: 22px;
+                                border-radius: 4px;
+                                background: chat_btn_ta.has_hover ? AppTheme.interactive-selected : transparent;
+
+                                Image {
+                                    source: @image-url("../../assets/message-square.svg");
+                                    width: 14px;
+                                    height: 14px;
+                                    colorize: chat_btn_ta.has_hover ? AppTheme.text-strong : AppTheme.text-muted;
+                                    image-fit: contain;
+                                }
+
+                                chat_btn_ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.open_channel_chat(channel.id); }
                                 }
                             }
                         }
