@@ -1731,6 +1731,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Our own bar only shows above the voice threshold; mic noise below it changes nothing.
             let shown_self_level = if self_level >= gateway::get_vad_threshold() { self_level } else { 0.0 };
             fingerprint.push((0, 0, (shown_self_level * 20.0) as u8));
+            // Streams asked for whose sender does not answer: their cards say so, and stop
+            // saying so, without waiting for the 1/s refresh.
+            let watch_unanswered = screen_capture::watch::unanswered();
+            fingerprint.extend(watch_unanswered.iter().map(|&uid| (1, uid, 0)));
             if fingerprint == last_panel_fingerprint && last_panel_update.elapsed() < std::time::Duration::from_secs(1) {
                 continue;
             }
@@ -1917,6 +1921,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         _ => avatars.image_for(&avatar_url),
                     };
 
+                    let watch_note = if watch_unanswered.contains(&user_id) { utils::i18n_ui::ui_text().watch_no_answer.replace("{}", &username) } else { String::new() };
+
                     participants.push(VoiceParticipant {
                         user_id: uid_str.into(),
                         username: username.into(),
@@ -1931,6 +1937,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         is_self,
                         is_streaming: is_streaming_peer,
                         is_stream_hidden: is_hidden,
+                        watch_note: watch_note.into(),
                     });
                 }
 
@@ -1966,7 +1973,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 || old.username != p.username
                                 || old.avatar_url != p.avatar_url
                                 || old.is_streaming != p.is_streaming
-                                || old.is_stream_hidden != p.is_stream_hidden;
+                                || old.is_stream_hidden != p.is_stream_hidden
+                                || old.watch_note != p.watch_note;
                             if level_changed || state_changed {
                                 cur_model.set_row_data(i, p);
                             }
@@ -2412,6 +2420,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             populate_video_interface_settings(&ui);
         }
     });
+
+    // Stream quality (advanced): read by the next screen share.
+    {
+        use slint::ComponentHandle;
+        let quality = app.global::<StreamQuality>();
+        quality.on_set_min_qp(|qp| video_settings::set_stream_min_qp(qp.max(0) as u32));
+        quality.on_set_max_bitrate(|mbps| video_settings::set_stream_max_bitrate_mbps(mbps.max(0) as u32));
+        quality.on_select_profile(|id: SharedString| video_settings::set_stream_profile(id.to_string()));
+    }
 
     let app_weak_notice = app_weak.clone();
     app.on_toggle_enable_self_preview_notice(move || {

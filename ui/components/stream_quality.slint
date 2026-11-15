@@ -1,0 +1,116 @@
+import { Slider } from "std-widgets.slint";
+import { AppTheme, TypeScale } from "../theme.slint";
+import { Tr } from "tr.slint";
+import { SettingsSection, SettingsButton, OptionSelect } from "settings_kit.slint";
+
+// The "stream quality" settings (src/utils/video_settings.rs). Rust fills the values and
+// ranges (populate_video_interface_settings) and saves what the callbacks report.
+export global StreamQuality {
+    // Built with the VA-API encoder, the one the quality floor and the profile act on.
+    in property <bool> has-gpu-encoder;
+    in property <float> min-qp-lowest: 18;
+    in property <float> min-qp-highest: 36;
+    in property <float> min-qp-default: 30;
+    in-out property <float> min-qp: 30;
+    in property <float> max-bitrate-lowest: 3;
+    in property <float> max-bitrate-highest: 50;
+    in property <float> max-bitrate-default: 8;
+    in-out property <float> max-bitrate: 8;
+    // "auto", "compatible" or "efficient".
+    in-out property <string> profile: "auto";
+    callback set-min-qp(int);
+    callback set-max-bitrate(int);
+    callback select-profile(string);
+}
+
+// A whole-number setting: title, slider with its value, reset to the default, explanation.
+component QualitySlider inherits VerticalLayout {
+    in property <string> title;
+    in property <string> desc;
+    in property <string> unit;
+    in property <float> minimum;
+    in property <float> maximum;
+    in property <float> default-value;
+    in-out property <float> value;
+    callback picked(int);
+
+    spacing: 8px;
+    Text { text: root.title; color: AppTheme.text-strong; font-size: TypeScale.body; font-weight: 600; wrap: word-wrap; }
+    HorizontalLayout {
+        spacing: 12px;
+        Slider {
+            horizontal-stretch: 1;
+            minimum: root.minimum;
+            maximum: root.maximum;
+            step: 1;
+            value <=> root.value;
+            changed(val) => {
+                root.value = Math.round(val);
+                root.picked(Math.round(val));
+            }
+        }
+        Text {
+            text: Math.round(root.value) + root.unit;
+            width: 68px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            color: AppTheme.text-strong;
+            font-size: TypeScale.body;
+            font-weight: 600;
+        }
+        SettingsButton {
+            text: Tr.reset_default;
+            enabled: Math.round(root.value) != root.default-value;
+            clicked => {
+                root.value = root.default-value;
+                root.picked(root.default-value);
+            }
+        }
+    }
+    Text { text: root.desc; color: AppTheme.text-muted; font-size: TypeScale.small; wrap: word-wrap; }
+}
+
+// A component of its own: written in place under an `if`, the wrapped explanation was
+// laid out as a single line and ran into what follows.
+component ProfileSelect inherits VerticalLayout {
+    spacing: 6px;
+    Text { text: Tr.stream_profile_title; color: AppTheme.text-strong; font-size: TypeScale.body; font-weight: 600; }
+    OptionSelect {
+        options: [
+            { id: "auto", name: Tr.gpu_auto, desc: Tr.profile_auto_desc },
+            { id: "compatible", name: Tr.profile_compatible, desc: Tr.profile_compatible_desc },
+            { id: "efficient", name: Tr.profile_efficient, desc: Tr.profile_efficient_desc },
+        ];
+        selected-id: StreamQuality.profile;
+        picked(id) => {
+            StreamQuality.profile = id;
+            StreamQuality.select-profile(id);
+        }
+    }
+    Text { text: Tr.stream_profile_desc; color: AppTheme.text-muted; font-size: TypeScale.small; wrap: word-wrap; }
+}
+
+export component StreamQualitySection inherits SettingsSection {
+    title: Tr.stream_quality_title;
+    Text { text: Tr.stream_quality_desc; color: AppTheme.text-muted; font-size: TypeScale.small; wrap: word-wrap; }
+    if StreamQuality.has-gpu-encoder: QualitySlider {
+        title: Tr.quality_floor_title;
+        desc: Tr.quality_floor_desc;
+        minimum: StreamQuality.min-qp-lowest;
+        maximum: StreamQuality.min-qp-highest;
+        default-value: StreamQuality.min-qp-default;
+        value <=> StreamQuality.min-qp;
+        picked(qp) => { StreamQuality.set-min-qp(qp); }
+    }
+    QualitySlider {
+        title: Tr.max_bitrate_title;
+        desc: Tr.max_bitrate_desc;
+        unit: " Mbps";
+        minimum: StreamQuality.max-bitrate-lowest;
+        maximum: StreamQuality.max-bitrate-highest;
+        default-value: StreamQuality.max-bitrate-default;
+        value <=> StreamQuality.max-bitrate;
+        picked(mbps) => { StreamQuality.set-max-bitrate(mbps); }
+    }
+    if StreamQuality.has-gpu-encoder: ProfileSelect { }
+}

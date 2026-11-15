@@ -53,6 +53,12 @@ pub trait VideoEncoder: Send {
     /// Retorna a taxa de bits atual configurada em bps
     fn get_bitrate_bps(&self) -> u32;
 
+    /// Asks for H.264 Main (`true`: every viewer decodes it) or Constrained Baseline, called
+    /// before each `encode`. Encoders with a single profile ignore it. Going to Main may wait
+    /// for the next keyframe the caller asks for; with `false`, the next picture out is
+    /// Constrained Baseline again.
+    fn set_efficient_profile(&mut self, _on: bool) {}
+
     /// Retorna o nome amigável do backend ativo
     fn name(&self) -> &'static str;
 
@@ -385,6 +391,6 @@ pub fn create_gpu_encoder(
         return Ok(Box::new(enc));
     }
     let enc = wmf::WmfGpuEncoder::for_device(device, vendor_id, width, height, fps, bitrate_bps).map_err(|e| e.to_string())?;
-    info!("🚀 [VIDEO CODEC FACTORY] '{}' pela GPU ativado ({}x{} {} FPS, {:.1} Mbps), sem passar quadros pela CPU", enc.gpu_name, width, height, fps, bitrate_bps as f64 / 1e6);
+    info!("🚀 [VIDEO CODEC FACTORY] '{}' pela GPU ativado ({}x{} {} FPS, {:.1} Mbps), sem passar quadros pela CPU", enc.gpu_name, width, height, fps, enc.bitrate_bps as f64 / 1e6);
     Ok(Box::new(enc))
 }

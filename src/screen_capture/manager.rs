@@ -186,6 +186,8 @@ impl ScreenCaptureManager {
                 if let Ok(mut cb_slot) = PORTAL_LOCAL_CB.lock() {
                     *cb_slot = None;
                 }
+                #[cfg(feature = "vaapi")]
+                super::linux_gpu_tx::end();
             }
         }
         if self.is_running.swap(false, Ordering::SeqCst) {
@@ -273,7 +275,10 @@ impl ScreenCaptureManager {
         super::gpu_tx::begin_stream(
             camera_index.is_none() && super::gpu_capture::choice() != super::gpu_capture::Choice::Cpu,
         );
-        REQUESTED_BITRATE_BPS.store(MAX_STREAM_BITRATE, Ordering::Relaxed);
+        // The stream settings as they are now: changing them later is for the next share.
+        let max_bitrate = crate::video_settings::get_stream_max_bitrate_bps();
+        let stream_profile = crate::video_settings::get_stream_profile();
+        REQUESTED_BITRATE_BPS.store(max_bitrate, Ordering::Relaxed);
         force_signaling_broadcast();
 
         let on_local_arc: Arc<dyn Fn(SharedPixelBuffer<Rgba8Pixel>) + Send + Sync + 'static> = Arc::new(on_local_frame);
@@ -817,9 +822,12 @@ impl ScreenCaptureManager {
                 let frame_target_interval = Duration::from_micros(1_000_000 / target_fps.max(1));
                 let mut next_tick = Instant::now();
                 let mut latest_cached_frame: Option<(Vec<u8>, u32, u32, u128, u128)> = None;
-                let mut rate = super::watch::RateControl::new(MAX_STREAM_BITRATE);
+                let mut rate = super::watch::RateControl::new(max_bitrate);
                 let mut last_rate_update = Instant::now();
                 let mut was_watched = false;
+                let mut profile_choice = super::watch::ProfileChoice::new(stream_profile);
+                // The rate last handed to the encoder.
+                let mut asked_bitrate = 0u32;
 
                 while is_running.load(Ordering::Relaxed) {
                     let mut cid = channel_id_atomic.load(Ordering::Relaxed);
@@ -890,7 +898,15 @@ impl ScreenCaptureManager {
                     }
                     #[cfg(windows)]
                     let gpu_path = super::gpu_tx::active();
-                    #[cfg(not(windows))]
+                    // Linux: the capture is encoded on the GPU as it arrives; this loop pulls
+                    // finished access units instead of frames.
+                    #[cfg(all(target_os = "linux", feature = "vaapi"))]
+                    let gpu_path = camera_index.is_none() && super::linux_gpu_tx::active();
+                    #[cfg(all(target_os = "linux", feature = "vaapi"))]
+                    if gpu_path {
+                        new_captures += super::linux_gpu_tx::take_new_pictures();
+                    }
+                    #[cfg(not(any(windows, all(target_os = "linux", feature = "vaapi"))))]
                     let gpu_path = false;
 
                     // Drena quadros novos da GPU para sempre ter o frame mais atualizado
@@ -933,16 +949,30 @@ impl ScreenCaptureManager {
                     // Nobody watching: the preview's pace (a new viewer is noticed within it).
                     let frame_target_interval = if was_watched { frame_target_interval } else { IDLE_FRAME_INTERVAL };
                     let now = Instant::now();
+                    // Linux GPU capture: the wait ends as soon as an access unit is finished.
+                    let au_paced = cfg!(all(target_os = "linux", feature = "vaapi")) && gpu_path && was_watched;
                     if now < next_tick {
                         let sleep_dur = (next_tick - now).min(frame_target_interval);
+                        #[cfg(all(target_os = "linux", feature = "vaapi"))]
+                        if au_paced {
+                            super::linux_gpu_tx::wait_ready(sleep_dur);
+                        }
                         // Woken early when a viewer arrives (wake_tx), instead of a full idle tick.
-                        std::thread::park_timeout(sleep_dur);
+                        if !au_paced {
+                            std::thread::park_timeout(sleep_dur);
+                        }
                         total_park_asked_us += sleep_dur.as_micros();
                         total_park_us += now.elapsed().as_micros();
                     }
                     next_tick += frame_target_interval;
                     if now > next_tick + frame_target_interval * 2 {
                         next_tick = now + frame_target_interval;
+                    }
+                    // Woken by access units and not by the clock, the loop turns more often than
+                    // once per interval: the schedule must not run ahead of the clock, or the
+                    // CPU-frame path would be late by that much after a fallback.
+                    if au_paced {
+                        next_tick = next_tick.min(Instant::now() + frame_target_interval);
                     }
 
                     // On the GPU path the pictures (and the preview) stay on the GPU: the loop goes
@@ -1025,16 +1055,26 @@ impl ScreenCaptureManager {
                         if bps != before {
                             info!("📶 [ABR] Taxa da transmissão: {:.1} -> {:.1} Mbps (pior perda entre espectadores: {:?}‰)", before as f64 / 1e6, bps as f64 / 1e6, super::watch::worst_loss());
                         }
-                        REQUESTED_BITRATE_BPS.store(bps, Ordering::Relaxed);
                     }
 
                     // Nobody watching (natively or in a browser): no encoding, nothing sent.
                     // The first viewer to arrive asks for a keyframe.
-                    let viewer_addrs = super::watch::viewer_addrs();
-                    let watched = !viewer_addrs.is_empty() || super::web_share::viewer_count() > 0;
+                    // Who gets this turn's picture and what they decode are read together and
+                    // before encoding: a viewer that cannot decode Main is on these lists only
+                    // in turns that encode Constrained Baseline.
+                    let (viewer_addrs, viewers_decode_main) = super::watch::viewers_now();
+                    let web_viewers = super::web_share::viewer_count();
+                    let watched = !viewer_addrs.is_empty() || web_viewers > 0;
+                    let efficient = profile_choice.update(watched, viewers_decode_main && web_viewers == 0, Instant::now());
+                    // Browsers report no loss, so nothing would bring a higher rate down for
+                    // them, and a keyframe has to fit their packet buffers.
+                    let rate_cap = if web_viewers > 0 { WEB_VIEWER_MAX_BITRATE } else { u32::MAX };
+                    REQUESTED_BITRATE_BPS.store(rate.current().min(rate_cap), Ordering::Relaxed);
                     if watched != was_watched {
                         was_watched = watched;
                         TX_WATCHED.store(watched, Ordering::Relaxed);
+                        #[cfg(all(target_os = "linux", feature = "vaapi"))]
+                        super::linux_gpu_tx::set_watched(watched);
                         info!("👀 [ASSISTIR SOB DEMANDA] {}", if watched { "Alguém começou a assistir: codificando." } else { "Ninguém assistindo: codificação pausada." });
                     }
 
@@ -1062,14 +1102,26 @@ impl ScreenCaptureManager {
                                 finished_on_gpu(&mut gpu_encoder)
                             }
                         }
-                        #[cfg(not(windows))]
+                        #[cfg(all(target_os = "linux", feature = "vaapi"))]
+                        {
+                            let want_idr = KEYFRAME_REQUESTED.swap(false, Ordering::Relaxed) || last_idr.elapsed() >= Duration::from_millis(2000);
+                            if want_idr {
+                                last_idr = Instant::now();
+                            }
+                            super::linux_gpu_tx::next_au(REQUESTED_BITRATE_BPS.load(Ordering::Relaxed), want_idr)
+                        }
+                        #[cfg(not(any(windows, all(target_os = "linux", feature = "vaapi"))))]
                         None
                     } else if let Some((bgra_slice, cur_w, cur_h, _, _)) = cpu_frame.filter(|_| encode_now) {
                         let enc = h264_encoder.get_or_insert_with(|| crate::encoder::create_best_encoder(target_fps as u32, camera_index.is_none()));
                         let target_bitrate = REQUESTED_BITRATE_BPS.load(Ordering::Relaxed);
-                        if enc.get_bitrate_bps() != target_bitrate {
+                        // OpenH264 ignores changes for a while and is asked on every frame; a GPU
+                        // encoder with a lower limit of its own is told each new rate once.
+                        if enc.get_bitrate_bps() != target_bitrate && (target_bitrate != asked_bitrate || !enc.is_hardware_accelerated()) {
                             enc.set_bitrate_bps(target_bitrate);
+                            asked_bitrate = target_bitrate;
                         }
+                        enc.set_efficient_profile(efficient);
                         if KEYFRAME_REQUESTED.swap(false, Ordering::Relaxed) || last_idr.elapsed() >= Duration::from_millis(2000) {
                             last_idr = Instant::now();
                             enc.force_intra_frame();
@@ -1081,9 +1133,15 @@ impl ScreenCaptureManager {
                     let enc_dur = enc_start.elapsed().as_micros();
                     total_encode_us += enc_dur;
 
+                    // The Linux GPU capture's turns follow its access units, with turns in between
+                    // that find none: only the ones that sent a picture count as frames.
+                    let counts_as_frame = !(cfg!(all(target_os = "linux", feature = "vaapi")) && gpu_path && watched) || frame_bytes_opt.is_some();
                     if let Some(raw_frame_bytes) = frame_bytes_opt {
-                        // Browsers watching over WebRTC get the same encoded frame.
-                        super::web_share::offer_frame(&raw_frame_bytes);
+                        // Browsers watching over WebRTC get the same encoded frame: those counted
+                        // before it was encoded (one that connected since waits for the next).
+                        if web_viewers > 0 {
+                            super::web_share::offer_frame(&raw_frame_bytes);
+                        }
                         let t_crypt_start = Instant::now();
                         let Some(frame_bytes) = super::watch::session_key().and_then(|k| encrypt_signaling_payload(&k, &raw_frame_bytes)) else {
                             continue;
@@ -1172,7 +1230,9 @@ impl ScreenCaptureManager {
                         total_net_us += t_net_us;
                     }
 
-                    tx_frame_count += 1;
+                    if counts_as_frame {
+                        tx_frame_count += 1;
+                    }
                     let turn_us = turn_start.elapsed().as_micros();
                     turn_start = Instant::now();
                     max_turn_us = max_turn_us.max(turn_us);
@@ -1300,6 +1360,7 @@ impl ScreenCaptureManager {
                 let mut rx_error_streak: HashMap<u64, u32> = HashMap::new();
                 // Aguardando IDR por peer: quando true, dropa frames até receber SPS/IDR
                 let mut waiting_for_idr: HashMap<u64, bool> = HashMap::new();
+                let mut last_decoded_seq: HashMap<u64, u32> = HashMap::new();
 
                 while is_running_decoder.load(Ordering::Relaxed) {
                     // The timeout only exists to zero the FPS readout after a stream
@@ -1391,6 +1452,12 @@ impl ScreenCaptureManager {
                             // Frames of this peer were dropped at the full queue: the ones after them
                             // cannot be decoded cleanly, so wait for a keyframe (and ask for it).
                             if take_decode_resync(peer_uid) {
+                                waiting_for_idr.insert(peer_uid, true);
+                            }
+                            // A frame of this peer never arrived whole. The decoder does not always
+                            // notice (after a lost keyframe that directly followed another one it
+                            // decodes on, against the wrong picture), so this waits for a keyframe too.
+                            if last_decoded_seq.insert(peer_uid, seq).is_some_and(|prev| seq != prev.wrapping_add(1)) {
                                 waiting_for_idr.insert(peer_uid, true);
                             }
 
@@ -1590,6 +1657,16 @@ impl ScreenCaptureManager {
                     fec_recovered: u32,
                 }
                 let mut qos_windows: HashMap<u64, PeerQosWindow> = HashMap::new();
+                // When each peer's last frame completed. The sender numbers every frame it sends,
+                // so a jump in the numbers while pictures were flowing is frames that never
+                // completed here (a pause in the stream is not loss).
+                let mut last_frame_at: HashMap<u64, Instant> = HashMap::new();
+                fn lost_between(before: Option<u32>, seq: u32, before_at: Option<Instant>) -> u32 {
+                    match (before, before_at) {
+                        (Some(before), Some(at)) if at.elapsed() < Duration::from_millis(500) => seq.wrapping_sub(before).saturating_sub(1).min(60),
+                        _ => 0,
+                    }
+                }
 
                 // Log throttling: these used to be written once per packet / per tick.
                 let mut rx_pkts_since_log: u64 = 0;
@@ -1675,9 +1752,9 @@ impl ScreenCaptureManager {
                     let wanted: Vec<u64> = if in_call && current_cid > 0 && my_uid > 0 { super::watch::streams_to_request() } else { Vec::new() };
                     if (wanted != requested || last_watch_request.elapsed() >= super::watch::RENEW_EVERY) && (!wanted.is_empty() || !requested.is_empty()) {
                         last_watch_request = Instant::now();
-                        let my_public = get_or_create_local_ecdh_keypair();
+                        let my_public = watch_public_key();
                         for &peer in &wanted {
-                            let mut pkt = Vec::with_capacity(65);
+                            let mut pkt = Vec::with_capacity(66);
                             pkt.extend_from_slice(MAGIC);
                             pkt.extend_from_slice(&my_instance_id.to_be_bytes());
                             pkt.push(OP_WATCH);
@@ -1685,11 +1762,15 @@ impl ScreenCaptureManager {
                             pkt.extend_from_slice(&my_uid.to_be_bytes());
                             pkt.extend_from_slice(&peer.to_be_bytes());
                             pkt.extend_from_slice(&my_public);
+                            // The capability byte: one more than upstream sends (it reads the first 65 and ignores the rest).
+                            pkt.push(super::watch::CAP_H264_MAIN);
                             for addr in peer_addrs(peer, &peers_store) {
                                 let _ = socket.send_to(&pkt, addr);
                             }
+                            super::watch::asked(peer);
                         }
                         for &peer in requested.iter().filter(|p| !wanted.contains(p)) {
+                            super::watch::stopped_asking(peer);
                             let mut pkt = Vec::with_capacity(33);
                             pkt.extend_from_slice(MAGIC);
                             pkt.extend_from_slice(&my_instance_id.to_be_bytes());
@@ -2086,7 +2167,7 @@ impl ScreenCaptureManager {
                                                 let is_newer = seq > last_seq || (last_seq.wrapping_sub(seq) > 0x8000_0000);
 
                                                 if is_newer || last_rendered_seq.get(&pkt_uid).is_none() {
-                                                    last_rendered_seq.insert(pkt_uid, seq);
+                                                    let seq_before = last_rendered_seq.insert(pkt_uid, seq);
 
                                                     let prev_state = active_streaming_users.insert(pkt_uid, true);
                                                     if prev_state != Some(true) {
@@ -2096,6 +2177,7 @@ impl ScreenCaptureManager {
 
                                                     let qos = qos_windows.entry(pkt_uid).or_default();
                                                     qos.frames_received += 1;
+                                                    qos.frames_lost += lost_between(seq_before, seq, last_frame_at.insert(pkt_uid, Instant::now()));
                                                     last_stream_activity.insert(pkt_uid, Instant::now());
 
                                                     let uname = peer_names.get(&pkt_uid).cloned().unwrap_or_else(|| format!("Usuário {}", pkt_uid));
@@ -2207,7 +2289,7 @@ impl ScreenCaptureManager {
                                                 let is_newer = seq > last_seq || (last_seq.wrapping_sub(seq) > 0x8000_0000);
 
                                                 if is_newer || last_rendered_seq.get(&pkt_uid).is_none() {
-                                                    last_rendered_seq.insert(pkt_uid, seq);
+                                                    let seq_before = last_rendered_seq.insert(pkt_uid, seq);
 
                                                     let prev_state = active_streaming_users.insert(pkt_uid, true);
                                                     if prev_state != Some(true) {
@@ -2217,6 +2299,7 @@ impl ScreenCaptureManager {
 
                                                     let qos = qos_windows.entry(pkt_uid).or_default();
                                                     qos.frames_received += 1;
+                                                    qos.frames_lost += lost_between(seq_before, seq, last_frame_at.insert(pkt_uid, Instant::now()));
                                                     qos.fec_recovered += 1;
                                                     last_stream_activity.insert(pkt_uid, Instant::now());
 
@@ -2274,12 +2357,15 @@ impl ScreenCaptureManager {
                                 OP_WATCH => {
                                     if len >= 65 && is_tx_running.load(Ordering::Relaxed) && u64::from_be_bytes(recv_buf[25..33].try_into().unwrap()) == my_uid {
                                         let viewer_public: [u8; 32] = recv_buf[33..65].try_into().unwrap();
+                                        // One capability byte after the key; clients without it
+                                        // (65 bytes) have none. Unknown bits and more bytes are ignored.
+                                        let caps = if len > 65 { recv_buf[65] } else { 0 };
                                         let in_channel = in_my_voice_channel(pkt_uid, my_current_cid);
-                                        match super::watch::on_watch(pkt_uid, viewer_public, src_addr, in_channel) {
+                                        match super::watch::on_watch(pkt_uid, viewer_public, src_addr, caps, in_channel) {
                                             Some(super::watch::Verdict::Accepted { new }) => {
                                                 if new {
-                                                    info!("👀 [ASSISTIR SOB DEMANDA] UID={} começou a assistir (de {}).", pkt_uid, src_addr);
-                                                    KEYFRAME_REQUESTED.store(true, Ordering::Relaxed);
+                                                    // Its keyframe was asked for by `on_watch`.
+                                                    info!("👀 [ASSISTIR SOB DEMANDA] UID={} começou a assistir (de {}, decodifica H.264 Main: {}).", pkt_uid, src_addr, if caps & super::watch::CAP_H264_MAIN != 0 { "sim" } else { "não" });
                                                     wake_tx();
                                                 }
                                                 let wrapped = super::watch::session_key().zip(pair_key(&viewer_public, my_uid, pkt_uid, my_current_cid))
@@ -2317,10 +2403,10 @@ impl ScreenCaptureManager {
                                 OP_WATCH_ACK => {
                                     if len >= 125 && u64::from_be_bytes(recv_buf[25..33].try_into().unwrap()) == my_uid {
                                         let sender_public: [u8; 32] = recv_buf[33..65].try_into().unwrap();
-                                        let key = pair_key(&sender_public, my_uid, pkt_uid, my_current_cid)
-                                            .and_then(|pair| decrypt_signaling_payload(&pair, &recv_buf[65..125]))
+                                        let key = decrypt_signaling_payload(&watch_pair_key(&sender_public, my_uid, pkt_uid, my_current_cid), &recv_buf[65..125])
                                             .and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok());
                                         if let Some(key) = key {
+                                            super::watch::answered(pkt_uid);
                                             if super::watch::stream_key(pkt_uid) != Some(key) {
                                                 info!("🔑 [ASSISTIR SOB DEMANDA] Chave da transmissão de UID={} recebida.", pkt_uid);
                                                 super::watch::set_stream_key(pkt_uid, key);
@@ -2654,8 +2740,9 @@ pub(super) fn capture_pace(frame_interval: Duration) -> Duration {
     if TX_WATCHED.load(Ordering::Relaxed) { frame_interval } else { IDLE_FRAME_INTERVAL.max(frame_interval) }
 }
 
-/// The highest bitrate a stream starts at and climbs back to.
-const MAX_STREAM_BITRATE: u32 = 8_000_000;
+/// The highest bitrate of a stream while a browser watches it (the rate every stream had
+/// before it became a setting).
+const WEB_VIEWER_MAX_BITRATE: u32 = 8_000_000;
 
 /// `uid` is in the voice channel `cid` (gateway voice states).
 fn in_my_voice_channel(uid: u64, cid: u64) -> bool {

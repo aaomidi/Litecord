@@ -582,12 +582,69 @@ fn has_idr(annex_b: &[u8]) -> bool {
     super::hw_decode::h264_state::nal_ranges(annex_b).iter().any(|r| annex_b[r.start] & 0x1f == 5)
 }
 
+/// The access unit as OpenH264 gets it: a Main profile SPS that declares no reordering is
+/// labelled Baseline (one byte, profile_idc 77 -> 66; nothing else in the stream changes).
+///
+/// OpenH264 returns a Baseline picture from the call that decoded it. Pictures of every
+/// other profile go through its output queue, which holds a picture back when its order
+/// count is more than 1 above the last one shown; the `openh264` crate then fetches it
+/// with FlushFrame, which hands it out but keeps the queue's hold on its buffer. With
+/// vah264enc's Main streams (pic_order_cnt_type 0, counting in steps of 2) that is every
+/// picture: after max_num_ref_frames + 2 of them the decoder is out of buffers until the
+/// next keyframe, about 3 pictures per keyframe on screen. Without the flush every picture
+/// came out one call late; with the label it comes out of its own call.
+///
+/// Why the label cannot change what is decoded: Main and Baseline share the SPS syntax, and
+/// the tools a stream uses are signalled where they are used (CABAC and weighted prediction
+/// in the PPS, the slice type in each slice), never derived from profile_idc. Apart from
+/// that queue, OpenH264 reads profile_idc for one thing: which of its two implementations
+/// of reference list modification (8.2.4.3) a CABAC stream gets, and the sender's
+/// single-reference streams carry no such commands. `max_num_reorder_frames` = 0 is the
+/// stream's own statement that pictures are shown in decoding order, so leaving the queue
+/// out cannot reorder them. Streams without that statement, with pic_order_cnt_type 2
+/// (their pictures were never held back) or of other profiles are passed on untouched.
+pub fn openh264_input(annex_b: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    use h264_reader::nal::sps::{PicOrderCntType, SeqParameterSet};
+    use h264_reader::nal::{Nal, RefNal};
+    let mut out = std::borrow::Cow::Borrowed(annex_b);
+    let mut i = 0;
+    while i + 5 <= annex_b.len() {
+        if annex_b[i..i + 3] != [0, 0, 1] {
+            i += 1;
+            continue;
+        }
+        let nal = i + 3;
+        i = nal;
+        match annex_b[nal] & 0x1f {
+            // Parameter sets come before the slices of their access unit: no need to
+            // search the pictures themselves (every access unit but keyframes ends here).
+            1..=5 => break,
+            7 if annex_b[nal + 1] == 77 => {
+                let mut end = annex_b[nal..].windows(3).position(|w| w == [0, 0, 1]).map_or(annex_b.len(), |p| nal + p);
+                while end > nal && annex_b[end - 1] == 0 {
+                    end -= 1;
+                }
+                let unordered = SeqParameterSet::from_bits(RefNal::new(&annex_b[nal..end], &[], true).rbsp_bits()).is_ok_and(|sps| {
+                    !matches!(sps.pic_order_cnt, PicOrderCntType::TypeTwo)
+                        && sps.vui_parameters.and_then(|v| v.bitstream_restrictions).is_some_and(|b| b.max_num_reorder_frames == 0)
+                });
+                if unordered {
+                    out.to_mut()[nal + 1] = 66;
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn decode_on_cpu(
     decoders: &mut HashMap<u64, openh264::decoder::Decoder>,
     peer_uid: u64,
     annex_b: &[u8],
 ) -> Option<(SharedPixelBuffer<Rgba8Pixel>, u32, u32)> {
     use openh264::formats::YUVSource;
+    let annex_b = &*openh264_input(annex_b);
     let decoder = decoders.entry(peer_uid).or_insert_with(|| {
         openh264::decoder::Decoder::new().expect("Falha ao criar Decoder H.264")
     });

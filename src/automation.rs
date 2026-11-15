@@ -34,6 +34,10 @@
 //! {"cmd":"stop_screen_share"}
 //! {"cmd":"watch_stream","user_id":"123"}     Watch a peer's stream and open it in the main view
 //! {"cmd":"unwatch_stream","user_id":"123"}   hide it (stop receiving it)
+//! {"cmd":"preview_watch_note","name":"Alice"} voice stage with a made-up stream that does
+//!                                            not answer Watch ("shown":false hides the note,
+//!                                            "both":true: neither stream answers, "active":true:
+//!                                            the other stream is on screen meanwhile)
 //! {"cmd":"stream_fullscreen"}                toggle the stream full screen button
 //! {"cmd":"resize","width":1920,"height":1080} set the window size in logical pixels
 //! {"cmd":"web_share_start"}                  start sharing to browsers; replies with the link
@@ -558,6 +562,31 @@ fn execute(ui: &AppWindow, cmd: &Value) -> Result<Value, String> {
             // Like hiding the stream: stop receiving it.
             let uid = cmd["user_id"].as_str().ok_or("missing \"user_id\"")?;
             ui.invoke_hide_stream(uid.into());
+            Ok(json!({ "ok": true }))
+        }
+        "preview_watch_note" => {
+            // The voice stage with a made-up participant whose stream does not answer Watch
+            // (layout check; works on the login screen, nothing is sent anywhere).
+            let name = cmd["name"].as_str().unwrap_or("Alice");
+            let flag = |key: &str, default: bool| cmd[key].as_bool().unwrap_or(default);
+            let (shown, both, active) = (flag("shown", true), flag("both", false), flag("active", false));
+            let row = |id: &str, name: &str, is_self: bool, note: bool| crate::VoiceParticipant {
+                user_id: id.into(),
+                username: name.into(),
+                avatar_text: name.chars().next().unwrap_or('?').to_string().into(),
+                volume: 1.0,
+                is_self,
+                is_streaming: !is_self,
+                is_stream_hidden: !is_self && !active,
+                watch_note: if note { crate::utils::i18n_ui::ui_text().watch_no_answer.replace("{}", name).into() } else { Default::default() },
+                ..Default::default()
+            };
+            ui.set_voice_participants(std::rc::Rc::new(slint::VecModel::from(vec![row("1", "Me", true, false), row("2", name, false, shown), row("3", "Bob", false, both)])).into());
+            ui.set_has_active_stream(active);
+            ui.set_active_stream_user_id(if active { "3" } else { "" }.into());
+            ui.set_is_logged_in(true);
+            ui.set_is_in_voice(true);
+            ui.set_is_voice_focused(true);
             Ok(json!({ "ok": true }))
         }
         "stream_fullscreen" => {

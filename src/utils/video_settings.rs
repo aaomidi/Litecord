@@ -38,6 +38,16 @@ pub struct VideoSettings {
     /// (screen_capture::web_link); web sharing is turned on for them if needed.
     #[serde(default = "default_true")]
     pub allow_web_link_requests: bool,   // default true
+    /// Stream quality (advanced), read when a share starts. `stream_min_qp`: the VA-API
+    /// encoder's QP floor. `stream_max_bitrate_mbps`: where a stream starts and climbs
+    /// back to. `stream_profile`: "auto", "compatible" or "efficient" (see `StreamProfile`).
+    /// None (never set, or not a value of that kind in the file) is the default.
+    #[serde(default, deserialize_with = "lenient")]
+    pub stream_min_qp: Option<u32>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub stream_max_bitrate_mbps: Option<u32>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub stream_profile: Option<String>,
 }
 
 /// Position in physical pixels (a logical position is ambiguous across monitors with
@@ -74,6 +84,27 @@ fn default_noise_suppression() -> String {
     "none".to_string()
 }
 
+pub const STREAM_MIN_QP_RANGE: (u32, u32) = (18, 36);
+pub const STREAM_MIN_QP_DEFAULT: u32 = 30;
+pub const STREAM_MAX_BITRATE_MBPS_RANGE: (u32, u32) = (3, 50);
+pub const STREAM_MAX_BITRATE_MBPS_DEFAULT: u32 = 8;
+
+/// A hand-edited value of the wrong kind costs that setting, not the whole file.
+fn lenient<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(d: D) -> Result<Option<T>, D::Error> {
+    Ok(serde_json::Value::deserialize(d).ok().and_then(|v| serde_json::from_value(v).ok()))
+}
+
+/// Which H.264 profile a stream uses where the encoder has a choice (VA-API).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamProfile {
+    /// Main while every viewer says it decodes it, Constrained Baseline otherwise.
+    Auto,
+    /// Constrained Baseline, which every receiver decodes.
+    Compatible,
+    /// Main, whoever watches.
+    Efficient,
+}
+
 impl Default for VideoSettings {
     fn default() -> Self {
         Self {
@@ -91,6 +122,9 @@ impl Default for VideoSettings {
             window: None,
             ui_scale_percent: 0,
             allow_web_link_requests: true,
+            stream_min_qp: None,
+            stream_max_bitrate_mbps: None,
+            stream_profile: None,
         }
     }
 }
@@ -304,3 +338,49 @@ pub fn toggle_automatic_gain_control() -> bool {
     new_val
 }
 
+pub fn get_stream_min_qp() -> u32 {
+    let qp = get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner()).stream_min_qp;
+    qp.unwrap_or(STREAM_MIN_QP_DEFAULT).clamp(STREAM_MIN_QP_RANGE.0, STREAM_MIN_QP_RANGE.1)
+}
+
+/// The file is written only when the value changes (a slider calls this while it moves).
+pub fn set_stream_min_qp(qp: u32) {
+    let qp = qp.clamp(STREAM_MIN_QP_RANGE.0, STREAM_MIN_QP_RANGE.1);
+    let mut store = get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner());
+    if store.stream_min_qp != Some(qp) {
+        store.stream_min_qp = Some(qp);
+        save_video_settings(&store);
+    }
+}
+
+pub fn get_stream_max_bitrate_mbps() -> u32 {
+    let mbps = get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner()).stream_max_bitrate_mbps;
+    mbps.unwrap_or(STREAM_MAX_BITRATE_MBPS_DEFAULT).clamp(STREAM_MAX_BITRATE_MBPS_RANGE.0, STREAM_MAX_BITRATE_MBPS_RANGE.1)
+}
+
+pub fn get_stream_max_bitrate_bps() -> u32 {
+    get_stream_max_bitrate_mbps() * 1_000_000
+}
+
+pub fn set_stream_max_bitrate_mbps(mbps: u32) {
+    let mbps = mbps.clamp(STREAM_MAX_BITRATE_MBPS_RANGE.0, STREAM_MAX_BITRATE_MBPS_RANGE.1);
+    let mut store = get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner());
+    if store.stream_max_bitrate_mbps != Some(mbps) {
+        store.stream_max_bitrate_mbps = Some(mbps);
+        save_video_settings(&store);
+    }
+}
+
+pub fn get_stream_profile() -> StreamProfile {
+    match get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner()).stream_profile.as_deref() {
+        Some("compatible") => StreamProfile::Compatible,
+        Some("efficient") => StreamProfile::Efficient,
+        _ => StreamProfile::Auto,
+    }
+}
+
+pub fn set_stream_profile(val: String) {
+    let mut store = get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner());
+    store.stream_profile = Some(val);
+    save_video_settings(&store);
+}
