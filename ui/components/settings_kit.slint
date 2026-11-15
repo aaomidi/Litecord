@@ -87,6 +87,24 @@ export component SettingsSection inherits VerticalLayout {
     }
 }
 
+// A conditional (`if`) or repeated (`for`) part of a layout that holds wrapping text:
+// a whole settings page, a list row. Slint 1.17.1 asks such a part for its height at
+// its preferred width, where no text wraps (the generated `layout_info` calls
+// `layoutinfo-v-with-constraint` with the preferred width and hands that width on
+// unchanged to the text column of every row), so the layout around it reserves one
+// line too few per wrapping text and a ScrollView cannot be scrolled to the end of
+// the page. The inner layout's own preferred height is measured at the real width;
+// giving it to the part as an explicit height keeps the surrounding layout from asking.
+export component SettingsBlock inherits Rectangle {
+    in property <length> spacing: 0px;
+    height: body.preferred-height;
+    body := VerticalLayout {
+        spacing: root.spacing;
+        alignment: start;
+        @children
+    }
+}
+
 // Title and explanation on the left, the control (children) on the right.
 export component SettingsRow inherits HorizontalLayout {
     in property <string> title;
