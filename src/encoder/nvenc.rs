@@ -61,50 +61,18 @@ pub struct FfmpegNvencEncoder {
     out_buffer: Vec<u8>,
 }
 
+/// Where FFmpeg is looked for first on Windows: `%LOCALAPPDATA%\Litecord\bin`.
+///
+/// Upstream embedded FFmpeg 7.1.1 (six DLLs, about 40 MB) in the executable and unpacked it
+/// into this directory. The fork does not carry those binaries, so nothing is unpacked any
+/// more: the directory is used when it exists, either left by an upstream build or filled by
+/// hand with avcodec-61.dll, avutil-59.dll, swresample-5.dll, swscale-8.dll, w32-pthreads.dll
+/// and zlib.dll from an FFmpeg 7 shared build. The other candidate directories follow it.
 #[cfg(target_os = "windows")]
-fn ensure_embedded_ffmpeg_extracted() -> Option<std::path::PathBuf> {
-    const AVCODEC_61_BYTES: &[u8] = include_bytes!("../../avcodec-61.dll");
-    const AVUTIL_59_BYTES: &[u8] = include_bytes!("../../avutil-59.dll");
-    const SWRESAMPLE_5_BYTES: &[u8] = include_bytes!("../../swresample-5.dll");
-    const SWSCALE_8_BYTES: &[u8] = include_bytes!("../../swscale-8.dll");
-    const W32_PTHREADS_BYTES: &[u8] = include_bytes!("../../w32-pthreads.dll");
-    const ZLIB_BYTES: &[u8] = include_bytes!("../../zlib.dll");
-
-    let base_dir = std::env::var("LOCALAPPDATA")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-
-    let target_dir = base_dir.join("Litecord").join("bin");
-    if let Err(e) = std::fs::create_dir_all(&target_dir) {
-        warn!("⚠️ [EMBEDDED FFMPEG] Falha ao criar diretório {}: {}", target_dir.display(), e);
-        return None;
-    }
-
-    let files: &[(&str, &[u8])] = &[
-        ("zlib.dll", ZLIB_BYTES),
-        ("w32-pthreads.dll", W32_PTHREADS_BYTES),
-        ("swresample-5.dll", SWRESAMPLE_5_BYTES),
-        ("swscale-8.dll", SWSCALE_8_BYTES),
-        ("avutil-59.dll", AVUTIL_59_BYTES),
-        ("avcodec-61.dll", AVCODEC_61_BYTES),
-    ];
-
-    for (name, bytes) in files {
-        let dest = target_dir.join(name);
-        let need_write = match std::fs::metadata(&dest) {
-            Ok(meta) => meta.len() != bytes.len() as u64,
-            Err(_) => true,
-        };
-        if need_write {
-            if let Err(e) = std::fs::write(&dest, bytes) {
-                warn!("⚠️ [EMBEDDED FFMPEG] Falha ao extrair {}: {}", dest.display(), e);
-                return None;
-            }
-        }
-    }
-
-    info!("📦 [EMBEDDED FFMPEG] Dependências FFmpeg autônomas verificadas em: {}", target_dir.display());
-    Some(target_dir)
+fn local_ffmpeg_dir() -> Option<std::path::PathBuf> {
+    let base_dir = std::env::var("LOCALAPPDATA").map(std::path::PathBuf::from).ok()?;
+    let dir = base_dir.join("Litecord").join("bin");
+    dir.is_dir().then_some(dir)
 }
 
 impl FfmpegNvencEncoder {
@@ -116,8 +84,8 @@ impl FfmpegNvencEncoder {
             let (avcodec_dll, avutil_dll, get_proc_codec, get_proc_util) = {
                 let mut candidate_dirs: Vec<std::path::PathBuf> = Vec::new();
 
-                if let Some(embedded_dir) = ensure_embedded_ffmpeg_extracted() {
-                    candidate_dirs.push(embedded_dir);
+                if let Some(local_dir) = local_ffmpeg_dir() {
+                    candidate_dirs.push(local_dir);
                 }
 
                 if let Ok(exe_path) = std::env::current_exe() {
