@@ -43,13 +43,38 @@
 //!   after its pipeline has stopped.
 //! - pipewiresrc waits up to 30 s inside its state change when the PipeWire stream does not
 //!   start, so the state change runs on its own thread and `begin` keeps its own deadline.
-//! - When the source renegotiates (a shared window is resized) PipeWire takes its buffers
-//!   away, unmapping memory that pictures still on their way to vapostproc point into, and
-//!   the keepalive goes on pushing the last one: a crash in vapostproc's upload.
+//! - When the source renegotiates (a synthetic one changing its size) PipeWire takes its
+//!   buffers away, unmapping memory that pictures still on their way to vapostproc point
+//!   into, and the keepalive goes on pushing the last one: a crash in vapostproc's upload.
 //!   `on-disconnect=error` makes pipewiresrc send flush-start first (which waits for the
 //!   picture being converted) and then report an error; from that flush on nothing more is
 //!   taken from the source and the stream is given up. The gst-launch capture follows such
 //!   changes, so the share goes on there.
+//! - A shared window is not such a source. Mutter (GNOME 51, RecordWindow, what the portal
+//!   uses) gives a window's stream the size of the window's monitor once and for all and
+//!   never renegotiates: each buffer carries the window's rectangle in it (PipeWire's crop
+//!   region; pipewiresrc makes it a GstVideoCropMeta). Resizing in one step or as a drag
+//!   does (sizes 3-16 ms apart), maximising and back, fullscreen on either monitor and back,
+//!   minimising and another window on top change that rectangle at most and nothing else:
+//!   same connection, same buffers, same format, no gap (the longest between two access
+//!   units was 92 ms). Only closing the window ends the stream, as a source that is gone.
+//!   (Bringing a minimised window back could not be tried without a person: Wayland lets
+//!   no client do it.) vapostproc takes the
+//!   rectangle as its input region, but where it puts the picture in the frame comes from
+//!   the format alone, so a window of another shape than its monitor came out stretched
+//!   over the whole frame. `add_gate` tells vapostproc the window's shape with a format of
+//!   its own in front of each picture that has a new one (see there), and the bars follow
+//!   (`rect_generation`). The shape told is the window's to within two pixels: the one
+//!   whose bars are an even number of pixels wide (`even_fit`), a window having any size
+//!   and an odd edge being a coloured line in NV12. At a change in one step Mutter now and
+//!   then sends one buffer whose rectangle is a frame ahead of its contents; the gate
+//!   leaves the first buffer of a much different size out (see there). A minimised window
+//!   goes on being drawn into its DMABuf stream, after 0.3 s of black while Mutter
+//!   animates. gst-launch knows nothing of the rectangle: it shows the whole monitor-sized
+//!   buffer, the window small in its top left corner. So the capture a window share falls
+//!   back to, or is kept on, is that pipeline inside this process with a videocrop that
+//!   follows the rectangle (`linux_portal::WindowCapture`). In system memory Mutter also
+//!   draws its own maximise and restore animations into the stream (about 0.3 s each).
 //! - Mutter renegotiates the very same format right after the stream first starts, about
 //!   one start in ten. No picture has been handed out then, so that one is let pass.
 //! - `path=N` is only a wish: with the node gone, the session manager links the stream to
@@ -302,6 +327,10 @@ pub struct Stats {
     pub bars_painted: u64,
     pub bars_us: u64,
     pub bars_failed: u64,
+    /// Times vapostproc was told a new shape of the picture (a shared window resized), and
+    /// the microseconds it took over that in all.
+    pub shape_changes: u64,
+    pub shape_us: u64,
 }
 
 /// One access unit with what is known about its picture.
@@ -352,6 +381,16 @@ struct Shared {
     /// first format), and the stream's frame.
     source_size: AtomicU64,
     frame: (u32, u32),
+    /// A size of the shape vapostproc was told for a shared window (`even_fit`), which is
+    /// what its place in the frame follows from; 0 for pictures that fill their buffers.
+    shape_size: AtomicU64,
+    /// Counts the changes of the picture's rectangle in the frame (never 0): bars painted
+    /// around one rectangle are of no use around the next.
+    rect_generation: AtomicU64,
+    /// vapostproc did not take the format that goes with a picture of a new shape.
+    shape_refused: AtomicBool,
+    shape_changes: AtomicU64,
+    shape_us: AtomicU64,
     bars_painted: AtomicU64,
     bars_us: AtomicU64,
     bars_failed: AtomicU64,
@@ -391,7 +430,8 @@ impl Shared {
     /// Where the picture lies in the stream's frame: all of it until the source's size is
     /// known, and whenever the two have the same shape.
     fn picture_rect(&self) -> (u32, u32, u32, u32) {
-        let source = self.source_size.load(Ordering::Relaxed);
+        let shape = self.shape_size.load(Ordering::Relaxed);
+        let source = if shape != 0 { shape } else { self.source_size.load(Ordering::Relaxed) };
         picture_rect(((source >> 32) as u32, source as u32), self.frame)
     }
 }
@@ -502,15 +542,16 @@ pub fn enabled() -> Result<(), String> {
     Ok(())
 }
 
-/// Whether this share is captured here, with the reason logged when it is not. A shared
-/// window changes size whenever the user resizes it and each change ends the GPU capture
-/// (see the module's notes); what a resize does to DMABuf pictures from a real compositor
-/// is untried, so windows stay with the gst-launch capture unless
-/// `LITECORD_VAAPI_CAPTURE_WINDOWS=1`.
+/// Whether this share is captured here, with the reason logged when it is not. Shared
+/// windows are: resized, maximised, made fullscreen or minimised, a window of Mutter's
+/// keeps its stream and only the picture's place in the frame follows (see the module's
+/// notes; run against real windows with `test_vaapi_capture --source mutter-window`).
+/// `LITECORD_VAAPI_CAPTURE_WINDOWS=0` keeps windows off it, on the capture in system memory
+/// (`linux_portal::WindowCapture`).
 pub fn allowed(window: bool) -> bool {
     let reason = match enabled() {
         Err(why) => why,
-        Ok(()) if window && std::env::var("LITECORD_VAAPI_CAPTURE_WINDOWS").as_deref() != Ok("1") => "janela compartilhada; LITECORD_VAAPI_CAPTURE_WINDOWS=1 para experimentar".into(),
+        Ok(()) if window && std::env::var("LITECORD_VAAPI_CAPTURE_WINDOWS").as_deref() == Ok("0") => "janela compartilhada e LITECORD_VAAPI_CAPTURE_WINDOWS=0".into(),
         Ok(()) => return true,
     };
     info!("🎯 [VAAPI] Captura na GPU desativada ({}); usando a captura por gst-launch", reason);
@@ -633,7 +674,12 @@ impl Stream {
             source_delay_us: AtomicU64::new(0),
             source_delay_max_us: AtomicU64::new(0),
             source_size: AtomicU64::new(0),
+            shape_size: AtomicU64::new(0),
             frame: (width, height),
+            rect_generation: AtomicU64::new(1),
+            shape_refused: AtomicBool::new(false),
+            shape_changes: AtomicU64::new(0),
+            shape_us: AtomicU64::new(0),
             bars_painted: AtomicU64::new(0),
             bars_us: AtomicU64::new(0),
             bars_failed: AtomicU64::new(0),
@@ -748,9 +794,9 @@ impl Stream {
 
         let caps = filter.static_pad("src").and_then(|p| p.current_caps()).ok_or("sem caps negociadas")?;
         self.dmabuf = caps.features(0).is_some_and(|f| f.contains("memory:DMABuf"));
-        if let Some(s) = caps.structure(0) {
-            self.source_size = (s.get::<i32>("width").unwrap_or(0) as u32, s.get::<i32>("height").unwrap_or(0) as u32);
-        }
+        // (The pictures' own size: a shared window's, not that of the frame it comes in.)
+        let picture = self.shared.source_size.load(Ordering::Relaxed);
+        self.source_size = ((picture >> 32) as u32, picture as u32);
         self.source_caps = caps.to_string();
         let relabelled = self.chain().pipeline.by_name("cap_set").and_then(|e| e.static_pad("src")).and_then(|p| p.current_caps());
         self.converter_caps = relabelled.map(|c| c.to_string()).unwrap_or_default();
@@ -1121,6 +1167,10 @@ impl Stream {
             // Pictures with whatever the surfaces held around them: not to be shown.
             return Err("as barras em volta da imagem não puderam ser pintadas".into());
         }
+        if self.shared.shape_refused.load(Ordering::Relaxed) {
+            // Pictures that would be stretched over the frame: not shown either.
+            return Err("o vapostproc recusou o formato da imagem depois de uma mudança de tamanho".into());
+        }
         let now = self.shared.now_ms();
         if now.saturating_sub(self.shared.last_check_ms.swap(now, Ordering::Relaxed)) > CHECK_GAP.as_millis() as u64 {
             // Nobody looked for a while: this process did not run, and neither did the
@@ -1161,7 +1211,10 @@ impl Stream {
             source_caps: self.source_caps.clone(),
             converter_caps: self.converter_caps.clone(),
             dmabuf: self.dmabuf,
-            source_size: self.source_size,
+            source_size: {
+                let picture = load(&self.shared.source_size);
+                ((picture >> 32) as u32, picture as u32)
+            },
             early_renegotiations: load(&self.shared.early_renegotiations),
             buffers: load(&self.shared.buffers),
             pictures: load(&self.shared.pictures),
@@ -1183,6 +1236,8 @@ impl Stream {
             bars_painted: load(&self.shared.bars_painted),
             bars_us: load(&self.shared.bars_us),
             bars_failed: load(&self.shared.bars_failed),
+            shape_changes: load(&self.shared.shape_changes),
+            shape_us: load(&self.shared.shape_us),
         }
     }
 }
@@ -1341,6 +1396,48 @@ fn add_arrival_probe(after: &gst::Element, shared: &Arc<Shared>) -> Result<(), S
     Ok(())
 }
 
+/// The pixel shape that makes a frame of `frame` size as wide, for its height, as a picture of
+/// `picture` size with square pixels is: what vapostproc is told so that a picture which is
+/// only a part of its buffer (a shared window) keeps its shape. `None` for sizes that make
+/// no fraction.
+fn pixel_shape(picture: (u32, u32), frame: (u32, u32)) -> Option<(i32, i32)> {
+    if picture == frame {
+        return Some((1, 1));
+    }
+    let (mut n, mut d) = (picture.0 as u64 * frame.1 as u64, picture.1 as u64 * frame.0 as u64);
+    if n == 0 || d == 0 {
+        return None;
+    }
+    let (mut a, mut b) = (n, d);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    n /= a;
+    d /= a;
+    Some((i32::try_from(n).ok()?, i32::try_from(d).ok()?))
+}
+
+/// A size of the shape a shared window is shown in: its own, but for a bar on each side that
+/// is an even number of pixels wide. In NV12 two rows and two columns share their colour:
+/// at an odd edge the bar's first line takes the picture's colour and the picture's own
+/// first line loses it, a coloured line for as long as the window keeps that size (and a
+/// window has any size). The picture is at most two pixels wider or narrower for it.
+fn even_fit(picture: (u32, u32), frame: (u32, u32)) -> (u32, u32) {
+    let (_, _, w, h) = picture_rect(picture, frame);
+    let even = |fit: u32, full: u32| {
+        let gap = full - fit;
+        let gap = match gap % 4 {
+            0 => gap,
+            1 => gap - 1,
+            3 => gap + 1,
+            _ if fit > 2 => gap + 2,
+            _ => gap - 2,
+        };
+        full - gap
+    };
+    (even(w, frame.0), even(h, frame.1))
+}
+
 /// What goes into vapostproc, and what for. To the encoder: nothing while nobody watches;
 /// new pictures at most `fps` times a second (the monitor may refresh faster); the last
 /// picture again every 100 ms while the screen is still, and at once when a keyframe waits
@@ -1353,11 +1450,15 @@ fn add_gate(queue: &gst::Element, shared: &Arc<Shared>, fps: u32, postproc: gst:
         due: Instant,
         preview_picture: u64,
         last_preview: Instant,
+        /// The size of the part of the last buffer that was its picture, and whether that
+        /// buffer was left out for it.
+        crop: Option<(u32, u32)>,
+        withheld: bool,
     }
     let shared = shared.clone();
     let interval = Duration::from_nanos(1_000_000_000 / fps as u64);
     let start = Instant::now();
-    let gate = Mutex::new(Gate { last_picture: 0, last_pass: start, due: start, preview_picture: 0, last_preview: start.checked_sub(PREVIEW_STILL_EVERY).unwrap_or(start) });
+    let gate = Mutex::new(Gate { last_picture: 0, last_pass: start, due: start, preview_picture: 0, last_preview: start.checked_sub(PREVIEW_STILL_EVERY).unwrap_or(start), crop: None, withheld: false });
     let pad = queue.static_pad("src").ok_or("pad src ausente")?;
     // While a new encoder is linked in, its request to negotiate again ends here: passed
     // on, pipewiresrc would reconnect its stream (see the module's notes). vapostproc has
@@ -1376,28 +1477,72 @@ fn add_gate(queue: &gst::Element, shared: &Arc<Shared>, fps: u32, postproc: gst:
     // format is taken here, on the thread that carries the pictures through vapostproc to
     // the encoder's door and right before vapostproc gets it: every picture of the format
     // before has had its bars by then, painted around its own rectangle.
-    let on_caps = shared.clone();
+    //
+    // A shared window does not come as pictures of its own size: Mutter's stream keeps the
+    // size of the window's monitor for good, and each picture says which part of it is the
+    // window (PipeWire's crop region, a GstVideoCropMeta here). vapostproc takes that part
+    // and scales it to wherever the *format* says the picture goes, so a window of another
+    // shape than its monitor would be stretched over the frame. The format vapostproc is
+    // given therefore names the pixel shape that makes the whole frame as wide as the
+    // window is (`Shape::told`): it then leaves the same bars as for a source of the
+    // window's size. A new shape is a new format event from here, in front of the picture
+    // that has it: nothing upstream hears of it, the encoder's format stays, and vapostproc
+    // takes about a millisecond over it (0.99 ms each over 160 shapes of two dragged resizes).
+    struct Shape {
+        /// The format as pipewiresrc negotiated it, and its size.
+        caps: gst::Caps,
+        size: (u32, u32),
+        /// The pixel shape vapostproc was last told.
+        told: (i32, i32),
+    }
+    let shape: Arc<Mutex<Option<Shape>>> = Arc::new(Mutex::new(None));
+    // The format event passing is this probe's own.
+    let own_event = Arc::new(AtomicBool::new(false));
+    let (on_caps, on_caps_shape, on_caps_own, on_caps_postproc) = (shared.clone(), shape.clone(), own_event.clone(), postproc.clone());
     pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        if on_caps_own.load(Ordering::SeqCst) {
+            return gst::PadProbeReturn::Ok;
+        }
         if let Some(gst::PadProbeData::Event(event)) = &info.data {
             if let gst::EventView::Caps(caps) = event.view() {
-                let size = caps.caps().structure(0).map(|s| (s.get::<i32>("width").unwrap_or(0).max(0) as u64, s.get::<i32>("height").unwrap_or(0).max(0) as u64));
-                let (w, h) = size.unwrap_or((0, 0));
-                on_caps.source_size.store(w << 32 | h, Ordering::Relaxed);
+                let structure = caps.caps().structure(0);
+                let size = structure.map(|s| (s.get::<i32>("width").unwrap_or(0).max(0) as u32, s.get::<i32>("height").unwrap_or(0).max(0) as u32)).unwrap_or((0, 0));
+                let par = structure.and_then(|s| s.get::<gst::Fraction>("pixel-aspect-ratio").ok()).map(|f| (f.numer(), f.denom())).unwrap_or((1, 1));
+                *lock(&on_caps_shape) = Some(Shape { caps: caps.caps_owned(), size, told: par });
+                on_caps.source_size.store((size.0 as u64) << 32 | size.1 as u64, Ordering::Relaxed);
+                on_caps.shape_size.store(0, Ordering::Relaxed);
+                on_caps.rect_generation.fetch_add(1, Ordering::Relaxed);
                 let rect = on_caps.picture_rect();
                 // (set_property panics on a property that is not there; the pipeline's
                 // description named it, so it is.)
-                if postproc.find_property("add-borders").is_some() {
-                    postproc.set_property("add-borders", (rect.2, rect.3) != on_caps.frame);
+                if on_caps_postproc.find_property("add-borders").is_some() {
+                    on_caps_postproc.set_property("add-borders", (rect.2, rect.3) != on_caps.frame);
                 }
             }
         }
         gst::PadProbeReturn::Ok
     })
     .ok_or("probe não instalado")?;
-    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+    pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
         let Some(buffer) = info.buffer() else { return gst::PadProbeReturn::Ok };
         let Some(pts) = buffer.pts() else { return gst::PadProbeReturn::Drop };
+        // The part of the buffer that is the picture, when the buffer says so.
+        let crop = buffer.meta::<gst_video::VideoCropMeta>().map(|meta| meta.rect()).filter(|r| r.2 > 0 && r.3 > 0).map(|r| (r.2, r.3));
         let mut gate = lock(&gate);
+        // When a window changes size in one step (maximised, restored, out of fullscreen)
+        // Mutter now and then hands over one buffer whose rectangle is a frame ahead of
+        // what is drawn in it: the old small window in a corner of black, or a corner of the
+        // old large one, for one picture (6 of 34 such changes). The first buffer of a much
+        // different size is therefore left out. The next passes whatever its size (a drag in
+        // large steps loses every other picture at most), and so does this one when the
+        // keepalive brings it again because nothing followed.
+        let far = |a: u32, b: u32| a.abs_diff(b) * 10 > a.max(b);
+        let jump = matches!((gate.crop, crop), (Some(before), Some(now)) if far(before.0, now.0) || far(before.1, now.1));
+        gate.crop = crop;
+        gate.withheld = jump && !gate.withheld;
+        if gate.withheld {
+            return gst::PadProbeReturn::Drop;
+        }
         let now = Instant::now();
         let picture = buffer.offset();
 
@@ -1436,6 +1581,45 @@ fn add_gate(queue: &gst::Element, shared: &Arc<Shared>, fps: u32, postproc: gst:
         }
         if !encode && !preview {
             return gst::PadProbeReturn::Drop;
+        }
+        // This picture goes into vapostproc: told its shape first, when that is a new one.
+        let new_format = {
+            let mut shape = lock(&shape);
+            shape.as_mut().and_then(|shape| {
+                let picture = crop.unwrap_or(shape.size);
+                // (A part of the buffer is shown in a shape with even bars; a picture that
+                // is its whole buffer, a monitor, as before.)
+                let shown = crop.map(|picture| even_fit(picture, shared.frame));
+                let wanted = pixel_shape(shown.unwrap_or(picture), shape.size)?;
+                shared.source_size.store((picture.0 as u64) << 32 | picture.1 as u64, Ordering::Relaxed);
+                shared.shape_size.store(shown.map_or(0, |s| (s.0 as u64) << 32 | s.1 as u64), Ordering::Relaxed);
+                if wanted == shape.told {
+                    // (Another size of the same shape: the same place in the frame.)
+                    return None;
+                }
+                shape.told = wanted;
+                let mut caps = shape.caps.clone();
+                caps.make_mut().set("pixel-aspect-ratio", gst::Fraction::new(wanted.0, wanted.1));
+                Some(caps)
+            })
+        };
+        if let Some(caps) = new_format {
+            shared.rect_generation.fetch_add(1, Ordering::Relaxed);
+            let rect = shared.picture_rect();
+            if postproc.find_property("add-borders").is_some() {
+                postproc.set_property("add-borders", (rect.2, rect.3) != shared.frame);
+            }
+            let told_at = Instant::now();
+            own_event.store(true, Ordering::SeqCst);
+            let taken = pad.push_event(gst::event::Caps::new(&caps));
+            own_event.store(false, Ordering::SeqCst);
+            shared.shape_changes.fetch_add(1, Ordering::Relaxed);
+            shared.shape_us.fetch_add(told_at.elapsed().as_micros() as u64, Ordering::Relaxed);
+            if !taken {
+                // Stretched over the frame it would be: `health` gives the stream up.
+                shared.shape_refused.store(true, Ordering::Relaxed);
+                return gst::PadProbeReturn::Drop;
+            }
         }
         let mut decisions = lock(&shared.decisions);
         // Never long: vapostproc hands each picture on before it takes the next.
@@ -1529,7 +1713,8 @@ fn add_encoder_probe(encoder_input: &gst::Element, shared: &Arc<Shared>, preview
 
 /// Paints the bars of a picture fresh out of vapostproc, unless its surface already has them:
 /// the surface's memory object, which the buffer pool hands out again with the surface,
-/// carries the rectangle its bars were painted around.
+/// carries the number of the rectangle its bars were painted around (`rect_generation`:
+/// when the rectangle changes, every surface is painted anew the next time it comes).
 fn paint_new_surface(pad: &gst::Pad, buffer: &mut gst::Buffer, rect: (u32, u32, u32, u32), shared: &Shared) -> bool {
     use gst::glib::translate::IntoGlib;
     static PAINTED: std::sync::OnceLock<gst::glib::Quark> = std::sync::OnceLock::new();
@@ -1537,8 +1722,10 @@ fn paint_new_surface(pad: &gst::Pad, buffer: &mut gst::Buffer, rect: (u32, u32, 
     if buffer.n_memory() == 0 {
         return true;
     }
-    // Never 0: the picture has a width.
-    let mark = ((rect.0 as usize) << 48 | (rect.1 as usize) << 32 | (rect.2 as usize) << 16 | rect.3 as usize) as gst::glib::ffi::gpointer;
+    // Never 0. Not the rectangle itself: a surface painted for one rectangle, then filled by
+    // a picture without bars (the window maximised), then used for the first rectangle
+    // again (restored) would keep that picture where its bars belong.
+    let mark = shared.rect_generation.load(Ordering::Relaxed) as usize as gst::glib::ffi::gpointer;
     let memory = buffer.peek_memory(0).as_ptr() as *mut gst::ffi::GstMiniObject;
     // (The memory outlives this call: the buffer holds it.)
     if unsafe { gst::ffi::gst_mini_object_get_qdata(memory, quark) } == mark {

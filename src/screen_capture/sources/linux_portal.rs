@@ -91,14 +91,25 @@ pub fn picture_rect(source: (u32, u32), frame: (u32, u32)) -> (u32, u32, u32, u3
 /// size changes while it is shared, so a window always gets the bars.
 #[cfg(target_os = "linux")]
 pub fn gst_launch_capture_args(source: &[String], dst_w: u32, dst_h: u32, target_fps: u64, monitor: Option<(u32, u32)>) -> Vec<String> {
+    capture_pipeline(source, dst_w, dst_h, target_fps, monitor, false)
+}
+
+/// `gst_launch_capture_args`, or with `window` the same pipeline as `WindowCapture` runs it
+/// inside this process: a videocrop in front of the conversion (`win_crop`) and an appsink
+/// in place of the pipe (`win_sink`).
+#[cfg(target_os = "linux")]
+fn capture_pipeline(source: &[String], dst_w: u32, dst_h: u32, target_fps: u64, monitor: Option<(u32, u32)>, window: bool) -> Vec<String> {
     let whole = (0, 0, dst_w, dst_h);
     let fill = monitor.is_some_and(|size| letterbox(size, (dst_w, dst_h)) != whole && picture_rect(size, (dst_w, dst_h)) == whole);
     let (square, scale): (&str, &[&str]) = if fill { ("", &["videoscale"]) } else { (",pixel-aspect-ratio=1/1", &["videoscale", "add-borders=true"]) };
-    let mut args = vec!["-q".to_string(), "pipewiresrc".to_string()];
+    let mut args = if window { vec!["pipewiresrc".to_string()] } else { vec!["-q".to_string(), "pipewiresrc".to_string()] };
     args.extend(source.iter().cloned());
     args.extend(["do-timestamp=true", "!"].map(String::from));
     if !fill {
         args.extend(["video/x-raw,pixel-aspect-ratio=1/1", "!"].map(String::from));
+    }
+    if window {
+        args.extend(["videocrop", "name=win_crop", "!"].map(String::from));
     }
     args.extend(["videoconvert", "n-threads=4", "!"].map(String::from));
     args.extend(scale.iter().map(|s| s.to_string()));
@@ -109,8 +120,122 @@ pub fn gst_launch_capture_args(source: &[String], dst_w: u32, dst_h: u32, target
     } else {
         args.push(frame);
     }
-    args.extend(["!", "queue", "max-size-buffers=1", "max-size-bytes=0", "max-size-time=0", "leaky=downstream", "!", "fdsink", "fd=1", "sync=false"].map(String::from));
+    if window {
+        args.extend(["!", "appsink", "name=win_sink", "sync=false", "max-buffers=1", "drop=true"].map(String::from));
+    } else {
+        args.extend(["!", "queue", "max-size-buffers=1", "max-size-bytes=0", "max-size-time=0", "leaky=downstream", "!", "fdsink", "fd=1", "sync=false"].map(String::from));
+    }
     args
+}
+
+/// The capture that is not on the GPU, for a shared window: the gst-launch capture's
+/// pipeline inside this process. Mutter gives a window's stream the size of the window's
+/// monitor and says in each buffer which part of it is the window (a GstVideoCropMeta; see
+/// the notes of `linux_gpu_tx`). No element that gst-launch could run in system memory
+/// takes that part out, so gst-launch shows the whole buffer: the window small in the top
+/// left corner of a black, transparent frame. Here a probe reads each buffer's rectangle
+/// and sets it on a videocrop in front of the conversion, which renegotiates behind itself
+/// for that very buffer; videoscale then puts the window where the GPU capture puts it
+/// (`letterbox`). A source without the rectangle passes whole.
+#[cfg(all(target_os = "linux", feature = "vaapi"))]
+pub struct WindowCapture {
+    pipeline: gstreamer::Pipeline,
+    sink: gstreamer_app::AppSink,
+}
+
+#[cfg(all(target_os = "linux", feature = "vaapi"))]
+impl WindowCapture {
+    /// `source`: pipewiresrc properties, as for `gst_launch_capture_args`.
+    pub fn start(source: &[String], dst_w: u32, dst_h: u32, target_fps: u64) -> Result<Self, String> {
+        use gstreamer as gst;
+        use gstreamer::prelude::*;
+        use gstreamer_video as gst_video;
+        gst::init().map_err(|e| format!("GStreamer: {e}"))?;
+        let args = capture_pipeline(source, dst_w, dst_h, target_fps, None, true);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let pipeline = gst::parse::launchv(&args).map_err(|e| format!("pipeline: {e}"))?.downcast::<gst::Pipeline>().map_err(|_| "não é um pipeline")?;
+        let crop = pipeline.by_name("win_crop").ok_or("sem videocrop")?;
+        let sink = pipeline.by_name("win_sink").and_then(|e| e.downcast::<gstreamer_app::AppSink>().ok()).ok_or("sem appsink")?;
+        let pad = crop.static_pad("sink").ok_or("sem pad")?;
+        // (left, top, right, bottom) as videocrop has them.
+        let set = std::sync::Mutex::new((0i32, 0i32, 0i32, 0i32));
+        pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+            let Some(buffer) = info.buffer() else { return gst::PadProbeReturn::Ok };
+            let size = pad.current_caps().and_then(|c| c.structure(0).map(|s| (s.get::<i32>("width").unwrap_or(0) as i64, s.get::<i32>("height").unwrap_or(0) as i64)));
+            let Some((w, h)) = size.filter(|s| s.0 > 0 && s.1 > 0) else { return gst::PadProbeReturn::Ok };
+            let rect = buffer.meta::<gst_video::VideoCropMeta>().map(|meta| meta.rect()).filter(|r| r.2 > 0 && r.3 > 0);
+            let wanted = match rect {
+                Some((x, y, cw, ch)) => {
+                    // (Kept inside the buffer whatever the compositor says.)
+                    let (x, y) = ((x as i64).min(w - 1), (y as i64).min(h - 1));
+                    let (cw, ch) = ((cw as i64).min(w - x), (ch as i64).min(h - y));
+                    (x as i32, y as i32, (w - x - cw) as i32, (h - y - ch) as i32)
+                }
+                None => (0, 0, 0, 0),
+            };
+            let mut set = set.lock().unwrap_or_else(|e| e.into_inner());
+            if *set != wanted {
+                // On the thread that carries this buffer into videocrop: its new format is
+                // negotiated before the buffer is cropped.
+                *set = wanted;
+                crop.set_property("left", wanted.0);
+                crop.set_property("top", wanted.1);
+                crop.set_property("right", wanted.2);
+                crop.set_property("bottom", wanted.3);
+            }
+            gst::PadProbeReturn::Ok
+        })
+        .ok_or("probe não instalado")?;
+        pipeline.set_state(gst::State::Playing).map_err(|e| format!("o pipeline não iniciou: {e}"))?;
+        Ok(Self { pipeline, sink })
+    }
+
+    /// The next frame, BGRA and opaque, into `frame`. False when the capture has ended (the
+    /// window was closed, the pipeline failed) or `wanted` says that the share has.
+    pub fn read(&self, frame: &mut [u8], wanted: &dyn Fn() -> bool) -> bool {
+        use gstreamer as gst;
+        use gstreamer::prelude::*;
+        loop {
+            if !wanted() {
+                return false;
+            }
+            let Some(sample) = self.sink.try_pull_sample(gst::ClockTime::from_mseconds(100)) else {
+                if self.sink.is_eos() {
+                    return false;
+                }
+                if let Some(error) = self.pipeline.bus().and_then(|bus| bus.pop_filtered(&[gst::MessageType::Error])) {
+                    if let gst::MessageView::Error(e) = error.view() {
+                        log::warn!("🎬 [GStreamer] captura da janela encerrada: {}", e.error());
+                    }
+                    return false;
+                }
+                continue;
+            };
+            let Some(Ok(map)) = sample.buffer().map(|b| b.map_readable()) else { return false };
+            if map.len() != frame.len() {
+                return false;
+            }
+            frame.copy_from_slice(&map);
+            // (Around the window Mutter leaves the buffer transparent, and a window has
+            // transparent corners: the UI would blend its preview with what is behind.)
+            for pixel in frame.chunks_exact_mut(4) {
+                pixel[3] = 255;
+            }
+            return true;
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "vaapi"))]
+impl Drop for WindowCapture {
+    fn drop(&mut self) {
+        use gstreamer::prelude::*;
+        // (pipewiresrc may wait inside its state change: not on the caller's thread.)
+        let pipeline = self.pipeline.clone();
+        let _ = std::thread::Builder::new().name("window-capture-stop".into()).spawn(move || {
+            let _ = pipeline.set_state(gstreamer::State::Null);
+        });
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -323,6 +448,33 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
             let monitor = stream.size().filter(|_| stream.source_type() == Some(SourceType::Monitor)).map(|(w, h)| (w.max(0) as u32, h.max(0) as u32));
             let gst_args = gst_launch_capture_args(&[format!("fd={}", raw_fd), format!("path={}", node_id)], dst_w, dst_h, target_fps, monitor);
 
+            // A shared window: the same pipeline inside this process, which takes the
+            // window out of the monitor-sized buffer (`WindowCapture`); gst-launch when
+            // that does not start.
+            #[cfg(feature = "vaapi")]
+            let window_capture = if stream.source_type() == Some(SourceType::Window) {
+                // (pipewiresrc closes the connection it is given: a copy of it.)
+                let own_fd = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 3) };
+                match WindowCapture::start(&[format!("fd={}", own_fd), format!("path={}", node_id)], dst_w, dst_h, target_fps) {
+                    Ok(capture) => {
+                        log::info!("🔧 Captura da janela no processo (videocrop pelo retângulo de cada quadro), sem gst-launch");
+                        Some(capture)
+                    }
+                    Err(e) => {
+                        log::warn!("⚠️ A captura da janela no processo não iniciou ({}); usando gst-launch", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            #[cfg(feature = "vaapi")]
+            let in_process = window_capture.is_some();
+            #[cfg(not(feature = "vaapi"))]
+            let in_process = false;
+
+            let mut stdout = None;
+            if !in_process {
             log::info!("🔧 GStreamer pipeline args: {:?}", gst_args);
 
             let mut child = match Command::new("gst-launch-1.0")
@@ -359,8 +511,8 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
                     .ok();
             }
 
-            let mut stdout = match child.stdout.take() {
-                Some(s) => s,
+            stdout = match child.stdout.take() {
+                Some(s) => Some(s),
                 None => {
                     let _ = session.close().await;
                     PORTAL_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -375,6 +527,14 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
                 }
                 *lock = Some(child);
             }
+            }
+            let mut next_frame = |frame: &mut [u8]| -> bool {
+                #[cfg(feature = "vaapi")]
+                if let Some(capture) = &window_capture {
+                    return capture.read(frame, &|| PORTAL_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed));
+                }
+                stdout.as_mut().is_some_and(|s| s.read_exact(frame).is_ok())
+            };
 
             let mut raw_buf = vec![0u8; frame_size];
             let mut pw_frame_count = 0u64;
@@ -384,7 +544,7 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
 
             log::info!("⏳ Aguardando primeiro quadro do GStreamer PipeWire (timeout 10s)...");
 
-            while PORTAL_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) && stdout.read_exact(&mut raw_buf).is_ok() {
+            while PORTAL_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) && next_frame(&mut raw_buf) {
                 if !got_first_frame {
                     got_first_frame = true;
                     log::info!("✅ Primeiro quadro do GStreamer PipeWire recebido com sucesso!");

@@ -23,7 +23,7 @@ mod harness {
     use litecord::encoder::{create_best_encoder, VideoEncoder};
     use litecord::screen_capture::hw_decode::h264_state::nal_ranges;
     use litecord::screen_capture::linux_gpu_tx as gpu;
-    use litecord::screen_capture::sources::linux_portal::{gst_launch_capture_args, PORTAL_LOCAL_CB};
+    use litecord::screen_capture::sources::linux_portal::{gst_launch_capture_args, WindowCapture, PORTAL_LOCAL_CB};
     use litecord::screen_capture::video_pipeline::{decode_video_frame, Decoded, StreamDecoders};
     use litecord::screen_capture::watch::{ProfileChoice, Verdict as WatchVerdict, Viewers, CAP_H264_MAIN};
     use litecord::utils::video_settings::StreamProfile;
@@ -32,6 +32,7 @@ mod harness {
     use std::collections::HashMap;
     use std::io::Read;
     use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -42,7 +43,9 @@ mod harness {
 test_vaapi_capture [options]
   --source S       mutter (default: Mutter ScreenCast RecordMonitor of the primary monitor, cursor
                    embedded, no dialog) | mutter:CONNECTOR | mutter-area:WxH[+X+Y] (RecordArea: a
-                   rectangle of the desktop, for a compositor source of any shape) | node:ID |
+                   rectangle of the desktop, for a compositor source of any shape) |
+                   mutter-window[:ID] (RecordWindow, what the portal does for a shared window:
+                   the window with that Mutter id, or the focused one) | node:ID |
                    synthetic (a `videotestsrc ! pipewiresink` this spawns)
   --src-props STR  synthetic: videotestsrc properties (default \"pattern=ball motion=sweep\")
   --src-size WxH   synthetic: picture size (default 2560x1440)
@@ -88,7 +91,14 @@ test_vaapi_capture [options]
   --end-source S   end the source S seconds into the share (Mutter: Session.Stop, as GNOME's
                    indicator does; synthetic: the provider is killed): the capture must report
                    the source gone and no other source may be taken
-  --as-window      tell the capture the source is a shared window
+  --as-window      tell the capture the source is a shared window (LITECORD_VAAPI_CAPTURE_WINDOWS=0
+                   then keeps it on the gst-launch capture)
+  --window-pipe P  with --window-script: the FIFO a test window reads its commands from
+  --window-script S  SEC:COMMAND;SEC:COMMAND;...: lines written to --window-pipe at those seconds
+                   of the share (size WxH, drag ..., maximize, minimize, close, ...)
+  --au-log FILE    one line per access unit: seconds into the share, its number, bytes, I or P,
+                   the path, and the GPU capture's picture rectangle at that moment
+  --source-must-end  the share is expected to end with its source gone (a closed window)
   --cycles N       stop the share and start it again N times in all (default 1). Not with the
                    synthetic source: its provider stops delivering to anybody once a consumer
                    left mid-stream (plain gst-launch consumers do the same to it)
@@ -118,7 +128,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
 
     impl Args {
         fn parse() -> Result<Self, String> {
-            let flags = ["fd", "legacy", "colours", "no-verify", "verbose", "help", "as-window", "geometry"];
+            let flags = ["fd", "legacy", "colours", "no-verify", "verbose", "help", "as-window", "geometry", "source-must-end"];
             let mut map = HashMap::new();
             let mut it = std::env::args().skip(1);
             while let Some(a) = it.next() {
@@ -197,7 +207,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
 
     impl Mutter {
         /// `area`: (x, y, width, height) of the desktop to record instead of a monitor.
-        fn open(connector: &str, area: Option<(i32, i32, i32, i32)>) -> Result<(Arc<Self>, u32), String> {
+        fn open(connector: &str, area: Option<(i32, i32, i32, i32)>, window: Option<Option<u64>>) -> Result<(Arc<Self>, u32), String> {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
             let (mutter, node) = rt.block_on(async {
                 let e = |e: zbus::Error| format!("Mutter ScreenCast: {e}");
@@ -212,9 +222,16 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 // RecordMonitor only: RecordVirtual would add a monitor to the desktop.
                 let mut props: HashMap<&str, zbus::zvariant::Value> = HashMap::new();
                 props.insert("cursor-mode", zbus::zvariant::Value::U32(1));
-                let reply = match area {
-                    Some((x, y, w, h)) => conn.call_method(Some(MUTTER_BUS), mutter.session.as_str(), Some(session_iface), "RecordArea", &(x, y, w, h, props)).await.map_err(e)?,
-                    None => conn.call_method(Some(MUTTER_BUS), mutter.session.as_str(), Some(session_iface), "RecordMonitor", &(connector, props)).await.map_err(e)?,
+                let reply = match (window, area) {
+                    (Some(id), _) => {
+                        // No id: Mutter takes the focused window.
+                        if let Some(id) = id {
+                            props.insert("window-id", zbus::zvariant::Value::U64(id));
+                        }
+                        conn.call_method(Some(MUTTER_BUS), mutter.session.as_str(), Some(session_iface), "RecordWindow", &(props,)).await.map_err(e)?
+                    }
+                    (None, Some((x, y, w, h))) => conn.call_method(Some(MUTTER_BUS), mutter.session.as_str(), Some(session_iface), "RecordArea", &(x, y, w, h, props)).await.map_err(e)?,
+                    (None, None) => conn.call_method(Some(MUTTER_BUS), mutter.session.as_str(), Some(session_iface), "RecordMonitor", &(connector, props)).await.map_err(e)?,
                 };
                 let stream: zbus::zvariant::OwnedObjectPath = reply.body().deserialize().map_err(e)?;
                 let proxy = zbus::Proxy::new(&conn, MUTTER_BUS, stream.as_str(), "org.gnome.Mutter.ScreenCast.Stream").await.map_err(e)?;
@@ -338,24 +355,52 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
     }
 
     /// linux_portal.rs's gst-launch pipeline and reader loop, on `node`.
-    fn legacy_capture(shared: &LegacyShared, fd: Option<RawFd>, node: u32, size: (u32, u32), fps: u32, monitor: Option<(u32, u32)>, running: &AtomicBool) {
+    fn legacy_capture(shared: &LegacyShared, fd: Option<RawFd>, node: u32, size: (u32, u32), fps: u32, monitor: Option<(u32, u32)>, window: bool, running: &AtomicBool) {
         let (dst_w, dst_h) = size;
         let frame_size = (dst_w * dst_h * 4) as usize;
-        let mut source: Vec<String> = fd.map(|fd| format!("fd={fd}")).into_iter().collect();
+        // (pipewiresrc inside this process closes the connection it is given: a copy.)
+        let window_fd = fd.filter(|_| window).map(|fd| unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) });
+        let mut source: Vec<String> = window_fd.or(fd).map(|fd| format!("fd={fd}")).into_iter().collect();
         // Not in the app's arguments: on the session's own connection (the portal's shows
         // only its node) a node that is gone must not be replaced by another video source.
         source.extend(["stream-properties=props,node.dont-fallback=(string)true".to_string(), format!("path={node}")]);
-        let gst_args = gst_launch_capture_args(&source, dst_w, dst_h, fps as u64, monitor);
-        let spawned = dies_with_us(Command::new("gst-launch-1.0").env_remove("PIPEWIRE_NODE").args(&gst_args).stdout(Stdio::piped()).stderr(Stdio::inherit())).spawn();
-        let mut child = match spawned {
-            Ok(c) => c,
-            Err(e) => return eprintln!("legacy: gst-launch-1.0 did not start: {e}"),
+        // What linux_portal.rs does for a shared window: the pipeline inside this process.
+        let window_capture = if window {
+            match WindowCapture::start(&source, dst_w, dst_h, fps as u64) {
+                Ok(capture) => {
+                    println!("  the window is captured inside this process (videocrop by each buffer's rectangle), no gst-launch");
+                    Some(capture)
+                }
+                Err(e) => return eprintln!("legacy: the in-process window capture did not start: {e}"),
+            }
+        } else {
+            None
         };
-        shared.child_pid.store(child.id(), Ordering::SeqCst);
-        let Some(mut stdout) = child.stdout.take() else { return };
+        let mut child = None;
+        let mut stdout = None;
+        if window_capture.is_none() {
+            let gst_args = gst_launch_capture_args(&source, dst_w, dst_h, fps as u64, monitor);
+            let spawned = dies_with_us(Command::new("gst-launch-1.0").env_remove("PIPEWIRE_NODE").args(&gst_args).stdout(Stdio::piped()).stderr(Stdio::inherit())).spawn();
+            let mut spawned = match spawned {
+                Ok(c) => c,
+                Err(e) => return eprintln!("legacy: gst-launch-1.0 did not start: {e}"),
+            };
+            shared.child_pid.store(spawned.id(), Ordering::SeqCst);
+            stdout = spawned.stdout.take();
+            child = Some(spawned);
+            if stdout.is_none() {
+                return;
+            }
+        }
+        let mut next_frame = |frame: &mut [u8]| -> bool {
+            if let Some(capture) = &window_capture {
+                return capture.read(frame, &|| running.load(Ordering::Relaxed));
+            }
+            stdout.as_mut().is_some_and(|s| s.read_exact(frame).is_ok())
+        };
         let mut raw_buf = vec![0u8; frame_size];
         let mut last_preview = Instant::now() - Duration::from_secs(1);
-        while running.load(Ordering::Relaxed) && stdout.read_exact(&mut raw_buf).is_ok() {
+        while running.load(Ordering::Relaxed) && next_frame(&mut raw_buf) {
             if shared.frames_read.fetch_add(1, Ordering::Relaxed) == 0 {
                 *shared.first_frame_at.lock().unwrap() = Some(Instant::now());
             }
@@ -382,8 +427,10 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 None => *slot = Some(raw_buf.clone()),
             }
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         shared.child_pid.store(0, Ordering::SeqCst);
         *shared.frame.lock().unwrap() = None;
     }
@@ -738,6 +785,11 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         geometry: Option<Geometry>,
         verbose: bool,
         dump_aus: Option<String>,
+        au_log: Option<String>,
+        /// (second, line) written to the test window's command FIFO.
+        window_script: Vec<(f64, String)>,
+        window_pipe: Option<String>,
+        source_must_end: bool,
         helper_pids: Vec<u32>,
     }
 
@@ -854,7 +906,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                     }
                 }
                 if wanted() {
-                    legacy_capture(&legacy, raw(&fd), node, size, fps, monitor, &running);
+                    legacy_capture(&legacy, raw(&fd), node, size, fps, monitor, as_window, &running);
                 }
             })
         }
@@ -979,11 +1031,27 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         let mut printed_caps = false;
         let mut s_label = 0;
         let mut end_source = setup.end_source.clone();
+        let mut window_script: std::collections::VecDeque<(f64, String)> = setup.window_script.iter().cloned().collect();
+        let mut au_log = setup.au_log.as_ref().and_then(|path| std::fs::File::create(path).ok());
+        let mut rect_seen: Option<(u32, u32, u32, u32)> = None;
 
         while !STOP.load(Ordering::Relaxed) {
             let t = share_start.elapsed().as_secs_f64();
             if t >= total_secs {
                 break;
+            }
+            while window_script.front().is_some_and(|(at, _)| t >= *at) {
+                if let Some((_, line)) = window_script.pop_front() {
+                    use std::io::Write;
+                    let sent = setup.window_pipe.as_ref().ok_or("no --window-pipe".to_string()).and_then(|p| std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(p).map_err(|e| e.to_string())).and_then(|mut f| writeln!(f, "{line}").map_err(|e| e.to_string()));
+                    println!("  t={t:.3}s WINDOW: {line}{}", sent.err().map(|e| format!(" (not sent: {e})")).unwrap_or_default());
+                }
+            }
+            if let Some(st) = gpu::stats().filter(|st| rect_seen != Some(st.picture_rect)) {
+                if rect_seen.is_some() || setup.as_window {
+                    println!("  t={t:.3}s the picture is now at {:?} of the frame (bars painted on {} surfaces so far)", st.picture_rect, st.bars_painted);
+                }
+                rect_seen = Some(st.picture_rect);
             }
             if end_source.as_ref().is_some_and(|(at, _)| t >= *at) {
                 if let Some((_, end)) = end_source.take() {
@@ -1033,7 +1101,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
             // Viewers drop a stream after 2.5 s without pictures, whichever path they come from
             // (--end-source takes the pictures away on purpose).
             let fed_at = last_au_at.max(watch_started);
-            if watched && was_watched && !starved && setup.end_source.is_none() && fed_at.is_some_and(|at| at.elapsed() > Duration::from_millis(2500)) {
+            if watched && was_watched && !starved && setup.end_source.is_none() && !setup.source_must_end && fed_at.is_some_and(|at| at.elapsed() > Duration::from_millis(2500)) {
                 starved = true;
                 fails.add(format!("t={t:.2}s: the viewers have been without pictures for 2.5 s"));
             }
@@ -1291,6 +1359,11 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 s_bytes += au.len();
                 totals.aus += 1;
                 totals.bytes += au.len();
+                if let Some(log) = au_log.as_mut() {
+                    use std::io::Write;
+                    let rect = gpu::stats().filter(|_| gpu_path).map(|st| st.picture_rect).unwrap_or_default();
+                    let _ = writeln!(log, "{:.4} {au_index} {} {} {path_now} {} {} {} {}", share_start.elapsed().as_secs_f64(), au.len(), if idr { "I" } else { "P" }, rect.0, rect.1, rect.2, rect.3);
+                }
                 if let Some((stream, index)) = dump.as_mut() {
                     use std::io::Write;
                     let _ = stream.write_all(&au);
@@ -1444,6 +1517,9 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
             if st.bars_failed > 0 {
                 fails.add(format!("the bars of {} surfaces could not be painted", st.bars_failed));
             }
+            if st.shape_changes > 0 {
+                println!("GPU capture: vapostproc was told a new shape of the picture {} times, {:.2} ms each", st.shape_changes, st.shape_us as f64 / 1000.0 / st.shape_changes as f64);
+            }
         }
         println!("{} ms", dist("capture -> access unit in hand (GPU path)", &mut all_lat));
         println!("{} ms", dist("encode() per frame (gst-launch path; excludes the capture pipeline before the pipe)", &mut all_enc));
@@ -1483,7 +1559,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         if let Some(ended) = ended {
             println!("the GPU capture ended as: {ended:?}");
         }
-        if setup.end_source.is_some() {
+        if setup.end_source.is_some() || setup.source_must_end {
             if ended != Some(gpu::Ended::SourceGone) {
                 fails.add(format!("the source was ended but the GPU capture ended as {ended:?}"));
             }
@@ -1743,6 +1819,17 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
             }
             _synthetic = Some(synthetic);
             node
+        } else if source == "mutter-window" || source.starts_with("mutter-window:") {
+            if total_secs > 180.0 {
+                return Err("recordings of the real screen are kept under three minutes".into());
+            }
+            let id = source.strip_prefix("mutter-window:").map(|id| id.parse::<u64>().map_err(|_| format!("bad window id {id}"))).transpose()?;
+            let (_, node) = Mutter::open("", None, Some(id))?;
+            println!("source: Mutter ScreenCast RecordWindow({}) cursor embedded, PipeWire node {node}", id.map(|id| id.to_string()).unwrap_or_else(|| "the focused window".into()));
+            if let Some(at) = end_at {
+                end_source = Some((at, Arc::new(stop_mutter)));
+            }
+            node
         } else if source == "mutter" || source.starts_with("mutter:") || source.starts_with("mutter-area:") {
             if total_secs > 180.0 {
                 return Err("recordings of the real screen are kept under three minutes".into());
@@ -1763,7 +1850,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 // (--legacy has no capture to learn the monitor's size from.)
                 source_size = Some(parse_size(&args.str("src-size", ""))?);
             }
-            let (_, node) = Mutter::open(connector, area)?;
+            let (_, node) = Mutter::open(connector, area, None)?;
             match area {
                 Some((x, y, w, h)) => println!("source: Mutter ScreenCast RecordArea({x}, {y}, {w}, {h}) cursor embedded, PipeWire node {node}"),
                 None => println!("source: Mutter ScreenCast RecordMonitor({}) cursor embedded, PipeWire node {node}", if connector.is_empty() { "primary" } else { connector }),
@@ -1779,7 +1866,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
             own_fd: args.has("fd"),
             as_window: args.has("as-window"),
             monitor: source_size.filter(|_| !args.has("as-window")),
-            expect_start: (!args.has("fail") || main_must_fail.is_some()) && !args.has("freeze-source") && !args.has("as-window"),
+            expect_start: (!args.has("fail") || main_must_fail.is_some()) && !args.has("freeze-source") && !(args.has("as-window") && std::env::var("LITECORD_VAAPI_CAPTURE_WINDOWS").as_deref() == Ok("0")),
             end_source,
             node,
             size,
@@ -1805,6 +1892,18 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
             }),
             verbose: args.has("verbose"),
             dump_aus: args.0.get("dump-aus").cloned(),
+            au_log: args.0.get("au-log").cloned(),
+            window_script: args
+                .str("window-script", "")
+                .split(';')
+                .filter(|p| !p.trim().is_empty())
+                .map(|p| {
+                    let (at, line) = p.trim().split_once(':').ok_or(format!("bad --window-script part {p}"))?;
+                    Ok((at.parse::<f64>().map_err(|_| format!("bad --window-script part {p}"))?, line.to_string()))
+                })
+                .collect::<Result<_, String>>()?,
+            window_pipe: args.0.get("window-pipe").cloned(),
+            source_must_end: args.has("source-must-end"),
             helper_pids,
         };
         println!(
