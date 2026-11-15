@@ -23,8 +23,10 @@ mod harness {
     use litecord::encoder::{create_best_encoder, VideoEncoder};
     use litecord::screen_capture::hw_decode::h264_state::nal_ranges;
     use litecord::screen_capture::linux_gpu_tx as gpu;
-    use litecord::screen_capture::sources::linux_portal::PORTAL_LOCAL_CB;
+    use litecord::screen_capture::sources::linux_portal::{gst_launch_capture_args, PORTAL_LOCAL_CB};
     use litecord::screen_capture::video_pipeline::{decode_video_frame, Decoded, StreamDecoders};
+    use litecord::screen_capture::watch::{ProfileChoice, Verdict as WatchVerdict, Viewers, CAP_H264_MAIN};
+    use litecord::utils::video_settings::StreamProfile;
     use openh264::formats::YUVSource;
     use slint::{Rgba8Pixel, SharedPixelBuffer};
     use std::collections::HashMap;
@@ -39,8 +41,9 @@ mod harness {
     const HELP: &str = "\
 test_vaapi_capture [options]
   --source S       mutter (default: Mutter ScreenCast RecordMonitor of the primary monitor, cursor
-                   embedded, no dialog) | mutter:CONNECTOR | node:ID | synthetic (a
-                   `videotestsrc ! pipewiresink` this spawns)
+                   embedded, no dialog) | mutter:CONNECTOR | mutter-area:WxH[+X+Y] (RecordArea: a
+                   rectangle of the desktop, for a compositor source of any shape) | node:ID |
+                   synthetic (a `videotestsrc ! pipewiresink` this spawns)
   --src-props STR  synthetic: videotestsrc properties (default \"pattern=ball motion=sweep\")
   --src-size WxH   synthetic: picture size (default 2560x1440)
   --src-fps N      synthetic: frame rate (default 60; 1 approximates a still screen)
@@ -53,6 +56,15 @@ test_vaapi_capture [options]
   --duration S     seconds watched (default 10); ignored with --watch
   --watch SPEC     u2,w8,u3,w5: unwatched 2 s, watched 8 s, ... (default u1,w<duration>)
   --bitrate SPEC   kbps, or SEC:KBPS,... (default 8000), e.g. 0:8000,4:3000,8:8000
+  --profile P      the 'stream profile' setting: compatible (default) | efficient | auto
+  --viewers SPEC   SEC:LIST,... who watches from those seconds on, by the send loop's own rules
+                   (watch::Viewers + watch::ProfileChoice), instead of --watch; the share then
+                   lasts --duration seconds in all. LIST: viewers joined by '+': m (native,
+                   decodes Main), c (native, does not), w (a browser), or - for nobody. A
+                   position keeps its identity: 0:m,5:c is one viewer changing its capability
+                   byte. With --profile auto, 0:-,1:m,4:m+c,7:m goes Main -> Constrained Baseline
+                   -> Main (the last step 5 s after the viewer that cannot decode Main left).
+                   Without it, the viewers of --watch are one native viewer that decodes Main.
   --pli SECS       extra keyframe requests at these times, e.g. 3.3,5.1 (besides one every 2 s)
   --memory M       auto (default) | dmabuf | system
   --max-fps N      ask the compositor for at most N pictures a second (experiment)
@@ -60,6 +72,17 @@ test_vaapi_capture [options]
                    (LITECORD_VAAPI_CAPTURE_TEST_FAIL): break the GPU path at its start or from
                    access unit N on (hang: its streaming thread blocks for 20 s, like a driver
                    that hangs); the share must go on
+                   nomain | mainrefuse | mainprofile | mainbreak | mainlate:N: H.264 Main goes
+                   wrong (the driver has no such profile, the encoder refuses the format, it
+                   produces another profile, it fails on its first picture, its first picture
+                   is withheld N times): the share must stay on the GPU capture in Constrained
+                   Baseline (mainlate:1: go to Main)
+                   prepstuck:N: making a new encoder blocks from the Nth replacement on (the
+                   driver hangs while the VA context is created): the send loop must not wait
+                   for it (0: Main is refused and the share stays as it is; 1 with a script
+                   that goes to Main and back: the share goes on over gst-launch)
+                   nobars: the bars around a picture of another shape cannot be painted: no
+                   such picture may be sent, and the share goes on over gst-launch
   --freeze-source S  synthetic: the provider is stopped (SIGSTOP) before the capture connects
                    and continued after S seconds: the capture's start must stay bounded
   --end-source S   end the source S seconds into the share (Mutter: Session.Stop, as GNOME's
@@ -71,7 +94,17 @@ test_vaapi_capture [options]
                    left mid-stream (plain gst-launch consumers do the same to it)
   --cycle-gap MS   pause between stop and start (default 200)
   --colours        synthetic colour bars: check decoded colours against BT.601 limited
+  --geometry       check where the picture lies in every decoded keyframe and in the previews:
+                   the source's shape kept, centred, black bars around it, the same place on
+                   the GPU capture and on the gst-launch path. The synthetic source then shows
+                   colour bars (pattern=smpte100) and the picture's rectangle is measured from
+                   the decoded pixels; with a compositor source only the bars are checked
+  --png DIR        with --geometry: write the first and the last checked keyframe of each path
+                   and one preview there as PNG
   --no-verify      do not decode (CPU measurements)
+  --dump-aus FILE  write every access unit sent to FILE, one after the other (an H.264 byte
+                   stream for other tools), and one line per keyframe to FILE.idr: its number
+                   in the stream, the path, and the word new-encoder for the first of a new encoder
   --verbose        one line per access unit
 Exit status 1 when a check fails, 2 when the source cannot be opened.";
 
@@ -85,7 +118,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
 
     impl Args {
         fn parse() -> Result<Self, String> {
-            let flags = ["fd", "legacy", "colours", "no-verify", "verbose", "help", "as-window"];
+            let flags = ["fd", "legacy", "colours", "no-verify", "verbose", "help", "as-window", "geometry"];
             let mut map = HashMap::new();
             let mut it = std::env::args().skip(1);
             while let Some(a) = it.next() {
@@ -163,7 +196,8 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
     const MUTTER_BUS: &str = "org.gnome.Mutter.ScreenCast";
 
     impl Mutter {
-        fn open(connector: &str) -> Result<(Arc<Self>, u32), String> {
+        /// `area`: (x, y, width, height) of the desktop to record instead of a monitor.
+        fn open(connector: &str, area: Option<(i32, i32, i32, i32)>) -> Result<(Arc<Self>, u32), String> {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
             let (mutter, node) = rt.block_on(async {
                 let e = |e: zbus::Error| format!("Mutter ScreenCast: {e}");
@@ -178,7 +212,10 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 // RecordMonitor only: RecordVirtual would add a monitor to the desktop.
                 let mut props: HashMap<&str, zbus::zvariant::Value> = HashMap::new();
                 props.insert("cursor-mode", zbus::zvariant::Value::U32(1));
-                let reply = conn.call_method(Some(MUTTER_BUS), mutter.session.as_str(), Some(session_iface), "RecordMonitor", &(connector, props)).await.map_err(e)?;
+                let reply = match area {
+                    Some((x, y, w, h)) => conn.call_method(Some(MUTTER_BUS), mutter.session.as_str(), Some(session_iface), "RecordArea", &(x, y, w, h, props)).await.map_err(e)?,
+                    None => conn.call_method(Some(MUTTER_BUS), mutter.session.as_str(), Some(session_iface), "RecordMonitor", &(connector, props)).await.map_err(e)?,
+                };
                 let stream: zbus::zvariant::OwnedObjectPath = reply.body().deserialize().map_err(e)?;
                 let proxy = zbus::Proxy::new(&conn, MUTTER_BUS, stream.as_str(), "org.gnome.Mutter.ScreenCast.Stream").await.map_err(e)?;
                 let mut added = proxy.receive_signal("PipeWireStreamAdded").await.map_err(e)?;
@@ -301,23 +338,14 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
     }
 
     /// linux_portal.rs's gst-launch pipeline and reader loop, on `node`.
-    fn legacy_capture(shared: &LegacyShared, fd: Option<RawFd>, node: u32, size: (u32, u32), fps: u32, running: &AtomicBool) {
+    fn legacy_capture(shared: &LegacyShared, fd: Option<RawFd>, node: u32, size: (u32, u32), fps: u32, monitor: Option<(u32, u32)>, running: &AtomicBool) {
         let (dst_w, dst_h) = size;
         let frame_size = (dst_w * dst_h * 4) as usize;
-        let mut gst_args = vec!["-q".to_string(), "pipewiresrc".to_string()];
-        if let Some(fd) = fd {
-            gst_args.push(format!("fd={fd}"));
-        }
+        let mut source: Vec<String> = fd.map(|fd| format!("fd={fd}")).into_iter().collect();
         // Not in the app's arguments: on the session's own connection (the portal's shows
         // only its node) a node that is gone must not be replaced by another video source.
-        gst_args.push("stream-properties=props,node.dont-fallback=(string)true".into());
-        gst_args.extend([format!("path={node}"), "do-timestamp=true".into(), "!".into(), "videoconvert".into(), "n-threads=4".into(), "!".into(), "videoscale".into(), "!".into()]);
-        if fps > 0 && fps < 120 {
-            gst_args.extend(["videorate".to_string(), "!".to_string(), format!("video/x-raw,format=BGRA,width={dst_w},height={dst_h},framerate={fps}/1")]);
-        } else {
-            gst_args.push(format!("video/x-raw,format=BGRA,width={dst_w},height={dst_h}"));
-        }
-        gst_args.extend(["!", "queue", "max-size-buffers=1", "max-size-bytes=0", "max-size-time=0", "leaky=downstream", "!", "fdsink", "fd=1", "sync=false"].map(String::from));
+        source.extend(["stream-properties=props,node.dont-fallback=(string)true".to_string(), format!("path={node}")]);
+        let gst_args = gst_launch_capture_args(&source, dst_w, dst_h, fps as u64, monitor);
         let spawned = dies_with_us(Command::new("gst-launch-1.0").env_remove("PIPEWIRE_NODE").args(&gst_args).stdout(Stdio::piped()).stderr(Stdio::inherit())).spawn();
         let mut child = match spawned {
             Ok(c) => c,
@@ -391,6 +419,109 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         ("blue", [0, 0, 255]),
     ];
 
+    /// `--geometry`: what the checks need to know, and where pictures are written.
+    #[derive(Clone)]
+    struct Geometry {
+        /// The source's picture size, once known (a compositor's is learnt from the capture).
+        source: Arc<Mutex<Option<(u32, u32)>>>,
+        /// The gst-launch capture is told the source's size (a monitor's): a fit one pixel
+        /// short fills the frame there too.
+        told: bool,
+        /// The source shows colour bars: the picture's rectangle can be measured.
+        measure: bool,
+        png: Option<std::path::PathBuf>,
+        name: String,
+    }
+
+    /// One picture's geometry: the rectangle measured (rows and columns with bright pixels in
+    /// them), and the brightest channel value found in the bars, with how many bar pixels are
+    /// brighter than black may be after encoding.
+    struct Measured {
+        rect: Option<(u32, u32, u32, u32)>,
+        bar_max: u8,
+        bar_bad: usize,
+    }
+
+    /// Bars are black: nothing above this in any channel, 4 pixels away from the picture
+    /// (the encoder rings that far; the green of an unwritten surface is 73).
+    const BAR_MAX: u8 = 40;
+
+    fn measure(rgba: &[u8], (w, h): (u32, u32), expected: (u32, u32, u32, u32), find_rect: bool) -> Measured {
+        let (w, h) = (w as usize, h as usize);
+        let px = |x: usize, y: usize| {
+            let o = (y * w + x) * 4;
+            rgba[o].max(rgba[o + 1]).max(rgba[o + 2])
+        };
+        let rect = find_rect.then(|| {
+            let (mut rows, mut cols) = (vec![0usize; h], vec![0usize; w]);
+            for y in 0..h {
+                for x in 0..w {
+                    if px(x, y) > 96 {
+                        rows[y] += 1;
+                        cols[x] += 1;
+                    }
+                }
+            }
+            // The colour bars reach every edge of the picture: a row or column of it has
+            // bright pixels along a good part of its length.
+            let (x0, x1) = (cols.iter().position(|c| *c * 50 > h), cols.iter().rposition(|c| *c * 50 > h));
+            let (y0, y1) = (rows.iter().position(|c| *c * 50 > w), rows.iter().rposition(|c| *c * 50 > w));
+            match (x0, x1, y0, y1) {
+                (Some(x0), Some(x1), Some(y0), Some(y1)) => Some((x0 as u32, y0 as u32, (x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32)),
+                _ => None,
+            }
+        }).flatten();
+        let (ex, ey, ew, eh) = (expected.0 as usize, expected.1 as usize, expected.2 as usize, expected.3 as usize);
+        let (mut bar_max, mut bar_bad) = (0u8, 0usize);
+        for y in 0..h {
+            for x in 0..w {
+                let in_bars = x + 4 < ex || x >= ex + ew + 4 || y + 4 < ey || y >= ey + eh + 4;
+                if in_bars {
+                    let v = px(x, y);
+                    bar_max = bar_max.max(v);
+                    bar_bad += (v > BAR_MAX) as usize;
+                }
+            }
+        }
+        Measured { rect, bar_max, bar_bad }
+    }
+
+    /// What is wrong with a measured picture, if anything. `source` -> `frame`.
+    fn geometry_faults(m: &Measured, source: (u32, u32), frame: (u32, u32), expected: (u32, u32, u32, u32)) -> Vec<String> {
+        let mut faults = Vec::new();
+        if m.bar_bad > 0 {
+            faults.push(format!("{} bar pixels are not black (brightest channel value {})", m.bar_bad, m.bar_max));
+        }
+        // What keeping the shape means, without the implementation's own arithmetic.
+        let scale = (frame.0 as f64 / source.0 as f64).min(frame.1 as f64 / source.1 as f64);
+        let ideal = (source.0 as f64 * scale, source.1 as f64 * scale);
+        if let Some((x, y, w, h)) = m.rect {
+            let near = |a: u32, b: u32| a.abs_diff(b) <= 1;
+            if !(near(x, expected.0) && near(y, expected.1) && near(w, expected.2) && near(h, expected.3)) {
+                faults.push(format!("the picture is at {x},{y} {w}x{h}, not at {},{} {}x{} (letterbox())", expected.0, expected.1, expected.2, expected.3));
+            }
+            if (w as f64 - ideal.0).abs() > 2.0 || (h as f64 - ideal.1).abs() > 2.0 {
+                faults.push(format!("the picture is {w}x{h}; the source's shape in this frame is {:.1}x{:.1}", ideal.0, ideal.1));
+            }
+            if (x as f64 - (frame.0 - w) as f64 / 2.0).abs() > 1.0 || (y as f64 - (frame.1 - h) as f64 / 2.0).abs() > 1.0 {
+                faults.push(format!("the picture at {x},{y} {w}x{h} is not centred"));
+            }
+        }
+        faults
+    }
+
+    /// One access unit on its way to the verifier.
+    struct Unit {
+        n: usize,
+        au: Vec<u8>,
+        /// From the GPU (capture or encoder): one slice, no filler, colours declared.
+        strict: bool,
+        /// Every viewer of this access unit decodes H.264 Main: the stream may be Main
+        /// then, and must be Constrained Baseline otherwise.
+        main_ok: bool,
+        gpu_path: bool,
+    }
+
     /// What the verifier thread found; it decodes every access unit like a receiver.
     #[derive(Default)]
     struct Verdict {
@@ -399,11 +530,19 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         sps: String,
         colour_lines: Vec<String>,
         cpu: f64,
+        /// Access units of a stream whose last SPS said Main.
+        main_units: usize,
+        /// --geometry: keyframes checked on each path (GPU capture, gst-launch), the
+        /// rectangles measured on each, and the brightest bar pixel seen.
+        geometry_checked: [usize; 2],
+        geometry_rects: [Vec<(u32, u32, u32, u32)>; 2],
+        geometry_bar_max: u8,
+        geometry_lines: Vec<String>,
     }
 
-    /// `strict` access units come from the GPU: one slice, no filler, colours declared.
-    fn verifier(rx: std::sync::mpsc::Receiver<(usize, Vec<u8>, bool)>, size: (u32, u32), colours: bool) -> Verdict {
+    fn verifier(rx: std::sync::mpsc::Receiver<Unit>, size: (u32, u32), colours: bool, geometry: Option<Geometry>) -> Verdict {
         let mut v = Verdict::default();
+        let mut stream_main = false;
         let mut decoders = StreamDecoders::default();
         let mut raw = if colours { openh264::decoder::Decoder::new().ok() } else { None };
         let mut colours_done = 0;
@@ -412,7 +551,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 v.failures.push(format!("access unit {n}: {what}"));
             }
         };
-        while let Ok((n, au, strict)) = rx.recv() {
+        while let Ok(Unit { n, au, strict, main_ok, gpu_path }) = rx.recv() {
             if !(au.starts_with(&[0, 0, 1]) || au.starts_with(&[0, 0, 0, 1])) {
                 fail(&mut v, n, "does not start with a start code".into());
             }
@@ -447,11 +586,22 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 if dims != size {
                     fail(&mut v, n, format!("SPS size {}x{}, stream {}x{}", dims.0, dims.1, size.0, size.1));
                 }
-                if nal[1] != 66 || nal[2] & 0x40 == 0 {
-                    fail(&mut v, n, format!("not Constrained Baseline: profile_idc={} flags={:#04x}", nal[1], nal[2]));
+                let constrained_baseline = nal[1] == 66 && nal[2] & 0x40 != 0;
+                stream_main = nal[1] == 77;
+                if !constrained_baseline && !stream_main {
+                    fail(&mut v, n, format!("neither Constrained Baseline nor Main: profile_idc={} flags={:#04x}", nal[1], nal[2]));
+                }
+                if stream_main && sps.vui_parameters.as_ref().and_then(|v| v.bitstream_restrictions.as_ref()).map(|r| r.max_num_reorder_frames) != Some(0) {
+                    fail(&mut v, n, "Main SPS without max_num_reorder_frames=0: decoders may hold pictures back".into());
                 }
                 if strict && colour != Some((false, Some((1, 1, 6)))) {
                     fail(&mut v, n, format!("SPS colours {colour:?}, expected limited range 1/1/6"));
+                }
+            }
+            if stream_main {
+                v.main_units += 1;
+                if !main_ok {
+                    fail(&mut v, n, "a Main access unit while a viewer that cannot decode Main is watching (or the profile setting is 'compatible')".into());
                 }
             }
             let yuv = raw.as_mut().and_then(|d| match d.decode(&au) {
@@ -470,6 +620,35 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                     v.decoded += 1;
                     if (w, h) != size || (buf.width(), buf.height()) != size {
                         fail(&mut v, n, format!("decoded {w}x{h} (picture {}x{}), stream {}x{}", buf.width(), buf.height(), size.0, size.1));
+                    } else if let Some((g, source)) = geometry.as_ref().filter(|_| idr).and_then(|g| g.source.lock().unwrap().map(|s| (g, s))) {
+                        let path = if gpu_path { 0 } else { 1 };
+                        let expected = if gpu_path || g.told { gpu::picture_rect(source, size) } else { gpu::letterbox(source, size) };
+                        let m = measure(buf.as_bytes(), size, expected, g.measure);
+                        let faults = geometry_faults(&m, source, size, expected);
+                        v.geometry_bar_max = v.geometry_bar_max.max(m.bar_max);
+                        if let Some(rect) = m.rect.filter(|r| !v.geometry_rects[path].contains(r)) {
+                            v.geometry_rects[path].push(rect);
+                        }
+                        let first = v.geometry_checked[path] == 0;
+                        v.geometry_checked[path] += 1;
+                        let path_name = if gpu_path { "gpu" } else { "gstlaunch" };
+                        if first || !faults.is_empty() {
+                            let measured = m.rect.map(|(x, y, w, h)| format!("measured at {x},{y} {w}x{h}")).unwrap_or_else(|| "not measured".into());
+                            v.geometry_lines.push(format!(
+                                "  GEOMETRY {path_name} access unit {n}: source {}x{} in {}x{}: picture expected at {},{} {}x{}, {measured}; brightest bar pixel {}{}",
+                                source.0, source.1, size.0, size.1, expected.0, expected.1, expected.2, expected.3, m.bar_max,
+                                if faults.is_empty() { "  ok".to_string() } else { format!("  WRONG: {}", faults.join("; ")) }
+                            ));
+                        }
+                        for fault in faults {
+                            fail(&mut v, n, format!("geometry ({path_name}): {fault}"));
+                        }
+                        if let Some(dir) = &g.png {
+                            let file = dir.join(format!("{}_{path_name}_{}.png", g.name, if first { "first" } else { "last" }));
+                            if let Err(e) = image::save_buffer(&file, buf.as_bytes(), size.0, size.1, image::ExtendedColorType::Rgba8) {
+                                fail(&mut v, n, format!("{}: {e}", file.display()));
+                            }
+                        }
                     } else if colours && idr && colours_done < 2 {
                         colours_done += 1;
                         let px = buf.as_bytes();
@@ -529,6 +708,9 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         /// Reach PipeWire through an own connection per share, as with the portal's fd.
         own_fd: bool,
         as_window: bool,
+        /// What the portal tells the gst-launch capture: the size of the source when it is
+        /// known and not a window's.
+        monitor: Option<(u32, u32)>,
         /// Nothing was arranged to keep the GPU capture from starting.
         expect_start: bool,
         /// Seconds into the share at which the source is ended, and how.
@@ -539,14 +721,23 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         legacy_only: bool,
         memory: gpu::Memory,
         max_fps: Option<u32>,
-        /// (watched, seconds) in order.
-        watch: Vec<(bool, f64)>,
+        /// Who watches from which second on (m, c, w as in --viewers), and how long the
+        /// share lasts.
+        viewers: Vec<(f64, Vec<char>)>,
+        total_secs: f64,
+        profile: StreamProfile,
+        /// A --fail mode about Main: whether Main must turn out unavailable (or be reached
+        /// all the same).
+        main_must_fail: Option<bool>,
+        main_late: bool,
         /// (second, bps).
         bitrates: Vec<(f64, u32)>,
         pli: Vec<f64>,
         verify: bool,
         colours: bool,
+        geometry: Option<Geometry>,
         verbose: bool,
+        dump_aus: Option<String>,
         helper_pids: Vec<u32>,
     }
 
@@ -569,14 +760,35 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         let legacy = Arc::new(LegacyShared { frame: Mutex::new(None), frames_read: AtomicU64::new(0), first_frame_at: Mutex::new(None), child_pid: AtomicU32::new(0), previews: AtomicU64::new(0) });
         let preview_count = Arc::new(AtomicU64::new(0));
         let preview_bad = Arc::new(AtomicU64::new(0));
+        let preview_geometry_bad = Arc::new(AtomicU64::new(0));
+        let preview_geometry: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         {
             // What ScreenCaptureManager::start does with the UI's callback.
             let (count, bad, size) = (preview_count.clone(), preview_bad.clone(), setup.size);
+            let (geometry, geometry_bad, geometry_seen) = (setup.geometry.clone(), preview_geometry_bad.clone(), preview_geometry.clone());
             *PORTAL_LOCAL_CB.lock().unwrap() = Some(Arc::new(move |p: SharedPixelBuffer<Rgba8Pixel>| {
-                count.fetch_add(1, Ordering::Relaxed);
+                let seen = count.fetch_add(1, Ordering::Relaxed);
                 let opaque = p.as_bytes().chunks_exact(4).step_by(997).all(|px| px[3] == 255);
                 if (p.width(), p.height()) != size || !opaque {
                     bad.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                // The preview shows the stream's frame: the same picture rectangle and bars.
+                let Some((g, source)) = geometry.as_ref().and_then(|g| g.source.lock().unwrap().map(|s| (g, s))) else { return };
+                // (The GPU capture fills the frame where the gst-launch path, not told the
+                // source's size, leaves a bar one pixel thin.)
+                let expected = if gpu::active() || g.told { gpu::picture_rect(source, size) } else { gpu::letterbox(source, size) };
+                let m = measure(p.as_bytes(), size, expected, g.measure);
+                let faults = geometry_faults(&m, source, size, expected);
+                let mut lines = geometry_seen.lock().unwrap();
+                if !faults.is_empty() {
+                    geometry_bad.fetch_add(1, Ordering::Relaxed);
+                }
+                if lines.is_empty() || (!faults.is_empty() && lines.len() < 4) {
+                    lines.push(format!("preview {seen}: {}; brightest bar pixel {}{}", m.rect.map(|(x, y, w, h)| format!("picture measured at {x},{y} {w}x{h}")).unwrap_or_else(|| "picture not measured".into()), m.bar_max, if faults.is_empty() { "  ok".to_string() } else { format!("  WRONG: {}", faults.join("; ")) }));
+                }
+                if let Some(dir) = g.png.as_ref().filter(|_| seen == 3) {
+                    let _ = image::save_buffer(dir.join(format!("{}_preview.png", g.name)), p.as_bytes(), size.0, size.1, image::ExtendedColorType::Rgba8);
                 }
             }));
         }
@@ -597,7 +809,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         }
         let portal = {
             let (running, legacy, gave_up, gpu_started, gpu_ended) = (running.clone(), legacy.clone(), gpu_gave_up_at.clone(), gpu_started.clone(), gpu_ended.clone());
-            let (node, size, fps, legacy_only, memory, max_fps, as_window) = (setup.node, setup.size, setup.fps, setup.legacy_only, setup.memory, setup.max_fps, setup.as_window);
+            let (node, size, fps, legacy_only, memory, max_fps, as_window, monitor) = (setup.node, setup.size, setup.fps, setup.legacy_only, setup.memory, setup.max_fps, setup.as_window, setup.monitor);
             std::thread::Builder::new().name("portal".into()).spawn(move || {
                 // Both connections are closed when this thread ends, like the portal's.
                 let mut fd = own_fd;
@@ -609,7 +821,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                     let begun = if memory == gpu::Memory::Auto && max_fps.is_none() {
                         gpu::begin(raw(&fd), node, size.0, size.1, fps, &wanted)
                     } else {
-                        gpu::begin_with(&gpu::Config { fd: raw(&fd), node, width: size.0, height: size.1, fps, memory, max_fps, min_qp: 30, main: std::env::var("LITECORD_TEST_CAPTURE_MAIN").is_ok() }, &wanted).map_err(|e| println!("  GPU capture did not start: {e}")).ok()
+                        gpu::begin_with(&gpu::Config { fd: raw(&fd), node, width: size.0, height: size.1, fps, memory, max_fps, min_qp: 30 }, &wanted).map_err(|e| println!("  GPU capture did not start: {e}")).ok()
                     };
                     println!("  begin() returned after {} ms: {}", began.elapsed().as_millis(), if begun.is_some() { "started" } else { "not started" });
                     let ended = match begun {
@@ -642,7 +854,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                     }
                 }
                 if wanted() {
-                    legacy_capture(&legacy, raw(&fd), node, size, fps, &running);
+                    legacy_capture(&legacy, raw(&fd), node, size, fps, monitor, &running);
                 }
             })
         }
@@ -685,10 +897,10 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         .expect("worker thread");
 
         // The receivers.
-        let (tx_verify, rx_verify) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>, bool)>(600);
+        let (tx_verify, rx_verify) = std::sync::mpsc::sync_channel::<Unit>(600);
         let verify_thread = {
-            let (size, colours) = (setup.size, setup.colours);
-            std::thread::Builder::new().name("verifier".into()).spawn(move || verifier(rx_verify, size, colours)).expect("verifier thread")
+            let (size, colours, geometry) = (setup.size, setup.colours, setup.geometry.clone());
+            std::thread::Builder::new().name("verifier".into()).spawn(move || verifier(rx_verify, size, colours, geometry)).expect("verifier thread")
         };
 
         // The "screen-capture-tx" loop of manager.rs.
@@ -704,8 +916,29 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         let mut was_watched = false;
         let mut keyframe_requested = false;
 
+        // Who watches, by the send loop's own rules (watch.rs).
+        let mut viewers = Viewers::new();
+        let mut choice = ProfileChoice::new(setup.profile);
+        let mut tokens: Vec<char> = Vec::new();
+        let mut viewer_step: Option<usize> = None;
+        let mut last_renewal = Instant::now();
+        // The profile of the stream by its last SPS, and what its changes cost.
+        let mut stream_main: Option<bool> = None;
+        let mut profile_changes: Vec<String> = Vec::new();
+        let mut switch_gaps: Vec<f64> = Vec::new();
+        let mut idr_asked_efficient = false;
+        // Keyframes of the GPU capture: the bytes of the first one of each new encoder and of
+        // all the others (a new encoder's rate control starts anew: --dump-aus and a
+        // decoder's QP output tell how coarse), and those nobody asked for.
+        let mut new_encoder_idrs: Vec<usize> = Vec::new();
+        let mut other_idrs: Vec<usize> = Vec::new();
+        let mut unasked_idrs: Vec<String> = Vec::new();
+        let mut last_idr_request: Option<Instant> = None;
+        let mut starved = false;
+        let mut dump = setup.dump_aus.as_ref().and_then(|path| Some((std::fs::File::create(path).ok()?, std::fs::File::create(format!("{path}.idr")).ok()?)));
+
         let share_start = Instant::now();
-        let total_secs: f64 = setup.watch.iter().map(|w| w.1).sum();
+        let total_secs = setup.total_secs;
         let shell_pid = find_pid("gnome-shell");
         let mut pli_left = setup.pli.clone();
         let mut totals = Totals::default();
@@ -758,12 +991,52 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                     end();
                 }
             }
-            // The watch schedule stands in for watch::viewer_addrs().
-            let mut acc = 0.0;
-            let watched = setup.watch.iter().find(|(_, secs)| {
-                acc += secs;
-                t < acc
-            }).map(|w| w.0).unwrap_or(false);
+            // Watch requests: a change in the list, and every viewer's renewal once a second.
+            let now = Instant::now();
+            let step = setup.viewers.iter().rposition(|(at, _)| *at <= t);
+            let mut new_viewer = false;
+            if step != viewer_step {
+                viewer_step = step;
+                let list = step.map(|i| setup.viewers[i].1.clone()).unwrap_or_default();
+                // A browser that connects asks for a keyframe (web_share).
+                new_viewer |= list.iter().filter(|t| **t == 'w').count() > tokens.iter().filter(|t| **t == 'w').count();
+                for i in 0..tokens.len() {
+                    if list.get(i).is_none_or(|new| *new == 'w') {
+                        viewers.unwatch(i as u64 + 1);
+                    }
+                }
+                tokens = list;
+                last_renewal = now - Duration::from_secs(2);
+                println!("  t={t:.2}s viewers are now {}", if tokens.is_empty() { "-".to_string() } else { tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>().join("+") });
+            }
+            if last_renewal.elapsed() >= Duration::from_secs(1) {
+                last_renewal = now;
+                for (i, t) in tokens.iter().enumerate().filter(|(_, t)| **t != 'w') {
+                    let uid = i as u64 + 1;
+                    // What watch::on_watch does with a request.
+                    if let WatchVerdict::Accepted { new } = viewers.watch(uid, [uid as u8; 32], std::net::SocketAddr::from(([10, 0, 0, uid as u8], 50005)), true, now) {
+                        viewers.set_caps(uid, if *t == 'm' { CAP_H264_MAIN } else { 0 });
+                        new_viewer |= new;
+                    }
+                }
+            }
+            // What the send loop does each turn.
+            viewers.expire(now);
+            let web_viewers = tokens.iter().filter(|t| **t == 'w').count();
+            let watched = viewers.len() > 0 || web_viewers > 0;
+            let all_decode_main = viewers.all_decode_main() && web_viewers == 0;
+            let efficient = choice.update(watched, all_decode_main, now);
+            let main_ok = setup.profile == StreamProfile::Efficient || (setup.profile == StreamProfile::Auto && all_decode_main);
+            if new_viewer {
+                keyframe_requested = true;
+            }
+            // Viewers drop a stream after 2.5 s without pictures, whichever path they come from
+            // (--end-source takes the pictures away on purpose).
+            let fed_at = last_au_at.max(watch_started);
+            if watched && was_watched && !starved && setup.end_source.is_none() && fed_at.is_some_and(|at| at.elapsed() > Duration::from_millis(2500)) {
+                starved = true;
+                fails.add(format!("t={t:.2}s: the viewers have been without pictures for 2.5 s"));
+            }
             let bitrate = setup.bitrates.iter().rev().find(|(s, _)| *s <= t).map(|b| b.1).unwrap_or(8_000_000);
             if pli_left.first().is_some_and(|p| *p <= t) {
                 pli_left.remove(0);
@@ -778,6 +1051,13 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                     println!("  negotiated with the source: {}", st.source_caps);
                     println!("  relabelled for vapostproc:  {}", st.converter_caps);
                     println!("  memory: {}, source {}x{} -> stream {}x{}", if st.dmabuf { "DMABuf (zero copy)" } else { "system memory" }, st.source_size.0, st.source_size.1, setup.size.0, setup.size.1);
+                    if let Some(g) = &setup.geometry {
+                        let mut source = g.source.lock().unwrap();
+                        if source.is_some_and(|s| s != st.source_size) {
+                            fails.add(format!("the source delivers {}x{}, not the {:?} asked for", st.source_size.0, st.source_size.1, *source));
+                        }
+                        *source = Some(st.source_size);
+                    }
                 }
             }
             if let Some(st) = gpu::stats() {
@@ -859,8 +1139,10 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 if want_idr {
                     last_idr = Instant::now();
                     idr_pending.get_or_insert((Instant::now(), "request"));
+                    last_idr_request = Some(Instant::now());
+                    idr_asked_efficient = efficient;
                 }
-                gpu::next_picture(bitrate, want_idr).map(|p| {
+                gpu::next_picture(bitrate, want_idr, efficient).map(|p| {
                     repeat = p.repeat;
                     latency = Some(p.latency.as_secs_f64() * 1000.0);
                     p.data
@@ -870,10 +1152,12 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 if enc.get_bitrate_bps() != bitrate {
                     enc.set_bitrate_bps(bitrate);
                 }
+                enc.set_efficient_profile(efficient);
                 if std::mem::take(&mut keyframe_requested) || last_idr.elapsed() >= Duration::from_millis(2000) {
                     last_idr = Instant::now();
                     enc.force_intra_frame();
                     idr_pending.get_or_insert((Instant::now(), "request"));
+                    idr_asked_efficient = efficient;
                 }
                 let fp = fingerprint(frame);
                 repeat = *seq == last_encoded_seq || fp == last_fp;
@@ -933,10 +1217,40 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                     s_lat.push(ms);
                     all_lat.push(ms);
                 }
+                // The stream's profile, by its SPS.
+                let sps_main = nal_ranges(&au).iter().map(|r| &au[r.clone()]).find(|nal| nal[0] & 0x1f == 7 && nal.len() > 3).map(|nal| nal[1] == 77);
+                let (mut profile_changed, viewer_first) = (false, first_after_watch);
+                if let Some(main) = sps_main.filter(|main| stream_main != Some(*main)) {
+                    let name = if main { "Main" } else { "Constrained Baseline" };
+                    if stream_main.is_some() {
+                        profile_changed = true;
+                        let replaced = gpu::stats().filter(|_| gpu_path).map(|st| format!(", encoder replaced in {:.1} ms (switch {})", st.last_switch_us as f64 / 1000.0, st.profile_switches)).unwrap_or_default();
+                        match last_au_at.filter(|_| !first_after_watch) {
+                            Some(prev) => {
+                                let gap = now.duration_since(prev).as_secs_f64() * 1000.0;
+                                println!("  t={t:.2}s PROFILE: the stream is now {name} ({path_now} path), {gap:.1} ms after the last access unit of the other profile{replaced}; {} bytes, NAL types {types:?}", au.len());
+                                switch_gaps.push(gap);
+                                if gap > 500.0 {
+                                    fails.add(format!("t={t:.2}s: {gap:.0} ms without pictures at the change to {name}"));
+                                }
+                            }
+                            None => println!("  t={t:.2}s PROFILE: the stream is now {name} ({path_now} path), with the first picture for the new viewers{replaced}"),
+                        }
+                        profile_changes.push(format!("{t:.2}s -> {name}"));
+                        if main && idr_pending.is_none() && !first_after_watch {
+                            fails.add(format!("t={t:.2}s: the stream went to Main without a keyframe being asked for"));
+                        }
+                    }
+                    stream_main = Some(main);
+                }
+                if idr && gpu_path && idr_pending.is_some() && idr_asked_efficient && efficient && sps_main == Some(false) && setup.main_must_fail.is_none() {
+                    fails.add(format!("t={t:.2}s: a keyframe was asked for while every viewer decodes Main, and it is not Main"));
+                }
                 if let Some(prev) = last_au_at {
                     all_gap.push(now.duration_since(prev).as_secs_f64() * 1000.0);
                 }
                 last_au_at = Some(now);
+                starved = false;
                 if first_after_watch {
                     first_after_watch = false;
                     let ms = watch_started.map(|w| now.duration_since(w).as_secs_f64() * 1000.0).unwrap_or(0.0);
@@ -949,6 +1263,14 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                     all_gap.pop();
                 }
                 if idr {
+                    if gpu_path {
+                        if profile_changed { &mut new_encoder_idrs } else { &mut other_idrs }.push(au.len());
+                        // (A change to Constrained Baseline brings its keyframe unasked.)
+                        // (Two requests a few milliseconds apart may each get theirs.)
+                        if idr_pending.is_none() && !profile_changed && !viewer_first && last_idr_request.is_none_or(|at| at.elapsed() > Duration::from_millis(150)) {
+                            unasked_idrs.push(format!("{t:.2}s"));
+                        }
+                    }
                     if let Some((asked, _)) = idr_pending.take() {
                         idr_latency.push(now.duration_since(asked).as_secs_f64() * 1000.0);
                     }
@@ -969,15 +1291,25 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 s_bytes += au.len();
                 totals.aus += 1;
                 totals.bytes += au.len();
+                if let Some((stream, index)) = dump.as_mut() {
+                    use std::io::Write;
+                    let _ = stream.write_all(&au);
+                    if idr {
+                        let _ = writeln!(index, "{au_index} {path_now}{}", if profile_changed && gpu_path { " new-encoder" } else { "" });
+                    }
+                }
                 let strict = gpu_path || h264_encoder.as_ref().is_some_and(|e| e.is_hardware_accelerated());
-                if setup.verify && tx_verify.try_send((au_index, au, strict)).is_err() {
+                if setup.verify && tx_verify.try_send(Unit { n: au_index, au, strict, main_ok, gpu_path }).is_err() {
                     verify_dropped += 1;
                 }
                 au_index += 1;
             }
             if let Some((asked, _)) = idr_pending {
-                if asked.elapsed() > Duration::from_millis(600) {
-                    fails.add(format!("t={t:.2}s: a keyframe asked for 600 ms ago has not arrived"));
+                // (A Main encoder whose first picture is withheld twice keeps the stream
+                // without pictures for twice 400 ms before it is replaced.)
+                let patience = Duration::from_millis(if setup.main_late { 1000 } else { 600 });
+                if asked.elapsed() > patience {
+                    fails.add(format!("t={t:.2}s: a keyframe asked for {} ms ago has not arrived", patience.as_millis()));
                     idr_pending = None;
                 }
             }
@@ -1104,11 +1436,40 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 st.buffers, st.pictures, st.encoded_new, st.encoded_repeats, st.skipped_pace, st.dropped_before_keyframe, st.previews, st.early_renegotiations
             );
         }
+        if let Some(st) = last_gpu_stats.as_ref().filter(|st| (st.picture_rect.2, st.picture_rect.3) != setup.size || st.bars_painted + st.bars_failed > 0) {
+            println!(
+                "GPU capture: the picture lies at {},{} {}x{} in the {}x{} frame; bars painted on {} surfaces in {:.1} ms each ({} could not be painted)",
+                st.picture_rect.0, st.picture_rect.1, st.picture_rect.2, st.picture_rect.3, setup.size.0, setup.size.1, st.bars_painted, st.bars_us as f64 / 1000.0 / st.bars_painted.max(1) as f64, st.bars_failed
+            );
+            if st.bars_failed > 0 {
+                fails.add(format!("the bars of {} surfaces could not be painted", st.bars_failed));
+            }
+        }
         println!("{} ms", dist("capture -> access unit in hand (GPU path)", &mut all_lat));
         println!("{} ms", dist("encode() per frame (gst-launch path; excludes the capture pipeline before the pipe)", &mut all_enc));
         println!("{} ms", dist("gap between access units while watched", &mut all_gap));
         println!("{} ms", dist("keyframe request -> IDR in hand", &mut idr_latency));
         println!("{} ms", dist("viewer arrives -> first access unit (an IDR)", &mut watch_latency));
+        if !profile_changes.is_empty() || setup.profile != StreamProfile::Compatible {
+            println!("profile changes: {}", if profile_changes.is_empty() { "none".to_string() } else { profile_changes.join(", ") });
+            println!("{} ms", dist("profile change mid-stream: last access unit of the old profile -> first IDR of the new", &mut switch_gaps));
+            if let Some(st) = &last_gpu_stats {
+                println!("GPU capture at its end: {} encoder, replaced {} times{}", if st.main { "Main" } else { "Constrained Baseline" }, st.profile_switches, if st.main_unavailable { ", Main found unavailable" } else { "" });
+            }
+        }
+        if totals.gpu_aus > 0 {
+            let show = |bytes: &mut Vec<usize>| {
+                bytes.sort();
+                match bytes.len() {
+                    0 => "none".to_string(),
+                    n => format!("n={n} {}..{} bytes (median {})", bytes[0], bytes[n - 1], bytes[n / 2]),
+                }
+            };
+            println!("GPU keyframes: first of a new encoder at a profile change: {}; all others: {}", show(&mut new_encoder_idrs), show(&mut other_idrs));
+            if !unasked_idrs.is_empty() {
+                fails.add(format!("{} keyframes of the GPU capture that nobody asked for (at {})", unasked_idrs.len(), unasked_idrs.join(", ")));
+            }
+        }
         println!("local preview: {previews} callbacks in {:.1} s ({:.1}/s), {} with a wrong size or alpha", totals.secs, previews as f64 / totals.secs.max(1.0), preview_bad.load(Ordering::Relaxed));
         println!(
             "CPU per second: this process {:.3} (of which the verifier's decoding {:.3}), helper processes {:.3}, gnome-shell {:.3}",
@@ -1143,6 +1504,51 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
             }
             if setup.colours && verdict.colour_lines.is_empty() {
                 fails.add("no colour check was made".into());
+            }
+            if let Some(g) = &setup.geometry {
+                for line in &verdict.geometry_lines {
+                    println!("{line}");
+                }
+                let rects = |path: usize| verdict.geometry_rects[path].iter().map(|(x, y, w, h)| format!("{x},{y} {w}x{h}")).collect::<Vec<_>>().join(" | ");
+                println!(
+                    "geometry: {} keyframes of the GPU capture checked (picture measured at: {}), {} of the gst-launch path (picture measured at: {}); brightest bar pixel in any of them {}",
+                    verdict.geometry_checked[0], rects(0), verdict.geometry_checked[1], rects(1), verdict.geometry_bar_max
+                );
+                for line in preview_geometry.lock().unwrap().iter() {
+                    println!("geometry: {line}");
+                }
+                if verdict.geometry_checked[0] + verdict.geometry_checked[1] == 0 {
+                    fails.add("no keyframe's geometry was checked".into());
+                }
+                // A share that changed path keeps its picture where it was.
+                if g.measure && verdict.geometry_checked[0] > 0 && verdict.geometry_checked[1] > 0 {
+                    let all: Vec<_> = verdict.geometry_rects.iter().flatten().collect();
+                    let spread = |f: fn(&(u32, u32, u32, u32)) -> u32| all.iter().map(|r| f(r)).max().unwrap_or(0) - all.iter().map(|r| f(r)).min().unwrap_or(0);
+                    let worst = spread(|r| r.0).max(spread(|r| r.1)).max(spread(|r| r.2)).max(spread(|r| r.3));
+                    println!("geometry: across the handover the picture's rectangle moves by at most {worst} px");
+                    if worst > 1 {
+                        fails.add(format!("the picture's rectangle differs by {worst} px between the GPU capture and the gst-launch path"));
+                    }
+                }
+                let bad = preview_geometry_bad.load(Ordering::Relaxed);
+                if bad > 0 {
+                    fails.add(format!("{bad} preview pictures with the wrong geometry or bars that are not black"));
+                }
+            }
+        }
+        if setup.verify && (verdict.main_units > 0 || setup.profile != StreamProfile::Compatible) {
+            println!("receiver: {} of the access units were H.264 Main", verdict.main_units);
+        }
+        if let Some(must_fail) = setup.main_must_fail {
+            let unavailable = last_gpu_stats.as_ref().is_some_and(|st| st.main_unavailable);
+            if totals.aus > totals.gpu_aus {
+                fails.add(format!("Main going wrong sent {} access units to the gst-launch path", totals.aus - totals.gpu_aus));
+            }
+            if must_fail && (!unavailable || verdict.main_units > 0) {
+                fails.add(format!("Main was to be found unavailable: unavailable={unavailable}, {} Main access units", verdict.main_units));
+            }
+            if !must_fail && (unavailable || (setup.verify && verdict.main_units == 0)) {
+                fails.add(format!("one late first picture was to be forgiven: unavailable={unavailable}, {} Main access units", verdict.main_units));
             }
         }
         for f in verdict.failures {
@@ -1239,6 +1645,41 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 }
             })
             .collect::<Result<_, String>>()?;
+        let profile_spec = args.str("profile", "compatible");
+        let profile = match profile_spec.as_str() {
+            "compatible" => StreamProfile::Compatible,
+            "efficient" => StreamProfile::Efficient,
+            "auto" => StreamProfile::Auto,
+            _ => return Err(format!("--profile: compatible, efficient or auto, not {profile_spec}")),
+        };
+        // --watch as a viewer script: one native viewer that decodes Main.
+        let mut viewers: Vec<(f64, Vec<char>)> = Vec::new();
+        let mut watch_secs = 0.0;
+        for (watched, secs) in &watch {
+            viewers.push((watch_secs, if *watched { vec!['m'] } else { Vec::new() }));
+            watch_secs += secs;
+        }
+        let mut share_secs = watch_secs;
+        if let Some(spec) = args.0.get("viewers") {
+            viewers.clear();
+            for part in spec.split(',') {
+                let (at, list) = part.split_once(':').ok_or(format!("bad --viewers part {part}"))?;
+                let at = at.parse::<f64>().map_err(|_| format!("bad --viewers part {part}"))?;
+                let tokens: Vec<char> = if list == "-" { Vec::new() } else { list.split('+').filter_map(|t| t.chars().next()).collect() };
+                if let Some(t) = tokens.iter().find(|t| !matches!(t, 'm' | 'c' | 'w')) {
+                    return Err(format!("--viewers: unknown viewer '{t}' (m, c, w or -)"));
+                }
+                viewers.push((at, tokens));
+            }
+            share_secs = duration;
+        }
+        let fail_mode = args.str("fail", "");
+        let main_must_fail = match fail_mode.as_str() {
+            "nomain" | "mainrefuse" | "mainprofile" | "mainbreak" | "prepstuck:0" => Some(true),
+            "mainlate:1" => Some(false),
+            mode if mode.starts_with("mainlate:") => Some(true),
+            _ => None,
+        };
         let bitrate_spec = args.str("bitrate", "8000");
         let bitrates: Vec<(f64, u32)> = bitrate_spec
             .split(',')
@@ -1257,7 +1698,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         let max_fps = args.0.get("max-fps").map(|v| v.parse::<u32>().map_err(|_| format!("bad --max-fps {v}"))).transpose()?;
         let cycles = args.num("cycles", 1.0)? as usize;
         let cycle_gap = Duration::from_millis(args.num("cycle-gap", 200.0)? as u64);
-        let total_secs: f64 = watch.iter().map(|w| w.1).sum::<f64>() * cycles as f64;
+        let total_secs: f64 = share_secs * cycles as f64;
 
         // ---- the source
         let source = args.str("source", "mutter");
@@ -1265,6 +1706,10 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         let mut _synthetic = None;
         let end_at = args.0.get("end-source").map(|v| v.parse::<f64>().map_err(|_| format!("bad --end-source {v}"))).transpose()?;
         let mut end_source: Option<(f64, Arc<dyn Fn() + Send + Sync>)> = None;
+        // --geometry: the source's picture size when it is known beforehand, and whether its
+        // pictures are the colour bars.
+        let mut source_size: Option<(u32, u32)> = None;
+        let mut measurable = false;
         let node = if let Some(id) = source.strip_prefix("node:") {
             let id = id.parse::<u32>().map_err(|_| format!("bad node id {id}"))?;
             if !video_node_present(id) {
@@ -1274,7 +1719,10 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         } else if source == "synthetic" {
             let src_size = parse_size(&args.str("src-size", "2560x1440"))?;
             let src_fps = args.num("src-fps", 60.0)? as u32;
-            let props = args.str("src-props", if args.has("colours") { "pattern=smpte100" } else { "pattern=ball motion=sweep" });
+            let props = args.str("src-props", if args.has("colours") || args.has("geometry") { "pattern=smpte100" } else { "pattern=ball motion=sweep" });
+            source_size = Some(src_size);
+            // (Other patterns have dark edges: only their bars are checked.)
+            measurable = props.contains("smpte100") || props.contains("pattern=white");
             let (synthetic, node) = Synthetic::spawn(&props, src_size, src_fps.max(1), args.0.get("src-colorimetry").map(|s| s.as_str()))?;
             let pid = synthetic.child.id() as i32;
             println!("source: synthetic PipeWire node {node} (videotestsrc {props}, {}x{} at {src_fps} fps), provider pid {pid}", src_size.0, src_size.1);
@@ -1295,13 +1743,31 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
             }
             _synthetic = Some(synthetic);
             node
-        } else if source == "mutter" || source.starts_with("mutter:") {
+        } else if source == "mutter" || source.starts_with("mutter:") || source.starts_with("mutter-area:") {
             if total_secs > 180.0 {
                 return Err("recordings of the real screen are kept under three minutes".into());
             }
             let connector = source.strip_prefix("mutter:").unwrap_or("");
-            let (_, node) = Mutter::open(connector)?;
-            println!("source: Mutter ScreenCast RecordMonitor({}) cursor embedded, PipeWire node {node}", if connector.is_empty() { "primary" } else { connector });
+            let area = match source.strip_prefix("mutter-area:") {
+                Some(spec) => {
+                    let mut parts = spec.split('+');
+                    let (w, h) = parse_size(parts.next().unwrap_or(""))?;
+                    let mut offset = || parts.next().map(|v| v.parse::<i32>().map_err(|_| format!("bad area {spec}"))).transpose().map(|v| v.unwrap_or(0));
+                    let (x, y) = (offset()?, offset()?);
+                    source_size = Some((w, h));
+                    Some((x, y, w as i32, h as i32))
+                }
+                None => None,
+            };
+            if area.is_none() && args.has("src-size") {
+                // (--legacy has no capture to learn the monitor's size from.)
+                source_size = Some(parse_size(&args.str("src-size", ""))?);
+            }
+            let (_, node) = Mutter::open(connector, area)?;
+            match area {
+                Some((x, y, w, h)) => println!("source: Mutter ScreenCast RecordArea({x}, {y}, {w}, {h}) cursor embedded, PipeWire node {node}"),
+                None => println!("source: Mutter ScreenCast RecordMonitor({}) cursor embedded, PipeWire node {node}", if connector.is_empty() { "primary" } else { connector }),
+            }
             if let Some(at) = end_at {
                 end_source = Some((at, Arc::new(stop_mutter)));
             }
@@ -1312,7 +1778,8 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         let setup = Setup {
             own_fd: args.has("fd"),
             as_window: args.has("as-window"),
-            expect_start: !args.has("fail") && !args.has("freeze-source") && !args.has("as-window"),
+            monitor: source_size.filter(|_| !args.has("as-window")),
+            expect_start: (!args.has("fail") || main_must_fail.is_some()) && !args.has("freeze-source") && !args.has("as-window"),
             end_source,
             node,
             size,
@@ -1320,22 +1787,38 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
             legacy_only: args.has("legacy"),
             memory,
             max_fps,
-            watch,
+            viewers,
+            total_secs: share_secs,
+            profile,
+            main_must_fail,
+            main_late: fail_mode.starts_with("mainlate"),
             bitrates,
             pli,
             verify: !args.has("no-verify"),
             colours: args.has("colours"),
+            geometry: args.has("geometry").then(|| Geometry {
+                source: Arc::new(Mutex::new(source_size)),
+                told: source_size.is_some() && !args.has("as-window"),
+                measure: measurable,
+                png: args.0.get("png").map(std::path::PathBuf::from),
+                name: format!("{}_{}_in_{}x{}", source.split(':').next().unwrap_or("source"), source_size.map(|(w, h)| format!("{w}x{h}")).unwrap_or_else(|| "screen".into()), size.0, size.1),
+            }),
             verbose: args.has("verbose"),
+            dump_aus: args.0.get("dump-aus").cloned(),
             helper_pids,
         };
         println!(
-            "== {}: {}x{} {fps} fps, watch {watch_spec}, bitrate {bitrate_spec} kbps, {cycles} share(s){} ==",
+            "== {}: {}x{} {fps} fps, {}, profile {profile_spec}, bitrate {bitrate_spec} kbps, {cycles} share(s){} ==",
             if setup.legacy_only { "today's gst-launch capture + create_best_encoder()" } else { "in-process GPU capture (linux_gpu_tx)" },
             size.0,
             size.1,
+            args.0.get("viewers").map(|v| format!("viewers {v} for {duration} s")).unwrap_or_else(|| format!("watch {watch_spec}")),
             args.0.get("fail").map(|f| format!(", failure injected: {f}")).unwrap_or_default()
         );
 
+        if let Some(dir) = setup.geometry.as_ref().and_then(|g| g.png.as_ref()) {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
         let mut fails = Failures::default();
         let mut sum = Totals::default();
         for cycle in 1..=cycles {

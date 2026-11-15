@@ -39,6 +39,80 @@ pub fn kill_portal_child() {
     }
 }
 
+/// Where a picture of `source` size lies in a `frame` of another shape when its own shape is
+/// kept: (x, y, width, height), centred, the rest being bars. The arithmetic is the one
+/// `vapostproc add-borders=true` and `videoscale add-borders=true` share (the GPU capture and
+/// the gst-launch capture: measured identical for every size tried), with square pixels on
+/// both sides: the frame's width is filled when the height that goes with it fits (rounded
+/// down), its height otherwise. A fit that is less than a pixel short fills the frame, which
+/// is why 16:9 pictures fill 854x480 (0.08% wider than 16:9).
+pub fn letterbox(source: (u32, u32), frame: (u32, u32)) -> (u32, u32, u32, u32) {
+    let (sw, sh, w, h) = (source.0 as u64, source.1 as u64, frame.0 as u64, frame.1 as u64);
+    if sw == 0 || sh == 0 || sw * h == sh * w {
+        return (0, 0, frame.0, frame.1);
+    }
+    let fitted_h = w * sh / sw;
+    if fitted_h <= h {
+        (0, ((h - fitted_h) / 2) as u32, frame.0, fitted_h as u32)
+    } else {
+        let fitted_w = h * sw / sh;
+        (((w - fitted_w) / 2) as u32, 0, fitted_w as u32, frame.1)
+    }
+}
+
+/// Where the captures put a picture of `source` size in the stream's `frame`: `letterbox`,
+/// except that a fit one pixel short of the frame fills it. Such a bar is rounding (1366x768
+/// is 1079.4 rows high in 1920x1080), and in NV12 it would cost the picture's last row its
+/// colour too (they share their chroma samples). The GPU capture follows this for every
+/// picture; the gst-launch capture for a monitor whose size it is told
+/// (`gst_launch_capture_args`).
+pub fn picture_rect(source: (u32, u32), frame: (u32, u32)) -> (u32, u32, u32, u32) {
+    let (x, y, w, h) = letterbox(source, frame);
+    if frame.0 - w <= 1 && frame.1 - h <= 1 {
+        return (0, 0, frame.0, frame.1);
+    }
+    (x, y, w, h)
+}
+
+/// The arguments of the gst-launch capture: pictures of PipeWire node `source` (pipewiresrc
+/// properties: `fd=`, `path=`) as BGRA frames of `dst_w` x `dst_h` on its standard output.
+/// The picture keeps its shape: it is scaled to fit the frame and centred, the rest of the
+/// frame being black bars (`videoscale add-borders`, which needs square pixels named on
+/// both sides: asked for a pixel shape, pipewiresrc otherwise settles on 1/2147483647, and
+/// with none named behind it videoscale stretches the picture and changes the pixel shape
+/// instead, which the pipe does not carry). The in-process GPU capture puts the picture at
+/// the same place (`letterbox`).
+///
+/// `monitor`: the size of the monitor shared, when the source is one and its size is known.
+/// The pipeline cannot be told a size once it runs, and videoscale leaves a bar one pixel
+/// thin where the fit is a pixel short (1366x768 in 1920x1080 or 1280x720: one black row
+/// at the bottom), which the GPU capture does not (`picture_rect`). For just such a monitor
+/// the picture is scaled to fill the frame, as it was before the bars existed. A window's
+/// size changes while it is shared, so a window always gets the bars.
+#[cfg(target_os = "linux")]
+pub fn gst_launch_capture_args(source: &[String], dst_w: u32, dst_h: u32, target_fps: u64, monitor: Option<(u32, u32)>) -> Vec<String> {
+    let whole = (0, 0, dst_w, dst_h);
+    let fill = monitor.is_some_and(|size| letterbox(size, (dst_w, dst_h)) != whole && picture_rect(size, (dst_w, dst_h)) == whole);
+    let (square, scale): (&str, &[&str]) = if fill { ("", &["videoscale"]) } else { (",pixel-aspect-ratio=1/1", &["videoscale", "add-borders=true"]) };
+    let mut args = vec!["-q".to_string(), "pipewiresrc".to_string()];
+    args.extend(source.iter().cloned());
+    args.extend(["do-timestamp=true", "!"].map(String::from));
+    if !fill {
+        args.extend(["video/x-raw,pixel-aspect-ratio=1/1", "!"].map(String::from));
+    }
+    args.extend(["videoconvert", "n-threads=4", "!"].map(String::from));
+    args.extend(scale.iter().map(|s| s.to_string()));
+    args.push("!".to_string());
+    let frame = format!("video/x-raw,format=BGRA,width={},height={}{}", dst_w, dst_h, square);
+    if target_fps > 0 && target_fps < 120 {
+        args.extend(["videorate".to_string(), "!".to_string(), format!("{},framerate={}/1", frame, target_fps)]);
+    } else {
+        args.push(frame);
+    }
+    args.extend(["!", "queue", "max-size-buffers=1", "max-size-bytes=0", "max-size-time=0", "leaky=downstream", "!", "fdsink", "fd=1", "sync=false"].map(String::from));
+    args
+}
+
 #[cfg(target_os = "linux")]
 pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: u64) {
     if PORTAL_CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -245,40 +319,9 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
             let (dst_w, dst_h) = (target_w, target_h);
             let frame_size = (dst_w * dst_h * 4) as usize;
 
-            let mut gst_args = vec![
-                "-q".to_string(),
-                "pipewiresrc".to_string(),
-                format!("fd={}", raw_fd),
-                format!("path={}", node_id),
-                "do-timestamp=true".to_string(),
-                "!".to_string(),
-                "videoconvert".to_string(),
-                "n-threads=4".to_string(),
-                "!".to_string(),
-                "videoscale".to_string(),
-                "!".to_string(),
-            ];
-
-            if target_fps > 0 && target_fps < 120 {
-                gst_args.push("videorate".to_string());
-                gst_args.push("!".to_string());
-                gst_args.push(format!("video/x-raw,format=BGRA,width={},height={},framerate={}/1", dst_w, dst_h, target_fps));
-            } else {
-                gst_args.push(format!("video/x-raw,format=BGRA,width={},height={}", dst_w, dst_h));
-            }
-
-            gst_args.extend_from_slice(&[
-                "!".to_string(),
-                "queue".to_string(),
-                "max-size-buffers=1".to_string(),
-                "max-size-bytes=0".to_string(),
-                "max-size-time=0".to_string(),
-                "leaky=downstream".to_string(),
-                "!".to_string(),
-                "fdsink".to_string(),
-                "fd=1".to_string(),
-                "sync=false".to_string(),
-            ]);
+            // (The portal gives a monitor's size in the compositor's coordinates: its shape.)
+            let monitor = stream.size().filter(|_| stream.source_type() == Some(SourceType::Monitor)).map(|(w, h)| (w.max(0) as u32, h.max(0) as u32));
+            let gst_args = gst_launch_capture_args(&[format!("fd={}", raw_fd), format!("path={}", node_id)], dst_w, dst_h, target_fps, monitor);
 
             log::info!("🔧 GStreamer pipeline args: {:?}", gst_args);
 

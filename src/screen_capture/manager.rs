@@ -1103,7 +1103,8 @@ impl ScreenCaptureManager {
                             if want_idr {
                                 last_idr = Instant::now();
                             }
-                            super::linux_gpu_tx::next_au(REQUESTED_BITRATE_BPS.load(Ordering::Relaxed), want_idr)
+                            // (`efficient`: the capture's encoder follows the viewers' profile too.)
+                            super::linux_gpu_tx::next_au(REQUESTED_BITRATE_BPS.load(Ordering::Relaxed), want_idr, efficient)
                         }
                         #[cfg(not(any(windows, all(target_os = "linux", feature = "vaapi"))))]
                         None
