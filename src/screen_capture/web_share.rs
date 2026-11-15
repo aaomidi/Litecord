@@ -372,7 +372,11 @@ async fn run_rtc(
         } else if count == 0 {
             stats_since = Instant::now();
         }
-        if state.viewers.swap(count, Ordering::Relaxed) != count { status_changed(); }
+        let before = state.viewers.swap(count, Ordering::Relaxed);
+        if before != count { status_changed(); }
+        // Asked for again now that the send loop can count the new viewer: it encodes for
+        // browsers (profile, bitrate) and offers them pictures only in turns that counted one.
+        if count > before { super::request_intra_keyframe(); }
         if viewers.is_empty() { audio = None; }
         tokio::select! {
             biased;

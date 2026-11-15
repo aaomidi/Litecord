@@ -3,8 +3,10 @@
 //!   frames (BGRA) -> vapostproc (to NV12, on the GPU) -> vah264enc -> appsink
 //!
 //! What the receivers need from it, each found by running them against vah264enc:
-//! - Constrained Baseline only: with Main/High the encoder's picture order counts make the
-//!   OpenH264 receiver show about three pictures per keyframe.
+//! - Constrained Baseline unless every viewer says it handles Main: with Main/High the
+//!   encoder's picture order counts make the OpenH264 receiver show about three pictures per
+//!   keyframe. Main (`set_efficient_profile`) is the same pipeline with other caps: CABAC,
+//!   still one P picture per frame, padded and declared the same way.
 //! - BT.601 limited range (vapostproc picks BT.709 at 1080p by itself), declared in the SPS
 //!   by `h264_vui::declare_colour` since vah264enc writes no colour description: matrix 6
 //!   (what every receiver converts with) with the desktop's own primaries and transfer (1),
@@ -56,12 +58,14 @@ const PROBE_SIZE: (u32, u32) = (640, 360);
 /// Test hook: `LITECORD_VAAPI_TEST_FAIL=init` fails construction, `after:N` makes every GPU
 /// frame from the Nth on fail at once, `stall:N` makes them time out for real. Two more
 /// numbers (`stall:N:COUNT:EVERY`) limit it to COUNT frames, one in EVERY: GPU hiccups.
+/// `main` makes every Main pipeline fail to start (a GPU without that profile).
 #[derive(Clone, Copy, PartialEq)]
 enum TestFail {
     None,
     Init,
     After,
     Stall,
+    Main,
 }
 
 struct TestHook {
@@ -80,6 +84,7 @@ impl TestHook {
             Some("init") => TestFail::Init,
             Some("after") => TestFail::After,
             Some("stall") => TestFail::Stall,
+            Some("main") => TestFail::Main,
             _ => TestFail::None,
         };
         let mut number = |default: u64| parts.next().and_then(|s| s.parse().ok()).unwrap_or(default);
@@ -88,7 +93,7 @@ impl TestHook {
 
     /// The failure to simulate for the next GPU frame, if any.
     fn next(&mut self, gpu_frames: u64) -> TestFail {
-        if self.fail == TestFail::None || gpu_frames < self.from || self.left == 0 {
+        if matches!(self.fail, TestFail::None | TestFail::Main) || gpu_frames < self.from || self.left == 0 {
             return TestFail::None;
         }
         self.calls += 1;
@@ -118,6 +123,46 @@ pub(crate) fn without_filler(au: Vec<u8>) -> Vec<u8> {
         from = r.end;
     }
     out
+}
+
+/// (level_idc, MaxBR in kbit/s) of H.264 table A-1. Baseline and Main streams may carry
+/// 1.2 times that, counting whole NAL units.
+const LEVEL_MAX_KBPS: [(u8, u32); 16] = [
+    (10, 64),
+    (11, 192),
+    (12, 384),
+    (13, 768),
+    (20, 2_000),
+    (21, 4_000),
+    (22, 4_000),
+    (30, 10_000),
+    (31, 14_000),
+    (32, 20_000),
+    (40, 20_000),
+    (41, 50_000),
+    (42, 50_000),
+    (50, 135_000),
+    (51, 240_000),
+    (52, 240_000),
+];
+
+/// vah264enc picks the level of a stream from its picture size and frame rate alone:
+/// 1080p30 comes out as level 4.0 and 720p60 as 3.2 (both end at 24 Mbps) whatever the
+/// bitrate. Every SPS of `au` whose level does not allow `bitrate_bps` is given the lowest
+/// one that does. Only that byte changes: the frame buffering is in the VUI.
+fn raise_level(au: &mut [u8], bitrate_bps: u32) {
+    let allows = |max_kbps: u32| max_kbps as u64 * 1200 >= bitrate_bps as u64;
+    for r in nal_ranges(au) {
+        if au[r.start] & 0x1f != 7 || r.len() < 4 {
+            continue;
+        }
+        let written = au[r.start + 3];
+        if LEVEL_MAX_KBPS.iter().any(|&(level, max)| level == written && !allows(max)) {
+            if let Some(&(level, _)) = LEVEL_MAX_KBPS.iter().find(|&&(level, max)| level > written && allows(max)) {
+                au[r.start + 3] = level;
+            }
+        }
+    }
 }
 
 /// Pipelines being stopped right now, and whether the process is about to exit. Mesa's VA
@@ -173,24 +218,26 @@ enum PullError {
 impl EncodeChain {
     /// The size is named after vapostproc: an encoder that cannot take it fails to
     /// negotiate instead of getting a scaled picture.
-    fn description(element: &str, width: u32, height: u32, bitrate_bps: u32) -> String {
-        Self::description_with(element, width, height, bitrate_bps, "")
+    fn description(element: &str, width: u32, height: u32, bitrate_bps: u32, min_qp: u32, main: bool) -> String {
+        Self::description_with(element, width, height, bitrate_bps, min_qp, main, "")
     }
 
     /// For a source of any size (the in-process screen capture hands vapostproc pictures
     /// of the monitor's size): vapostproc scales to this size, stretched to fill it.
-    pub(crate) fn description_scaled(element: &str, width: u32, height: u32, bitrate_bps: u32) -> String {
-        Self::description_with(element, width, height, bitrate_bps, ",pixel-aspect-ratio=1/1")
+    pub(crate) fn description_scaled(element: &str, width: u32, height: u32, bitrate_bps: u32, min_qp: u32, main: bool) -> String {
+        Self::description_with(element, width, height, bitrate_bps, min_qp, main, ",pixel-aspect-ratio=1/1")
     }
 
-    fn description_with(element: &str, width: u32, height: u32, bitrate_bps: u32, more_caps: &str) -> String {
+    fn description_with(element: &str, width: u32, height: u32, bitrate_bps: u32, min_qp: u32, main: bool, more_caps: &str) -> String {
         format!(
             "vapostproc ! video/x-raw(memory:VAMemory),format=NV12,width={width},height={height},colorimetry=(string)2:4:7:1{more_caps} \
-             ! {element} name=enc {ENCODER_PROPS} bitrate={} cpb-size={} \
-             ! video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au \
+             ! {element} name=enc {ENCODER_PROPS} min-qp={min_qp} max-qp={} bitrate={} cpb-size={} \
+             ! video/x-h264,profile={},stream-format=byte-stream,alignment=au \
              ! appsink name=sink sync=false async=false max-buffers=4 drop=false emit-signals=false enable-last-sample=false",
+            MAX_QP.max(min_qp),
             bitrate_bps / 1000,
-            cpb_size_kbit(bitrate_bps)
+            cpb_size_kbit(bitrate_bps),
+            if main { "main" } else { "constrained-baseline" }
         )
     }
 
@@ -315,9 +362,10 @@ impl Drop for EncodeChain {
 /// - `cbr` keeps pictures near the frame budget on busy content (IDR about 4 frames' worth);
 ///   `vbr` let single keyframes reach 800 kB. CBR's padding is removed (`without_filler`).
 /// - On a quiet screen the rate control has bits to spare and spends them on the keyframe:
-///   only a QP floor holds it back. `min-qp=30` gave 215 kB keyframes where no floor gave
-///   300-440 kB (OpenH264: 170-190 kB, at lower quality in both keyframes and P pictures);
-///   each 2 steps of QP are worth about 10% of the size.
+///   only a QP floor holds it back. `min-qp=30` (the default of the "quality floor"
+///   setting) gave 215 kB keyframes where no floor gave 300-440 kB (OpenH264: 170-190 kB,
+///   at lower quality in both keyframes and P pictures); each 2 steps of QP are worth
+///   about 10% of the size.
 /// - `cpb-size` (see `cpb_size_kbit`) caps a keyframe at half a second of the bitrate.
 /// - `max-qp=44` is for the pictures the rate control starves: the first keyframe of a
 ///   pipeline (25-26 dB instead of 21-25 on an IDE screen) and every keyframe of dense text
@@ -325,7 +373,9 @@ impl Drop for EncodeChain {
 ///   keyframes pass the cap by 12% and the stream its target by 12% at 30 FPS, 24% at 60
 ///   (5% and 12% without the bound). `max-qp=42` tripled the excess for 1.5 dB more.
 const ENCODER_PROPS: &str =
-    "rate-control=cbr min-qp=30 max-qp=44 target-usage=3 key-int-max=1024 b-frames=0 i-frames=0 ref-frames=1 num-slices=1 aud=false cc-insert=false";
+    "rate-control=cbr target-usage=3 key-int-max=1024 b-frames=0 i-frames=0 ref-frames=1 num-slices=1 aud=false cc-insert=false";
+/// `max-qp` (see above), unless the QP floor is set higher.
+const MAX_QP: u32 = 44;
 
 /// The smallest buffer vah264enc accepts (half a second of the bitrate; smaller values are
 /// silently replaced by two seconds). Not a hard limit: keyframes came out up to 3% larger
@@ -395,12 +445,15 @@ struct Session {
     height: u32,
     /// Rate the encoder element runs at now.
     bitrate_bps: u32,
+    /// H.264 Main instead of Constrained Baseline.
+    main: bool,
     frames: u64,
 }
 
 impl Session {
-    fn start(element: &str, width: u32, height: u32, fps: u32, bitrate_bps: u32) -> Result<Self, String> {
-        let description = format!("{} ! {}", MemorySource::description(width, height, fps), EncodeChain::description(element, width, height, bitrate_bps));
+    fn start(element: &str, width: u32, height: u32, fps: u32, bitrate_bps: u32, min_qp: u32, main: bool) -> Result<Self, String> {
+        let description =
+            format!("{} ! {}", MemorySource::description(width, height, fps), EncodeChain::description(element, width, height, bitrate_bps, min_qp, main));
         let pipeline = gst::parse::launch(&description)
             .map_err(|e| e.to_string())?
             .downcast::<gst::Pipeline>()
@@ -411,7 +464,7 @@ impl Session {
         if let Err(e) = chain.pipeline.set_state(gst::State::Playing) {
             return Err(format!("{e}: {}", chain.bus_error().unwrap_or_default()));
         }
-        Ok(Self { source, chain, width, height, bitrate_bps, frames: 0 })
+        Ok(Self { source, chain, width, height, bitrate_bps, main, frames: 0 })
     }
 }
 
@@ -438,6 +491,18 @@ pub struct VaapiEncoder {
     software: Option<OpenH264Encoder>,
     software_since: Instant,
     gpu_retry_after: Duration,
+    /// QP floor of this stream (the "quality floor" setting when the encoder was created).
+    min_qp: u32,
+    /// What `set_efficient_profile` asked for last.
+    want_main: bool,
+    /// Main is not available on this machine: Constrained Baseline only (`main_unavailable`).
+    main_failed: bool,
+    /// A Main pipeline of this encoder has put out its keyframe.
+    main_proven: bool,
+    /// The one late first picture a Main pipeline is forgiven has happened.
+    main_was_late: bool,
+    /// The rate the level written in the SPS allows (see `raise_level`).
+    level_bitrate_bps: u32,
     test: TestHook,
 }
 
@@ -453,12 +518,13 @@ impl VaapiEncoder {
         if gst::ElementFactory::find("vapostproc").is_none() {
             return Err("plugin VA-API do GStreamer ausente (gst-plugin-va)".into());
         }
+        let min_qp = crate::video_settings::get_stream_min_qp();
         let mut last_error = String::from("nenhum codificador H.264 VA-API registrado");
         for element in ENCODER_ELEMENTS {
             if gst::ElementFactory::find(element).is_none() {
                 continue;
             }
-            match Self::probe(element, target_fps) {
+            match Self::probe(element, target_fps, min_qp) {
                 Ok(took) => {
                     info!("🚀 [VAAPI] {} respondeu ao teste em {:.0} ms (Constrained Baseline)", element, took.as_secs_f64() * 1000.0);
                     return Ok(Self {
@@ -479,6 +545,12 @@ impl VaapiEncoder {
                         software: None,
                         software_since: Instant::now(),
                         gpu_retry_after: GPU_RETRY_AFTER,
+                        min_qp,
+                        want_main: false,
+                        main_failed: false,
+                        main_proven: false,
+                        main_was_late: false,
+                        level_bitrate_bps: 0,
                         test,
                     });
                 }
@@ -489,10 +561,10 @@ impl VaapiEncoder {
     }
 
     /// Encodes one black frame with the stream's own pipeline and checks what comes out.
-    fn probe(element: &str, fps: u32) -> Result<Duration, String> {
+    fn probe(element: &str, fps: u32, min_qp: u32) -> Result<Duration, String> {
         let started = Instant::now();
         let (w, h) = PROBE_SIZE;
-        let session = Session::start(element, w, h, fps, INITIAL_BITRATE_BPS)?;
+        let session = Session::start(element, w, h, fps, INITIAL_BITRATE_BPS, min_qp, false)?;
         let frame = vec![0u8; (w * h * 4) as usize];
         session.source.push(&frame, w as usize, h as usize, (w * 4) as usize, gst::ClockTime::ZERO)?;
         let au = match session.chain.pull(gst::ClockTime::ZERO, PROBE_TIMEOUT) {
@@ -500,7 +572,7 @@ impl VaapiEncoder {
             Err(PullError::Timeout) => return Err("sem resposta do codificador".into()),
             Err(PullError::Broken(e)) => return Err(e),
         };
-        check_keyframe(&au)?;
+        check_keyframe(&au, false)?;
         Ok(started.elapsed())
     }
 
@@ -515,11 +587,41 @@ impl VaapiEncoder {
             TestFail::After => return Err("falha simulada (LITECORD_VAAPI_TEST_FAIL=after)".into()),
             fail => fail == TestFail::Stall,
         };
-        if self.session.as_ref().map(|s| (s.width, s.height) != (w, h)).unwrap_or(true) {
+        // Coming back from OpenH264, only with a profile this GPU has already produced.
+        let main = self.want_main && !self.main_failed && (self.main_proven || self.software.is_none());
+        // vah264enc does not change its profile while it runs (asked to, the pipeline stops
+        // with an error): the pipeline is replaced, which starts with a keyframe. To Main
+        // only when the caller asked for a keyframe anyway; back to Constrained Baseline at
+        // once, since a viewer that cannot decode Main is watching.
+        let switch_profile = self.session.as_ref().is_some_and(|s| s.main != main && (self.needs_keyframe || !main));
+        if switch_profile {
+            info!("🔀 [VAAPI] Perfil H.264 da transmissão muda para {}", profile_name(main));
+        }
+        if switch_profile || self.session.as_ref().map(|s| (s.width, s.height) != (w, h)).unwrap_or(true) {
             // The old pipeline is stopped before the new one starts.
             self.session = None;
-            let session = Session::start(self.element, w, h, self.target_fps, self.bitrate_bps)?;
-            info!("🚀 [VAAPI] Pipeline {} iniciado: {}x{} {} FPS, {:.1} Mbps", self.element, w, h, self.target_fps, self.bitrate_bps as f64 / 1e6);
+            let started = if main && self.test.fail == TestFail::Main {
+                Err("falha simulada (LITECORD_VAAPI_TEST_FAIL=main)".to_string())
+            } else {
+                Session::start(self.element, w, h, self.target_fps, self.bitrate_bps, self.min_qp, main)
+            };
+            let session = match started {
+                Ok(session) => session,
+                Err(e) => {
+                    self.main_unavailable(main, false);
+                    return Err(e);
+                }
+            };
+            info!(
+                "🚀 [VAAPI] Pipeline {} iniciado: {}x{} {} FPS, {:.1} Mbps, perfil {}, min-qp {}",
+                self.element,
+                w,
+                h,
+                self.target_fps,
+                self.bitrate_bps as f64 / 1e6,
+                profile_name(main),
+                self.min_qp
+            );
             self.session = Some(session);
             // A new pipeline starts with an IDR by itself.
             self.needs_keyframe = false;
@@ -527,6 +629,9 @@ impl VaapiEncoder {
         let pts = self.next_pts();
         let Some(session) = self.session.as_mut() else { return Err("sem pipeline".into()) };
         let first = session.frames == 0;
+        let first_of_main = first && session.main;
+        // A first picture that came late was thrown away: the keyframe after it is checked.
+        let check_main = session.main && (first || !self.main_proven);
 
         let rate_due = session.bitrate_bps != self.bitrate_bps && (self.needs_keyframe || self.bitrate_asked_at.elapsed() >= BITRATE_MAX_WAIT);
         if rate_due {
@@ -538,6 +643,7 @@ impl VaapiEncoder {
         if !stall {
             if let Err(e) = session.source.push(bgra, w as usize, h as usize, stride, pts) {
                 self.session = None;
+                self.main_unavailable(first_of_main, false);
                 return Err(e);
             }
         }
@@ -549,10 +655,12 @@ impl VaapiEncoder {
                 // next one must not reference it.
                 self.needs_keyframe = true;
                 self.lost_picture = true;
+                self.main_unavailable(first_of_main, true);
                 return Err(format!("sem resposta em {} ms", timeout.as_millis()));
             }
             Err(PullError::Broken(e)) => {
                 self.session = None;
+                self.main_unavailable(first_of_main, false);
                 return Err(e);
             }
         };
@@ -578,9 +686,35 @@ impl VaapiEncoder {
             }
             return Ok(au);
         }
+        if check_main {
+            if let Err(e) = check_keyframe(&au, true) {
+                // Not the Main stream the viewers said they decode.
+                self.session = None;
+                self.needs_keyframe = true;
+                self.main_unavailable(true, false);
+                return Err(e);
+            }
+            self.main_proven = true;
+        }
         self.needs_keyframe = false;
         self.lost_picture = false;
-        Ok(super::h264_vui::declare_colour(&au, 1, 1, 6))
+        // The highest rate of the stream so far, so the level does not follow every change.
+        self.level_bitrate_bps = self.level_bitrate_bps.max(session.bitrate_bps);
+        let mut au = super::h264_vui::declare_colour(&au, 1, 1, 6);
+        raise_level(&mut au, self.level_bitrate_bps);
+        Ok(au)
+    }
+
+    /// A Main pipeline gave no first picture (`failed`). Unless Main has worked on this
+    /// encoder before (then the GPU is in trouble, like with any lost frame), the stream
+    /// stays on Constrained Baseline, which the construction test proved. A picture that
+    /// is only `late` is forgiven once: a busy GPU does that to any new pipeline.
+    fn main_unavailable(&mut self, failed: bool, late: bool) {
+        if !failed || self.main_failed || self.main_proven || (late && !std::mem::replace(&mut self.main_was_late, true)) {
+            return;
+        }
+        self.main_failed = true;
+        warn!("⚠️ [VAAPI] Perfil Main indisponível neste codificador; a transmissão segue em Constrained Baseline");
     }
 
     /// Drops the pipeline without waiting for it to stop: it is being given up on.
@@ -631,9 +765,17 @@ impl VaapiEncoder {
     }
 }
 
+fn profile_name(main: bool) -> &'static str {
+    if main {
+        "Main"
+    } else {
+        "Constrained Baseline"
+    }
+}
+
 /// An access unit that opens a stream the receivers accept: Annex B, IDR with SPS and PPS,
-/// Constrained Baseline.
-pub(crate) fn check_keyframe(au: &[u8]) -> Result<(), String> {
+/// Constrained Baseline (or Main, when that was asked for).
+pub(crate) fn check_keyframe(au: &[u8], main: bool) -> Result<(), String> {
     if !matches!(au, [0, 0, 1, ..] | [0, 0, 0, 1, ..]) {
         return Err("saída sem start code".into());
     }
@@ -643,8 +785,8 @@ pub(crate) fn check_keyframe(au: &[u8]) -> Result<(), String> {
         return Err("primeiro quadro sem SPS/PPS/IDR".into());
     }
     let sps = ranges.iter().map(|r| &au[r.clone()]).find(|n| n[0] & 0x1f == 7).filter(|n| n.len() >= 3).ok_or("SPS curto")?;
-    // profile_idc 66 with constraint_set1_flag.
-    if sps[1] != 66 || sps[2] & 0x40 == 0 {
+    // profile_idc 66 with constraint_set1_flag, or 77.
+    if if main { sps[1] != 77 } else { sps[1] != 66 || sps[2] & 0x40 == 0 } {
         return Err(format!("perfil H.264 inesperado (profile_idc {}, flags {:#04x})", sps[1], sps[2]));
     }
     Ok(())
@@ -715,6 +857,10 @@ impl VideoEncoder for VaapiEncoder {
 
     fn get_bitrate_bps(&self) -> u32 {
         self.bitrate_bps
+    }
+
+    fn set_efficient_profile(&mut self, on: bool) {
+        self.want_main = on;
     }
 
     fn name(&self) -> &'static str {

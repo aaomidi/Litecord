@@ -2388,6 +2388,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Stream quality (advanced): read by the next screen share.
+    {
+        use slint::ComponentHandle;
+        let quality = app.global::<StreamQuality>();
+        quality.on_set_min_qp(|qp| video_settings::set_stream_min_qp(qp.max(0) as u32));
+        quality.on_set_max_bitrate(|mbps| video_settings::set_stream_max_bitrate_mbps(mbps.max(0) as u32));
+        quality.on_select_profile(|id: SharedString| video_settings::set_stream_profile(id.to_string()));
+    }
+
     let app_weak_notice = app_weak.clone();
     app.on_toggle_enable_self_preview_notice(move || {
         let new_val = video_settings::toggle_enable_self_preview_notice();

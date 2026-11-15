@@ -609,7 +609,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                     let begun = if memory == gpu::Memory::Auto && max_fps.is_none() {
                         gpu::begin(raw(&fd), node, size.0, size.1, fps, &wanted)
                     } else {
-                        gpu::begin_with(&gpu::Config { fd: raw(&fd), node, width: size.0, height: size.1, fps, memory, max_fps }, &wanted).map_err(|e| println!("  GPU capture did not start: {e}")).ok()
+                        gpu::begin_with(&gpu::Config { fd: raw(&fd), node, width: size.0, height: size.1, fps, memory, max_fps, min_qp: 30, main: std::env::var("LITECORD_TEST_CAPTURE_MAIN").is_ok() }, &wanted).map_err(|e| println!("  GPU capture did not start: {e}")).ok()
                     };
                     println!("  begin() returned after {} ms: {}", began.elapsed().as_millis(), if begun.is_some() { "started" } else { "not started" });
                     let ended = match begun {

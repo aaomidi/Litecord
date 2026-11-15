@@ -112,6 +112,11 @@ pub struct Config {
     pub memory: Memory,
     /// Experiments only: ask the compositor for at most this many pictures a second.
     pub max_fps: Option<u32>,
+    /// The encoder's QP floor (the stream quality setting).
+    pub min_qp: u32,
+    /// H.264 Main instead of Constrained Baseline, for the whole share: this pipeline
+    /// cannot change its profile while it runs.
+    pub main: bool,
 }
 
 impl Config {
@@ -124,7 +129,11 @@ impl Config {
             _ => Memory::Auto,
         };
         let max_fps = std::env::var("LITECORD_VAAPI_CAPTURE_MAXFPS").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0);
-        Self { fd, node, width, height, fps, memory, max_fps }
+        // Automatic stays on Constrained Baseline here (see `main`); only the explicit
+        // Efficient setting gives Main on this path.
+        let min_qp = crate::video_settings::get_stream_min_qp();
+        let main = crate::video_settings::get_stream_profile() == crate::video_settings::StreamProfile::Efficient;
+        Self { fd, node, width, height, fps, memory, max_fps, min_qp, main }
     }
 }
 
@@ -282,6 +291,7 @@ struct Stream {
     gone: AtomicBool,
     /// The first picture came out: the pipeline's start is over.
     start_over: bool,
+    main: bool,
     test_fail: TestFail,
     source_caps: String,
     converter_caps: String,
@@ -411,7 +421,7 @@ impl Stream {
              ! queue name=cap_queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream \
              ! {chain}",
             node = cfg.node,
-            chain = EncodeChain::description_scaled(element, width, height, vaapi::INITIAL_BITRATE_BPS),
+            chain = EncodeChain::description_scaled(element, width, height, vaapi::INITIAL_BITRATE_BPS, cfg.min_qp, cfg.main),
         );
         let pipeline = gst::parse::launch(&description)
             .map_err(|e| e.to_string())?
@@ -475,6 +485,7 @@ impl Stream {
             buffers_removed: AtomicBool::new(false),
             gone: AtomicBool::new(false),
             start_over: false,
+            main: cfg.main,
             test_fail,
             source_caps: String::new(),
             converter_caps: String::new(),
@@ -525,7 +536,7 @@ impl Stream {
         };
         let buffer = sample.buffer().ok_or("amostra sem buffer")?;
         let map = buffer.map_readable().map_err(|e| e.to_string())?;
-        vaapi::check_keyframe(map.as_slice())?;
+        vaapi::check_keyframe(map.as_slice(), self.main)?;
         lock(&self.shared.in_flight).clear();
 
         let caps = filter.static_pad("src").and_then(|p| p.current_caps()).ok_or("sem caps negociadas")?;
