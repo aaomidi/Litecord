@@ -47,12 +47,22 @@ impl Viewers {
         Self { list: HashMap::new(), bound: HashMap::new() }
     }
 
-    pub fn watch(&mut self, uid: u64, public: [u8; 32], addr: SocketAddr, in_channel: bool, now: Instant) -> Verdict {
+    /// Who may ask this stream for anything: someone in the channel, under the first key
+    /// that user id showed. Does not put the user on the list (see `watch`).
+    pub fn admit(&mut self, uid: u64, public: [u8; 32], in_channel: bool) -> Verdict {
         if !in_channel {
             return Verdict::NotInChannel;
         }
         if *self.bound.entry(uid).or_insert(public) != public {
             return Verdict::KeyMismatch;
+        }
+        Verdict::Accepted { new: false }
+    }
+
+    pub fn watch(&mut self, uid: u64, public: [u8; 32], addr: SocketAddr, in_channel: bool, now: Instant) -> Verdict {
+        let verdict = self.admit(uid, public, in_channel);
+        if verdict != (Verdict::Accepted { new: false }) {
+            return verdict;
         }
         let new = self.list.get(&uid).map_or(true, |v| now.duration_since(v.last_seen) >= LEASE);
         let loss = self.list.get(&uid).and_then(|v| v.loss);
@@ -169,6 +179,13 @@ pub fn session_key() -> Option<[u8; 32]> {
 pub fn on_watch(uid: u64, public: [u8; 32], addr: SocketAddr, in_channel: bool) -> Option<Verdict> {
     let mut s = SESSION.lock().unwrap_or_else(|e| e.into_inner());
     Some(s.as_mut()?.viewers.watch(uid, public, addr, in_channel, Instant::now()))
+}
+
+/// A request that is not a watch request (a browser link): the same check and the same
+/// key binding, without sending the stream to `uid`. `None` when not streaming.
+pub fn admit(uid: u64, public: [u8; 32], in_channel: bool) -> Option<Verdict> {
+    let mut s = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    Some(s.as_mut()?.viewers.admit(uid, public, in_channel))
 }
 
 /// Whether `uid` was watching (UNWATCH is sent three times).

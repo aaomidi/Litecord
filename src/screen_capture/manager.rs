@@ -1577,6 +1577,8 @@ impl ScreenCaptureManager {
                 // Opus decoders of the streams being watched, by peer.
                 let mut audio_decoders: HashMap<u64, super::stream_audio::StreamAudioDecoder> = HashMap::new();
                 let mut requested: Vec<u64> = Vec::new();
+                let web_link_share: Arc<dyn super::web_link::WebShare> = Arc::new(super::web_link::AppWebShare);
+                let mut last_web_link_check = Instant::now();
 
                 let my_instance_id = get_process_instance_id();
                 let mut last_outbound_heartbeat = Instant::now() - Duration::from_secs(10);
@@ -1672,6 +1674,23 @@ impl ScreenCaptureManager {
                             }
                         }
                         requested = wanted;
+                    }
+
+                    // "Open in browser": the request for a browser link, repeated for a few seconds.
+                    if super::web_link::asking() && in_call && current_cid > 0 && my_uid > 0 {
+                        if let Some((peer, pkt)) = super::web_link::request_due(&super::web_link::Endpoint::local(my_instance_id, current_cid, my_uid)) {
+                            for addr in peer_addrs(peer, &peers_store) {
+                                let _ = socket.send_to(&pkt, addr);
+                            }
+                        }
+                    }
+                    // Sender side: a link given to somebody who left the call stops working.
+                    if is_tx_running.load(Ordering::Relaxed) && last_web_link_check.elapsed() >= Duration::from_secs(2) {
+                        last_web_link_check = Instant::now();
+                        let cid = current_voice_channel_fallback();
+                        if cid > 0 {
+                            super::web_link::stop_if_someone_left(web_link_share.as_ref(), |uid| in_my_voice_channel(uid, cid));
+                        }
                     }
 
                     // Heartbeats keep NAT routes open only where a stream flows (the watch
@@ -2278,6 +2297,19 @@ impl ScreenCaptureManager {
                                             }
                                         }
                                     }
+                                }
+                                OP_WEB_LINK_REQ => {
+                                    if is_tx_running.load(Ordering::Relaxed) {
+                                        let me = super::web_link::Endpoint::local(my_instance_id, my_current_cid, my_uid);
+                                        let in_channel = in_my_voice_channel(pkt_uid, my_current_cid);
+                                        let allowed = crate::utils::video_settings::get_allow_web_link_requests();
+                                        if let Some(reply) = super::web_link::handle_request(&recv_buf[..len], src_addr, &me, in_channel, allowed, &web_link_share) {
+                                            let _ = socket.send_to(&reply, src_addr);
+                                        }
+                                    }
+                                }
+                                OP_WEB_LINK_REPLY => {
+                                    super::web_link::handle_reply(&recv_buf[..len], &super::web_link::Endpoint::local(my_instance_id, my_current_cid, my_uid));
                                 }
                                 OP_STOP => {
                                     if len >= 25 {

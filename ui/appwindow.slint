@@ -159,6 +159,10 @@ export component AppWindow inherits Window {
     callback close_popout_window();
     callback hide_stream(string /* user_id */);
     callback unhide_stream(string /* user_id */);
+    // Asks the person streaming for a browser link and opens it; nothing is decoded here.
+    callback open_stream_in_browser(string /* user_id */);
+    // The person streaming opened the link window of web sharing that is already on.
+    callback web_share_link_shown();
     callback launch_stream_browser();
     callback click_command(string /* command_name */);
     callback handle_input_change(string /* text */);
@@ -327,6 +331,7 @@ export component AppWindow inherits Window {
     in-out property <string> selected_video_capture_backend: "auto";
     in-out property <string> selected_audio_loopback_backend: "auto";
     in-out property <bool> enable_self_preview_notice: true;
+    in-out property <bool> allow_web_link_requests: true;
     in-out property <bool> show_hardware_monitor: true;
     in-out property <bool> use_gpu_renderer: false;
     in-out property <string> selected_ui_scale: "0";
@@ -353,6 +358,7 @@ export component AppWindow inherits Window {
     callback select_video_capture_backend(string);
     callback select_audio_loopback_backend(string);
     callback toggle_enable_self_preview_notice();
+    callback toggle_allow_web_link_requests();
     callback toggle_hardware_monitor();
     callback toggle_gpu_renderer();
     callback select_ui_scale(string);
@@ -443,6 +449,8 @@ export component AppWindow inherits Window {
     in-out property <string> web_share_url: "";
     in-out property <string> web_share_error: "";
     in-out property <int> web_share_viewers: 0;
+    // The user whose browser link is being asked for ("" when none).
+    in-out property <string> web_link_pending_uid: "";
 
     if root.web_share_error != "": Rectangle {
         z: 100;
@@ -1482,6 +1490,7 @@ export component AppWindow inherits Window {
                                             if root.web_share_active {
                                                 root.web_share_copied = false;
                                                 root.show_web_share_modal = true;
+                                                root.web_share_link_shown();
                                             } else {
                                                 root.toggle_web_share();
                                             }
@@ -1993,6 +2002,57 @@ export component AppWindow inherits Window {
                                                     spacing: 6px;
                                                     alignment: end;
 
+                                                    // 4. browser (move someone else's stream to the browser: on success the app
+                                                    // stops watching it here - Priority 4, hidden when width < 210px)
+                                                    if (!p.is_self && stream_top_bar.width >= 210px): Rectangle {
+                                                        width: 28px;
+                                                        height: 24px;
+                                                        border-radius: 4px;
+                                                        background: card_web_ta.has-hover ? AppTheme.backdrop-max : AppTheme.backdrop;
+                                                        opacity: root.web_link_pending_uid != "" ? 0.5 : 1;
+                                                        accessible-role: button;
+                                                        accessible-label: Tr.open_in_browser;
+
+                                                        VerticalLayout {
+                                                            alignment: center;
+                                                            HorizontalLayout {
+                                                                alignment: center;
+                                                                Image {
+                                                                    source: @image-url("../assets/globe.svg");
+                                                                    width: 12px;
+                                                                    height: 12px;
+                                                                    colorize: AppTheme.text-on-accent;
+                                                                    image-fit: contain;
+                                                                }
+                                                            }
+                                                        }
+
+                                                        if card_web_ta.has-hover: Rectangle {
+                                                            z: 10;
+                                                            x: parent.width - self.width;
+                                                            y: parent.height + 6px;
+                                                            width: card_web_tip.preferred-width + 16px;
+                                                            height: 24px;
+                                                            border-radius: 4px;
+                                                            background: AppTheme.backdrop-max;
+                                                            card_web_tip := Text {
+                                                                text: Tr.open_in_browser;
+                                                                color: AppTheme.text-on-accent;
+                                                                font-size: TypeScale.caption;
+                                                                horizontal-alignment: center;
+                                                                vertical-alignment: center;
+                                                            }
+                                                        }
+
+                                                        card_web_ta := TouchArea {
+                                                            enabled: root.web_link_pending_uid == "";
+                                                            mouse-cursor: pointer;
+                                                            clicked => {
+                                                                root.open_stream_in_browser(p.user_id);
+                                                            }
+                                                        }
+                                                    }
+
                                                     // 3. max (Stream Card Focus / Expand Toggle - Priority 3, hidden when width < 160px)
                                                     if (stream_top_bar.width >= 160px): Rectangle {
                                                         width: 28px;
@@ -2407,6 +2467,57 @@ export component AppWindow inherits Window {
                                                              mouse-cursor: pointer;
                                                              clicked => {
                                                                  root.unhide_stream(p.user_id);
+                                                             }
+                                                         }
+                                                     }
+
+                                                     // Open in browser, next to Watch: asks the person streaming for a browser
+                                                     // link (the browser decodes on the GPU). Icon only, with the name on hover,
+                                                     // and after Watch: the row does not shrink, so what comes last is what a
+                                                     // narrow window cuts off, and that must not be Watch.
+                                                     if (p.is_streaming && !p.is_self): open_browser_btn := Rectangle {
+                                                         property <bool> asking: root.web_link_pending_uid == p.user_id;
+                                                         width: 26px;
+                                                         height: 22px;
+                                                         border-radius: 4px;
+                                                         border-width: 1px;
+                                                         border-color: AppTheme.accent;
+                                                         // Filled while its request is on the way (and on hover); the others dim.
+                                                         background: self.asking || open_browser_ta.has-hover ? AppTheme.accent : AppTheme.accent-subtle;
+                                                         opacity: root.web_link_pending_uid != "" && !self.asking ? 0.5 : 1;
+                                                         accessible-role: button;
+                                                         accessible-label: Tr.open_in_browser;
+
+                                                         Image {
+                                                             source: @image-url("../assets/globe.svg");
+                                                             width: 12px;
+                                                             height: 12px;
+                                                             colorize: open_browser_btn.asking || open_browser_ta.has-hover ? AppTheme.text-on-accent : AppTheme.accent-soft;
+                                                             image-fit: contain;
+                                                         }
+
+                                                         if open_browser_ta.has-hover || self.asking: Rectangle {
+                                                             z: 10;
+                                                             x: parent.width - self.width;
+                                                             y: -self.height - 6px;
+                                                             width: open_browser_tip.preferred-width + 16px;
+                                                             height: 24px;
+                                                             border-radius: 4px;
+                                                             background: AppTheme.backdrop-max;
+                                                             open_browser_tip := Text {
+                                                                 text: open_browser_btn.asking ? Tr.web_share_connecting : Tr.open_in_browser;
+                                                                 color: AppTheme.text-on-accent;
+                                                                 font-size: TypeScale.caption;
+                                                                 horizontal-alignment: center;
+                                                                 vertical-alignment: center;
+                                                             }
+                                                         }
+
+                                                         open_browser_ta := TouchArea {
+                                                             enabled: root.web_link_pending_uid == "";
+                                                             mouse-cursor: pointer;
+                                                             clicked => {
+                                                                 root.open_stream_in_browser(p.user_id);
                                                              }
                                                          }
                                                      }
@@ -3164,6 +3275,7 @@ export component AppWindow inherits Window {
         video_capture_options: root.video_capture_options;
         audio_loopback_options: root.audio_loopback_options;
         enable_self_preview_notice: root.enable_self_preview_notice;
+        allow_web_link_requests: root.allow_web_link_requests;
         show_hardware_monitor: root.show_hardware_monitor;
         use_gpu_renderer: root.use_gpu_renderer;
         selected_ui_scale: root.selected_ui_scale;
@@ -3202,6 +3314,7 @@ export component AppWindow inherits Window {
         select_video_capture_backend(arg0) => { root.select_video_capture_backend(arg0); }
         select_audio_loopback_backend(arg0) => { root.select_audio_loopback_backend(arg0); }
         toggle_enable_self_preview_notice => { root.toggle_enable_self_preview_notice(); }
+        toggle_allow_web_link_requests => { root.toggle_allow_web_link_requests(); }
         toggle_hardware_monitor => { root.toggle_hardware_monitor(); }
         toggle_gpu_renderer => { root.toggle_gpu_renderer(); }
         select_ui_scale(arg0) => { root.select_ui_scale(arg0); }

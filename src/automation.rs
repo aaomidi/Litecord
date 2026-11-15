@@ -38,6 +38,11 @@
 //! {"cmd":"resize","width":1920,"height":1080} set the window size in logical pixels
 //! {"cmd":"web_share_start"}                  start sharing to browsers; replies with the link
 //! {"cmd":"web_share_stop"}
+//! {"cmd":"open_in_browser","user_id":"123"}  same as the "Open in browser" button of a stream
+//! {"cmd":"demo_voice_stage","a":"Name"}      a made-up call (nothing is connected) with one
+//!                                            stream not watched (named "a" if given) and one
+//!                                            watched, to look at the voice stage without an
+//!                                            account
 //! {"cmd":"spawn_threads","n":100,"alloc":true} start and join n threads (that allocate):
 //!                                            what a thread that exits costs in memory
 //! ```
@@ -420,8 +425,43 @@ fn execute(ui: &AppWindow, cmd: &Value) -> Result<Value, String> {
             if !ui.get_web_share_active() && !ui.get_web_share_pending() { ui.invoke_toggle_web_share(); }
             Ok(json!({ "ok": true, "pending": ui.get_web_share_pending(), "url": ui.get_web_share_url().to_string() }))
         }
+        "open_in_browser" => {
+            let uid = cmd["user_id"].as_str().ok_or("missing \"user_id\"")?;
+            ui.invoke_open_stream_in_browser(uid.into());
+            Ok(json!({ "ok": true, "pending": ui.get_web_link_pending_uid().to_string() }))
+        }
+        "demo_voice_stage" => {
+            let person = |id: &str, name: &str, is_self: bool, is_streaming: bool, is_stream_hidden: bool| crate::VoiceParticipant {
+                user_id: id.into(),
+                username: name.into(),
+                avatar_text: name.chars().next().unwrap_or('?').to_string().into(),
+                avatar_url: "".into(),
+                avatar_img: Default::default(),
+                is_speaking: false,
+                audio_level: 0.0,
+                is_muted: false,
+                volume: 1.0,
+                priority: 0,
+                is_self,
+                is_streaming,
+                is_stream_hidden,
+            };
+            let people = vec![
+                person("1", "Me", true, false, false),
+                person("2", cmd["a"].as_str().unwrap_or("Streaming, not watched"), false, true, true),
+                person("3", "Streaming, watched here", false, true, false),
+            ];
+            ui.set_voice_participants(std::rc::Rc::new(slint::VecModel::from(people)).into());
+            ui.set_has_active_stream(true);
+            ui.set_active_stream_user_id("3".into());
+            ui.set_is_logged_in(true);
+            ui.set_is_in_voice(true);
+            ui.set_is_voice_focused(true);
+            Ok(json!({ "ok": true }))
+        }
         "web_share_stop" => {
             crate::screen_capture::web_share::stop();
+            crate::screen_capture::web_link::stopped_by_hand();
             ui.set_web_share_active(false);
             ui.set_web_share_url("".into());
             Ok(json!({ "ok": true }))
@@ -487,6 +527,9 @@ fn state(ui: &AppWindow) -> Value {
             "web_url": ui.get_web_share_url().to_string(),
             "web_error": ui.get_web_share_error().to_string(),
             "web_viewers": crate::screen_capture::web_share::viewer_count(),
+            "web_auto_started": crate::screen_capture::web_link::is_auto_started(),
+            "web_link_pending": ui.get_web_link_pending_uid().to_string(),
+            "allow_web_link_requests": ui.get_allow_web_link_requests(),
             "is_screen_sharing": ui.get_is_screen_sharing(),
             "has_active_stream": ui.get_has_active_stream(),
             "active_stream_user": ui.get_active_stream_user().to_string(),

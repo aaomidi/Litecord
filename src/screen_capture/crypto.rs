@@ -46,6 +46,30 @@ fn pair_key_from(secret: &StaticSecret, peer_public: &[u8; 32], uid_a: u64, uid_
     hasher.finalize().into()
 }
 
+/// A key pair of its own, for code that runs more than one endpoint in a process (the
+/// test binaries); the app itself always speaks with the process-wide pair above.
+pub struct Identity {
+    secret: StaticSecret,
+    public: [u8; 32],
+}
+
+impl Identity {
+    pub fn generate() -> Self {
+        let secret = StaticSecret::from(rand::random::<[u8; 32]>());
+        let public = *PublicKey::from(&secret).as_bytes();
+        Self { secret, public }
+    }
+
+    pub fn public(&self) -> [u8; 32] {
+        self.public
+    }
+
+    /// Same derivation as `pair_key`.
+    pub fn pair_key(&self, peer_public: &[u8; 32], my_uid: u64, peer_uid: u64, cid: u64) -> [u8; 32] {
+        pair_key_from(&self.secret, peer_public, my_uid, peer_uid, cid)
+    }
+}
+
 /// Deriva uma chave AES de 32 bytes exclusiva e sincronizada para todos os participantes do canal de voz
 pub fn get_voice_encryption_key(cid: u64) -> [u8; 32] {
     let mut hasher = Sha256::new();

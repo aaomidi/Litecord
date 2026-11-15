@@ -329,6 +329,7 @@ pub fn populate_video_interface_settings(ui: &AppWindow) {
     ui.set_selected_video_capture_backend(vcap.clone().into());
     ui.set_selected_audio_loopback_backend(aloop.clone().into());
     ui.set_enable_self_preview_notice(notice);
+    ui.set_allow_web_link_requests(video_settings::get_allow_web_link_requests());
     ui.set_show_hardware_monitor(show_hw);
     ui.set_use_light_theme(use_light_theme);
 
