@@ -202,6 +202,9 @@ const CHECK_GAP: Duration = Duration::from_millis(150);
 /// a moment later (7 ms with Mutter); a source that only changed its format reports none.
 /// How long "buffers taken away" waits to learn which it was.
 const SOURCE_GONE_WAIT: Duration = Duration::from_millis(100);
+/// PipeWire's stream error when the node it is linked to has gone (`node.dont-fallback`):
+/// "stream error: defined target not found".
+const SOURCE_GONE_ERROR: &str = "target not found";
 /// Replacing the encoder waits for the picture on its way into the old one: a frame's time
 /// at most. After this long the streaming thread is stuck in it.
 const SWITCH_IDLE_TIMEOUT: Duration = Duration::from_millis(300);
@@ -1333,8 +1336,14 @@ impl Stream {
             }
             if msg.src().is_some_and(|s| s.name() == "cap_src") {
                 if e.error().matches(gst::ResourceError::Failed) {
-                    // "stream error: ...": PipeWire failed the stream (its node is gone).
-                    self.gone.store(true, Ordering::SeqCst);
+                    // "stream error: ...": PipeWire failed the stream. Its node is gone only when
+                    // it says so; xdg-desktop-portal-hyprland renegotiates a window's stream at
+                    // each resize, and a renegotiation that fails ("no more input formats")
+                    // leaves the node there for the capture that takes over.
+                    warn!("⚠️ [VAAPI] Fluxo do PipeWire falhou: {}", e.error());
+                    if e.error().message().contains(SOURCE_GONE_ERROR) {
+                        self.gone.store(true, Ordering::SeqCst);
+                    }
                 } else if e.error().matches(gst::ResourceError::NotFound) {
                     // "all buffers have been removed": gone, or a new format. Not an error
                     // when the flush that came with it found no picture handed out yet.
