@@ -178,7 +178,7 @@ pub fn create_best_encoder(target_fps: u32, is_screen_content: bool) -> Box<dyn 
             #[cfg(all(target_os = "linux", feature = "vaapi"))]
             "vaapi" => match vaapi::VaapiEncoder::try_new(target_fps, is_screen_content) {
                 Ok(enc) => {
-                    info!("🚀 [VIDEO CODEC FACTORY] Codificador manual VA-API (GPU) ativado com sucesso!");
+                    info!("🚀 [VIDEO CODEC FACTORY] Codificador manual {} ativado com sucesso!", enc.name());
                     return Box::new(enc);
                 }
                 Err(e) => warn!("⚠️ [VIDEO CODEC FACTORY] VA-API manual indisponível ({}), executando detecção automática...", e),
@@ -260,13 +260,13 @@ pub fn create_best_encoder(target_fps: u32, is_screen_content: bool) -> Box<dyn 
         // A manual "vaapi" has just been tried above.
         #[cfg(feature = "vaapi")]
         if manual_selection != "vaapi" {
-            info!("🎯 [VIDEO CODEC FACTORY] Tentando VA-API (GPU AMD / Intel) via GStreamer...");
+            info!("🎯 [VIDEO CODEC FACTORY] Tentando GPU via GStreamer (VA-API: AMD / Intel; NVENC: NVIDIA)...");
             match vaapi::VaapiEncoder::try_new(target_fps, is_screen_content) {
                 Ok(enc) => {
-                    info!("🚀 [VIDEO CODEC FACTORY] VA-API (GPU) ativado com sucesso!");
+                    info!("🚀 [VIDEO CODEC FACTORY] {} ativado com sucesso!", enc.name());
                     return Box::new(enc);
                 }
-                Err(e) => warn!("⚠️ [VIDEO CODEC FACTORY] VA-API indisponível ({}), tentando o próximo...", e),
+                Err(e) => warn!("⚠️ [VIDEO CODEC FACTORY] GPU via GStreamer indisponível ({}), tentando o próximo...", e),
             }
         }
 
