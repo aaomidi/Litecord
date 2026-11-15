@@ -136,6 +136,12 @@
 //!   hangs): no encoder can be fed then, and after `ENCODER_SILENCE` the share goes to
 //!   gst-launch, as it does for an encoder that has proven itself.
 //!
+//! - NVIDIA (`vaapi::Backend::Nvenc`, nvh264enc): glupload takes the DMABuf, gltransformation
+//!   fits the picture into the frame and clears the bars to black (no painting), glcolorconvert
+//!   makes the NV12 in the encoder's colours. DMABuf only: on NVIDIA's EGL glupload from
+//!   system memory gave black pictures, so without DMABuf the share stays with gst-launch.
+//!   Found against Hyprland (xdg-desktop-portal-hyprland) on an RTX 2080 Ti, driver 615.
+//!
 //! Threads: the portal thread calls `begin`, then `run_until_end` (which watches the
 //! pipeline's health) and takes the capture over with gst-launch when that reports a failure;
 //! the "screen-capture-tx" thread calls `wait_ready` / `next_au` / `set_watched`.
@@ -380,6 +386,9 @@ struct Shared {
     source_shut: AtomicBool,
     /// Test hooks: the streaming thread blocks at the encoder; the bars cannot be painted.
     hang: AtomicBool,
+    /// The bars are painted by the CPU (vapostproc leaves them unwritten); gltransformation
+    /// clears them itself.
+    bars_by_cpu: bool,
     no_bars: bool,
     /// Milliseconds after `started` (never 0) at which the streaming thread began handing a
     /// picture to the encoder, while it has not come back from that; 0 otherwise. A thread
@@ -593,11 +602,16 @@ pub fn allowed(window: bool) -> bool {
     false
 }
 
-/// The caps pipewiresrc may negotiate: what vapostproc takes as DMABuf (with its
-/// `drm-format` list) and/or in system memory.
-fn source_caps(memory: Memory, max_fps: Option<u32>) -> Result<gst::Caps, String> {
-    let probe = gst::ElementFactory::make("vapostproc").build().map_err(|e| e.to_string())?;
-    let accepted = probe.static_pad("sink").ok_or("vapostproc sem pad de entrada")?.query_caps(None);
+/// The caps pipewiresrc may negotiate: what vapostproc (glupload for NVENC) takes as DMABuf
+/// (with its `drm-format` list) and/or in system memory (not for NVENC: see the module's notes).
+fn source_caps(backend: vaapi::Backend, memory: Memory, max_fps: Option<u32>) -> Result<gst::Caps, String> {
+    let (first, memory) = match backend {
+        vaapi::Backend::Va => ("vapostproc", memory),
+        vaapi::Backend::Nvenc if memory == Memory::System => return Err("NVENC: só DMABuf (glupload da memória do sistema dá quadros pretos)".into()),
+        vaapi::Backend::Nvenc => ("glupload", Memory::DmaBuf),
+    };
+    let probe = gst::ElementFactory::make(first).build().map_err(|e| e.to_string())?;
+    let accepted = probe.static_pad("sink").ok_or(format!("{first} sem pad de entrada"))?.query_caps(None);
     let mut caps = gst::Caps::new_empty();
     {
         let caps = caps.get_mut().ok_or("caps compartilhadas")?;
@@ -620,7 +634,7 @@ fn source_caps(memory: Memory, max_fps: Option<u32>) -> Result<gst::Caps, String
         }
     }
     if caps.is_empty() {
-        return Err("vapostproc não aceita DMABuf nem memória do sistema".into());
+        return Err(format!("{first} não aceita DMABuf nem memória do sistema"));
     }
     Ok(caps)
 }
@@ -638,12 +652,13 @@ impl Stream {
 
     fn start(cfg: &Config, test_fail: TestFail, wanted: &dyn Fn() -> bool) -> Result<Self, String> {
         gst::init().map_err(|e| format!("GStreamer: {e}"))?;
-        for element in ["pipewiresrc", "vapostproc", "capssetter"] {
+        for element in ["pipewiresrc", "capssetter"] {
             if gst::ElementFactory::find(element).is_none() {
                 return Err(format!("elemento GStreamer ausente: {element}"));
             }
         }
-        let element = vaapi::ENCODER_ELEMENTS.into_iter().find(|e| gst::ElementFactory::find(e).is_some()).ok_or("nenhum codificador H.264 VA-API registrado")?;
+        let element = vaapi::usable_encoders(true)?[0];
+        let backend = vaapi::Backend::of(element);
         let (width, height, fps) = (cfg.width & !1, cfg.height & !1, cfg.fps.max(1));
         if width == 0 || height == 0 {
             return Err("tamanho inválido".into());
@@ -662,14 +677,22 @@ impl Stream {
             None => None,
         };
         let fd_prop = fd.as_ref().map(|fd| format!("fd={}", std::os::fd::AsRawFd::as_raw_fd(fd))).unwrap_or_default();
+        let relabel = format!("video/x-raw,framerate=(fraction){fps}/1,colorimetry=(string)sRGB,pixel-aspect-ratio=(fraction)1/1");
+        // glupload only knows the DMABuf modifiers it imports once it has its GL context, in
+        // the running pipeline: capssetter would hide it from pipewiresrc's caps query (both
+        // sides of it failed to negotiate). For NVENC the relabelling is done on the caps
+        // event instead (`add_relabel_probe`), past an element that hides nothing.
+        let set = match backend {
+            vaapi::Backend::Va => format!("capssetter name=cap_set join=true replace=false caps=\"{relabel}\""),
+            vaapi::Backend::Nvenc => "identity name=cap_set".to_string(),
+        };
         // The queue keeps only the newest picture: when the encoder is behind, raw pictures
         // are skipped instead of latency building up.
         let description = format!(
             "pipewiresrc name=cap_src {fd_prop} path={node} do-timestamp=true keepalive-time={KEEPALIVE_MS} provide-clock=false \
                on-disconnect=error stream-properties=\"props,node.dont-fallback=(string)true\" \
              ! capsfilter name=cap_filter \
-             ! capssetter name=cap_set join=true replace=false \
-               caps=\"video/x-raw,framerate=(fraction){fps}/1,colorimetry=(string)sRGB,pixel-aspect-ratio=(fraction)1/1\" \
+             ! {set} \
              ! queue name=cap_queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream \
              ! {chain}",
             node = cfg.node,
@@ -683,7 +706,7 @@ impl Stream {
         let chain = EncodeChain::from_pipeline(pipeline)?;
         let by_name = |name: &str| chain.pipeline.by_name(name).ok_or(format!("elemento {name} ausente"));
         let filter = by_name("cap_filter")?;
-        filter.set_property("caps", source_caps(cfg.memory, cfg.max_fps)?);
+        filter.set_property("caps", source_caps(backend, cfg.memory, cfg.max_fps)?);
 
         let shared = Arc::new(Shared {
             started: Instant::now(),
@@ -694,6 +717,7 @@ impl Stream {
             last_check_ms: AtomicU64::new(0),
             source_shut: AtomicBool::new(false),
             hang: AtomicBool::new(false),
+            bars_by_cpu: backend == vaapi::Backend::Va,
             no_bars: test_fail == TestFail::NoBars,
             at_encoder_ms: AtomicU64::new(0),
             early_renegotiations: AtomicU64::new(0),
@@ -727,6 +751,9 @@ impl Stream {
             decisions: Mutex::new(VecDeque::new()),
             in_flight: Mutex::new(VecDeque::new()),
         });
+        if backend == vaapi::Backend::Nvenc {
+            add_relabel_probe(&by_name("cap_set")?, &relabel)?;
+        }
         add_arrival_probe(&by_name("cap_set")?, &shared)?;
         add_gate(&by_name("cap_queue")?, &shared, fps, by_name(vaapi::POSTPROC)?)?;
         let (preview_tx, preview_rx) = sync_channel(1);
@@ -1253,7 +1280,7 @@ impl Stream {
         tx.keyframe_tries = 0;
         // vah264enc takes the level from size and frame rate alone (same rule as VaapiEncoder).
         tx.level_bps = tx.level_bps.max(tx.applied_bps);
-        let mut au = crate::encoder::h264_vui::declare_colour(&au, 1, 1, 6);
+        let mut au = crate::encoder::h264_vui::declare_no_reordering(&crate::encoder::h264_vui::declare_colour(&au, 1, 1, 6));
         vaapi::raise_level(&mut au, tx.level_bps);
         Ok(Some(Picture { data: au, idr, repeat, latency }))
     }
@@ -1587,6 +1614,30 @@ fn even_fit(picture: (u32, u32), frame: (u32, u32)) -> (u32, u32) {
     (even(w, frame.0), even(h, frame.1))
 }
 
+/// capssetter's relabelling (`join=true replace=false`) done on the caps event leaving
+/// `element`: every field of `relabel` is set in what the source negotiated.
+fn add_relabel_probe(element: &gst::Element, relabel: &str) -> Result<(), String> {
+    let relabel = relabel.parse::<gst::Caps>().map_err(|e| e.to_string())?;
+    let fields = relabel.structure(0).ok_or("caps vazias")?.to_owned();
+    let pad = element.static_pad("src").ok_or("pad src ausente")?;
+    pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        if let Some(gst::PadProbeData::Event(event)) = &mut info.data {
+            if let gst::EventView::Caps(caps) = event.view() {
+                let mut caps = caps.caps_owned();
+                for s in caps.make_mut().iter_mut() {
+                    for (name, value) in fields.iter() {
+                        s.set_value(name, value.clone());
+                    }
+                }
+                *event = gst::event::Caps::new(&caps);
+            }
+        }
+        gst::PadProbeReturn::Ok
+    })
+    .ok_or("probe não instalado")?;
+    Ok(())
+}
+
 /// What goes into vapostproc, and what for. To the encoder: nothing while nobody watches;
 /// new pictures evenly spaced and about `fps` times a second at most (the monitor may
 /// refresh faster: `Cadence` picks them, a whole number of refreshes apart, so a 144 Hz
@@ -1669,6 +1720,11 @@ fn add_gate(queue: &gst::Element, shared: &Arc<Shared>, fps: u32, postproc: gst:
                 // description named it, so it is.)
                 if on_caps_postproc.find_property("add-borders").is_some() {
                     on_caps_postproc.set_property("add-borders", (rect.2, rect.3) != on_caps.frame);
+                } else if on_caps_postproc.find_property("scale-x").is_some() {
+                    // gltransformation: the picture spans the frame unless shrunk to its
+                    // rectangle, which `letterbox` centres.
+                    on_caps_postproc.set_property("scale-x", rect.2 as f32 / on_caps.frame.0 as f32);
+                    on_caps_postproc.set_property("scale-y", rect.3 as f32 / on_caps.frame.1 as f32);
                 }
             }
         }
@@ -1787,7 +1843,7 @@ fn add_encoder_probe(encoder_input: &gst::Element, shared: &Arc<Shared>, preview
         // First of all, for the encoder and the preview alike: the bars around a picture
         // of another shape than the frame's.
         let rect = shared.picture_rect();
-        if (rect.2, rect.3) != shared.frame {
+        if shared.bars_by_cpu && (rect.2, rect.3) != shared.frame {
             if let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_mut() {
                 if !paint_new_surface(pad, buffer, rect, &shared) {
                     // Whatever the surface held would show around the picture (green, when
@@ -2045,7 +2101,7 @@ pub fn begin_with(cfg: &Config, wanted: &dyn Fn() -> bool) -> Result<u64, String
     }
     let started = Instant::now();
     let stream = Stream::start(cfg, test_fail, wanted)?;
-    let (id, source_size, dmabuf) = (stream.id, stream.source_size, stream.dmabuf);
+    let (id, source_size, dmabuf, element) = (stream.id, stream.source_size, stream.dmabuf, stream.element);
     {
         // `end` takes this lock after the share's flag went down: checked under it, a share
         // stopped at any moment either finds the stream here or keeps it from being put here.
@@ -2057,7 +2113,9 @@ pub fn begin_with(cfg: &Config, wanted: &dyn Fn() -> bool) -> Result<u64, String
         ACTIVE.store(true, Ordering::SeqCst);
     }
     info!(
-        "🚀 [VAAPI] Captura na GPU ativa: nó PipeWire {} {}x{} ({}) -> {}x{} {} FPS, primeiro quadro em {:.0} ms",
+        "🚀 [VAAPI] Captura na GPU ativa ({} {}): nó PipeWire {} {}x{} ({}) -> {}x{} {} FPS, primeiro quadro em {:.0} ms",
+        vaapi::Backend::of(element).name(),
+        element,
         cfg.node,
         source_size.0,
         source_size.1,
