@@ -172,6 +172,11 @@ impl ScreenCaptureManager {
         stop_window_border_overlay();
         #[cfg(not(windows))]
         {
+            // First of all: the capture poll runs until `is_running` falls further down, and
+            // must not take this for a share that still needs its source (`share_stopped`).
+            #[cfg(target_os = "linux")]
+            share_stopped();
+            #[cfg(not(target_os = "linux"))]
             PORTAL_INITIALIZED.store(false, Ordering::SeqCst);
             if let Ok(mut slot) = PORTAL_FRAME.lock() {
                 *slot = None;

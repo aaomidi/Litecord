@@ -153,6 +153,8 @@ export component AppWindow inherits Window {
     in-out property <int> drop_target_guild_idx: -1;
     callback load_older_messages();
     callback toggle_screen_share();
+    // Ends the running share; nothing when there is none.
+    callback end_screen_share();
     callback toggle_web_share();
     callback copy_web_share_link();
     callback toggle_stream_fullscreen();

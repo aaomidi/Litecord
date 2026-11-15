@@ -21,6 +21,6 @@ pub use self::linux_portal::{PORTAL_CANCELLED, PORTAL_FRAME, PORTAL_INITIALIZED}
 #[cfg(target_os = "linux")]
 pub use self::linux_portal::{
     draw_test_watermark, get_test_watermark_digit, init_wayland_portal_screencast,
-    kill_portal_child, on_share_end, reset_wayland_portal_cancelled, take_share_end, ShareEnd,
+    kill_portal_child, on_share_end, reset_wayland_portal_cancelled, share_stopped, take_share_end, ShareEnd,
     PORTAL_CHILD, PORTAL_LOCAL_CB,
 };

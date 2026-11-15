@@ -68,6 +68,39 @@ fn open_in_default_browser(url: &str) {
     }
 }
 
+/// The screen share manager, for `quit_app` (the tray's thread starts before it exists).
+static QUIT_SCREEN_MANAGER: std::sync::OnceLock<Arc<screen_capture::ScreenCaptureManager>> = std::sync::OnceLock::new();
+
+/// Leaves the application, by every way of quitting (title bar, tray, the compositor closing
+/// the window, a signal) and from any thread: a running share is stopped for its viewers,
+/// the voice channel is left and the gateway closed (at most 400 ms), then the process
+/// exits. Each step does nothing when there is nothing to do; a second call while one is
+/// under way waits for that one.
+fn quit_app(why: &str) -> ! {
+    static QUITTING: AtomicBool = AtomicBool::new(false);
+    if QUITTING.swap(true, Ordering::SeqCst) {
+        loop {
+            std::thread::park();
+        }
+    }
+    info!("{}: saindo do aplicativo...", why);
+    // Whatever the steps below wait for, the process ends: `exit` itself can hang for good
+    // in Mesa's VA exit handler when a VA teardown outlasts `before_exit`.
+    #[cfg(target_os = "linux")]
+    let _ = std::thread::Builder::new().name("quit-backstop".into()).spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        unsafe { libc::_exit(0) }
+    });
+    if let Some(screen_manager) = QUIT_SCREEN_MANAGER.get() {
+        screen_manager.stop();
+    }
+    #[cfg(target_os = "linux")]
+    screen_capture::kill_portal_child();
+    gateway::say_goodbye(std::time::Duration::from_millis(400));
+    encoder::before_exit();
+    std::process::exit(0);
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     commit_heap_pages_on_demand();
@@ -455,11 +488,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .spawn(move || {
             while let Ok(restore) = tray_action_rx.recv() {
                 if !restore {
-                    #[cfg(target_os = "linux")]
-                    screen_capture::kill_portal_child();
-                    gateway::say_goodbye(std::time::Duration::from_millis(400));
-                    encoder::before_exit();
-                    std::process::exit(0);
+                    quit_app("Sair escolhido no ícone da bandeja");
                 }
 
                 APP_IS_VISIBLE.store(true, Ordering::Relaxed);
@@ -912,6 +941,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Screen Share / Live Stream Video Callbacks (P2P UDP Transmitter & Receiver)
     let screen_manager = Arc::new(ScreenCaptureManager::new());
+    let _ = QUIT_SCREEN_MANAGER.set(Arc::clone(&screen_manager));
     let sm_clone = Arc::clone(&screen_manager);
     let app_weak_ss = app_weak.clone();
     let pop_w_ss = popout_weak.clone();
@@ -1102,40 +1132,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
 
+    // Ends the share that is running: Stop Streaming, and a capture that ended by itself
+    // (`on_share_end` below). Nothing when no share is running, so it cannot start one.
+    {
+        let sm = Arc::clone(&sm_clone);
+        let app_weak_end = app_weak_ss.clone();
+        let pop_w_ss = pop_w_ss.clone();
+        #[cfg(target_os = "windows")]
+        let pop_hwnd_ss = Arc::clone(&pop_hwnd_ss);
+        app.on_end_screen_share(move || {
+            let Some(ui) = app_weak_end.upgrade() else { return; };
+            if !sm.is_active() { return; }
+            info!("🛑 Encerrando transmissão de tela P2P...");
+            sm.stop();
+            ui.set_is_screen_sharing(false);
+            ui.set_web_share_active(false);
+            ui.set_web_share_url("".into());
+            ui.set_web_share_viewers(0);
+            ui.set_show_self_preview_notice(false);
+            ui.set_local_preview_fps("".into());
+            ui.set_active_stream_frame(Image::default());
+            let my_uid = gateway::get_my_user_id().to_string();
+            if ui.get_popped_out_stream_uid() == "self" || ui.get_popped_out_stream_uid() == my_uid.as_str() {
+                ui.set_popped_out_stream_uid("".into());
+                if let Some(pop) = pop_w_ss.upgrade() {
+                    pop.set_user_id("".into());
+                    pop.set_is_self(false);
+                    pop.set_show_self_preview_notice(false);
+                    let _ = pop.hide();
+                }
+            }
+            if ui.get_focused_stream_uid() == "self" || ui.get_focused_stream_uid() == my_uid.as_str() {
+                ui.set_focused_stream_uid("".into());
+            }
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = *pop_hwnd_ss.lock().unwrap() {
+                unsafe {
+                    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+                    ShowWindow(hwnd as _, SW_HIDE);
+                }
+            }
+        });
+    }
+
     app.on_toggle_screen_share(move || {
         let sm = Arc::clone(&sm_clone);
         if let Some(ui) = app_weak_ss.upgrade() {
             let active = sm.is_active();
             if active {
-                info!("🛑 Encerrando transmissão de tela P2P...");
-                sm.stop();
-                ui.set_is_screen_sharing(false);
-                ui.set_web_share_active(false);
-                ui.set_web_share_url("".into());
-                ui.set_web_share_viewers(0);
-                ui.set_show_self_preview_notice(false);
-                ui.set_local_preview_fps("".into());
-                ui.set_active_stream_frame(Image::default());
-                let my_uid = gateway::get_my_user_id().to_string();
-                if ui.get_popped_out_stream_uid() == "self" || ui.get_popped_out_stream_uid() == my_uid.as_str() {
-                    ui.set_popped_out_stream_uid("".into());
-                    if let Some(pop) = pop_w_ss.upgrade() {
-                        pop.set_user_id("".into());
-                        pop.set_is_self(false);
-                        pop.set_show_self_preview_notice(false);
-                        let _ = pop.hide();
-                    }
-                }
-                if ui.get_focused_stream_uid() == "self" || ui.get_focused_stream_uid() == my_uid.as_str() {
-                    ui.set_focused_stream_uid("".into());
-                }
-                #[cfg(target_os = "windows")]
-                if let Some(hwnd) = *pop_hwnd_ss.lock().unwrap() {
-                    unsafe {
-                        use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
-                        ShowWindow(hwnd as _, SW_HIDE);
-                    }
-                }
+                ui.invoke_end_screen_share();
             } else {
                 ui.set_active_stream_frame(Image::default());
                 let my_uid = gateway::get_my_user_id();
@@ -1243,7 +1288,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui.set_web_share_viewers(screen_capture::web_share::viewer_count() as i32);
                 if !active {
                     ui.set_web_share_url("".into());
-                    ui.set_web_share_error(screen_capture::web_share::last_error().into());
+                    let error = screen_capture::web_share::last_error();
+                    // (The banner shows a share notice first: a newer error takes its place.)
+                    if !error.is_empty() {
+                        ui.set_share_notice("".into());
+                    }
+                    ui.set_web_share_error(error.into());
                     // Or the link window would come back by itself the next time a
                     // request from the call turns web sharing on.
                     ui.set_show_web_share_modal(false);
@@ -1267,7 +1317,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !screen_capture::take_share_end() || !sm.is_active() { return; }
                 let Some(ui) = weak.upgrade() else { return; };
                 warn!("🛑 Captura do compartilhamento terminou sozinha ({:?}): encerrando a transmissão de tela", why);
-                ui.invoke_toggle_screen_share();
+                ui.invoke_end_screen_share();
+                // (One banner shows both kinds of message: the newer one replaces the other.)
+                if why != screen_capture::ShareEnd::Cancelled {
+                    ui.set_web_share_error("".into());
+                }
                 ui.set_share_notice(match why {
                     screen_capture::ShareEnd::Cancelled => "",
                     screen_capture::ShareEnd::Failed => utils::i18n_ui::pick(
@@ -1313,7 +1367,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ui.set_web_share_active(true);
                             ui.set_show_web_share_modal(true);
                         },
-                        Err(e) => ui.set_web_share_error(e.to_string().into()),
+                        Err(e) => {
+                            ui.set_share_notice("".into());
+                            ui.set_web_share_error(e.to_string().into());
+                        },
                         _ => {},
                     }
                 }
@@ -1407,6 +1464,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Outcome::BadLink => text.web_link_bad_link,
             };
             info!("🌐 [ABRIR NO NAVEGADOR] Transmissão de UID={} não aberta no navegador: {:?}", uid, outcome);
+            ui.set_share_notice("".into());
             ui.set_web_share_error(message.into());
         });
     });
@@ -2761,6 +2819,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_current_voice_channel("".into());
             ui.set_is_in_dm_call(false); // também encerra chamada DM se estava ativa
             ui.set_is_screen_sharing(false);
+            ui.set_share_notice("".into());
             ui.set_show_self_preview_notice(false);
             ui.set_web_share_active(false);
             ui.set_web_share_url("".into());
@@ -4659,41 +4718,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let sm_for_close = Arc::clone(&screen_manager);
     app.on_close_window(move || {
-        info!("Fechar clicado na barra superior: saindo do aplicativo...");
         crate::ui::window_place::save_now();
-        sm_for_close.stop();
-        #[cfg(target_os = "linux")]
-        screen_capture::kill_portal_child();
-        gateway::say_goodbye(std::time::Duration::from_millis(400));
-        encoder::before_exit();
-        std::process::exit(0);
+        quit_app("Fechar clicado na barra superior");
+    });
+    // The compositor closing the window (Alt+F4, the overview's close button) is the same
+    // quit. Left to Slint, the window would only be hidden and `main` return: no share stop,
+    // no voice leave, and no `before_exit` ahead of the exit handlers.
+    app.window().on_close_requested(|| {
+        crate::ui::window_place::save_now();
+        quit_app("Janela fechada pelo compositor")
     });
 
-    // SIGTERM (a session logging out, `kill`): the same goodbye, or the account stays shown
-    // in its voice channel until Discord gives the connection up.
+    // SIGTERM (a session logging out, `kill`), SIGINT (Ctrl+C in the terminal the app was
+    // started from) and SIGHUP (that terminal closed): the same quit, or the account stays
+    // shown in its voice channel until Discord gives the connection up. On a thread and a
+    // small runtime of their own: whatever state the main runtime is in, the signal is
+    // heard and `quit_app` arms its backstop.
     #[cfg(target_os = "linux")]
     {
-        let sm_for_term = Arc::clone(&screen_manager);
-        tokio::spawn(async move {
-            let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) else { return };
-            if term.recv().await.is_none() { return; }
-            info!("SIGTERM recebido: saindo do aplicativo...");
-            // (Off the runtime's own threads: the goodbye waits for a task of that runtime.)
-            // (Whatever the steps below wait for, SIGTERM still ends the process.)
-            let _ = std::thread::Builder::new().name("sigterm-backstop".into()).spawn(|| {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                unsafe { libc::_exit(0) }
+        let _ = std::thread::Builder::new().name("quit-signals".into()).spawn(|| {
+            use tokio::signal::unix::{signal, SignalKind};
+            // A signal handed down ignored (nohup, a background job of a script) stays so.
+            fn ignored(signum: libc::c_int) -> bool {
+                unsafe {
+                    let mut current: libc::sigaction = std::mem::zeroed();
+                    libc::sigaction(signum, std::ptr::null(), &mut current) == 0 && current.sa_sigaction == libc::SIG_IGN
+                }
+            }
+            // Returns when the signal arrives; never when it is not listened to.
+            async fn received(kind: SignalKind, listen: bool) {
+                if listen {
+                    if let Ok(mut stream) = signal(kind) {
+                        if stream.recv().await.is_some() {
+                            return;
+                        }
+                    }
+                }
+                std::future::pending::<()>().await
+            }
+            // (Before anything is registered: a failure here leaves the signals as they were.)
+            let runtime = match tokio::runtime::Builder::new_current_thread().enable_io().build() {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    warn!("⚠️ Sem tratamento de SIGTERM/SIGINT/SIGHUP (runtime: {:?}): esses sinais encerram o processo sem despedida", e);
+                    return;
+                }
+            };
+            let (listen_int, listen_hup) = (!ignored(libc::SIGINT), !ignored(libc::SIGHUP));
+            let name = runtime.block_on(async {
+                tokio::select! {
+                    _ = received(SignalKind::terminate(), true) => "SIGTERM",
+                    _ = received(SignalKind::interrupt(), listen_int) => "SIGINT",
+                    _ = received(SignalKind::hangup(), listen_hup) => "SIGHUP",
+                }
             });
-            let _ = std::thread::Builder::new().name("sigterm-exit".into()).spawn(move || {
-                sm_for_term.stop();
-                #[cfg(target_os = "linux")]
-                screen_capture::kill_portal_child();
-                gateway::say_goodbye(std::time::Duration::from_millis(400));
-                encoder::before_exit();
-                std::process::exit(0);
-            });
+            quit_app(&format!("{} recebido", name));
         });
     }
 
@@ -5086,6 +5166,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.run()?;
     crate::ui::window_place::save_now();
-    Ok(())
+    // The event loop ended by itself (its last window closed some other way): the same way
+    // out as every quit, not a return from `main` past the goodbye and `before_exit`.
+    quit_app("Laço de eventos encerrado")
 }
 
