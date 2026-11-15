@@ -31,6 +31,9 @@ pub struct VideoSettings {
     /// Where the main window was when it last moved or resized. None until it does.
     #[serde(default)]
     pub window: Option<WindowGeometry>,
+    /// Interface scale in percent (100 to 200), or 0 for the system's own.
+    #[serde(default)]
+    pub ui_scale_percent: u32,
 }
 
 /// Position in physical pixels (a logical position is ambiguous across monitors with
@@ -82,6 +85,7 @@ impl Default for VideoSettings {
             echo_cancellation: false,
             automatic_gain_control: false,
             window: None,
+            ui_scale_percent: 0,
         }
     }
 }
@@ -210,6 +214,26 @@ pub fn toggle_use_gpu_renderer() -> bool {
     let new_val = store.use_gpu_renderer;
     save_video_settings(&store);
     new_val
+}
+
+/// 0 is Automatic. A value outside the offered range (a damaged file) counts as Automatic.
+pub fn get_ui_scale_percent() -> u32 {
+    let percent = get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner()).ui_scale_percent;
+    if (100..=200).contains(&percent) { percent } else { 0 }
+}
+
+/// Takes effect on the next start: the scale is fixed before the window exists.
+pub fn set_ui_scale_percent(percent: u32) {
+    let mut store = get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner());
+    store.ui_scale_percent = percent;
+    save_video_settings(&store);
+}
+
+/// The scale setting this run started with, and whether an explicit SLINT_SCALE_FACTOR
+/// overrides it. First called before main() sets that variable from the setting.
+pub fn ui_scale_at_start() -> (u32, bool) {
+    static AT_START: OnceLock<(u32, bool)> = OnceLock::new();
+    *AT_START.get_or_init(|| (get_ui_scale_percent(), std::env::var_os("SLINT_SCALE_FACTOR").is_some()))
 }
 
 pub fn get_use_light_theme() -> bool {

@@ -113,6 +113,35 @@ pub fn set_layer_sink(window: &i_slint_core::api::Window, sink: Option<std::rc::
     accepted
 }
 
+/// Puts `text` on the system clipboard through the clipboard this backend made for the
+/// session's display (Wayland or X11) and keeps alive: the one the text inputs copy to.
+/// Returns false when `window` is not a winit window or the clipboard refused the text.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_clipboard_text(window: &i_slint_core::api::Window, text: &str) -> bool {
+    with_clipboard(window, |clipboard| clipboard.set_contents(text.into()).is_ok()).unwrap_or(false)
+}
+
+/// The text now on that clipboard, if it holds any.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn clipboard_text(window: &i_slint_core::api::Window) -> Option<String> {
+    with_clipboard(window, |clipboard| clipboard.get_contents().ok()).flatten()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn with_clipboard<R>(
+    window: &i_slint_core::api::Window,
+    f: impl FnOnce(&mut dyn copypasta::ClipboardProvider) -> R,
+) -> Option<R> {
+    let adapter = i_slint_core::window::WindowInner::from_pub(window)
+        .window_adapter()
+        .internal(i_slint_core::InternalToken)
+        .and_then(|wa| (wa as &dyn core::any::Any).downcast_ref::<WinitWindowAdapter>())
+        .map(|wa| wa.self_weak.clone())
+        .and_then(|w| w.upgrade())?;
+    let mut pair = adapter.shared_backend_data.clipboard.borrow_mut();
+    Some(f(pair.0.as_mut()))
+}
+
 mod renderer {
     use std::sync::Arc;
 
@@ -602,6 +631,18 @@ impl SharedBackendData {
                 );
             }
         }
+    }
+
+    /// What a window multiplies the window system's scale factor by: the desktop's text
+    /// scaling (GNOME's text-scaling-factor, "Large Text"). A Wayland compositor's factor
+    /// leaves it out and other toolkits apply it themselves; under X11 winit already
+    /// gets it through Xft.dpi.
+    pub(crate) fn text_scale(&self) -> f32 {
+        #[cfg(xdg_desktop_settings)]
+        if self.is_wayland {
+            return self.desktop_settings.text_scaling_factor();
+        }
+        1.0
     }
 
     pub fn register_window(&self, id: winit::window::WindowId, window: Rc<WinitWindowAdapter>) {

@@ -15,6 +15,8 @@ use crate::utils::video_settings::{self, WindowGeometry, WINDOW_MIN_HEIGHT, WIND
 use crate::AppWindow;
 
 const DEFAULT_SIZE: (u32, u32) = (980, 620);
+/// The window's minimum in ui/appwindow.slint.
+const MIN_SIZE: (u32, u32) = (680, 480);
 const DEFAULT_POSITION: (f64, f64) = (100.0, 100.0);
 const SAVE_AFTER: Duration = Duration::from_secs(1);
 /// How much of the title bar must lie on a monitor for a saved position to be used.
@@ -30,16 +32,26 @@ thread_local! {
 
 /// Sizes and places the window as it was saved, or at the defaults. A saved position
 /// that no longer lands on any monitor (one was unplugged) is dropped.
-pub fn restore(window: &winit::window::Window) -> bool {
+pub fn restore(window: &winit::window::Window, ui_scale: f32) -> bool {
     let saved = video_settings::get_window_geometry();
     LAST.with(|l| l.set(saved));
     // Events from before this (the window appearing where the system put it) are stale.
     DIRTY.with(|d| d.set(false));
-    let (width, height) = saved.map_or(DEFAULT_SIZE, |g| (g.width, g.height));
-    let _ = window.request_inner_size(winit::dpi::LogicalSize::new(width as f64, height as f64));
+    let scale = window.scale_factor();
+    // The interface scale setting can differ from the system's scale: the default and the
+    // minimum size are in interface pixels, a saved size is in the system's logical pixels.
+    let k = ui_scale as f64 / scale;
+    let logical = |(width, height): (u32, u32)| winit::dpi::LogicalSize::new(width as f64 * k, height as f64 * k);
+    let size: winit::dpi::PhysicalSize<u32> = match saved {
+        Some(g) => {
+            let min = logical(MIN_SIZE);
+            winit::dpi::LogicalSize::new((g.width as f64).max(min.width), (g.height as f64).max(min.height)).to_physical(scale)
+        }
+        None => fit_to_monitor(window, logical(DEFAULT_SIZE).to_physical(scale)),
+    };
+    let _ = window.request_inner_size(size);
     let position = saved.and_then(|g| Some((g.x?, g.y?))).filter(|&(x, y)| {
-        let scale = window.scale_factor();
-        let title_width = (width as f64 * scale) as i32;
+        let title_width = size.width as i32;
         window.available_monitors().any(|m| {
             let (mp, ms) = (m.position(), m.size());
             let visible_x = (x + title_width).min(mp.x + ms.width as i32) - x.max(mp.x);
@@ -56,6 +68,22 @@ pub fn restore(window: &winit::window::Window) -> bool {
         window.set_maximized(true);
     }
     maximized
+}
+
+/// `size` cut down to the monitor the window is on.
+fn fit_to_monitor(window: &winit::window::Window, size: winit::dpi::PhysicalSize<u32>) -> winit::dpi::PhysicalSize<u32> {
+    let monitor = window.current_monitor().or_else(|| window.primary_monitor()).or_else(|| window.available_monitors().next());
+    match monitor.map(|m| m.size()).filter(|m| m.width > 0 && m.height > 0) {
+        Some(m) => winit::dpi::PhysicalSize::new(size.width.min(m.width), size.height.min(m.height)),
+        None => size,
+    }
+}
+
+/// The size to give a window that came up larger than its monitor (a large interface
+/// scale on a small screen), or None when it fits.
+pub fn size_fitting_monitor(window: &winit::window::Window) -> Option<winit::dpi::PhysicalSize<u32>> {
+    let size = window.inner_size();
+    Some(fit_to_monitor(window, size)).filter(|fitted| *fitted != size)
 }
 
 /// A move or resize happened: the geometry is read when it is saved, a second later.
