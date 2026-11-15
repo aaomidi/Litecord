@@ -133,39 +133,6 @@ pub fn set_stream_view_sizes(main: (u32, u32), popout: (u32, u32)) {
     STREAM_POPOUT_PX.store((popout.0 as u64) << 32 | popout.1 as u64, Ordering::Relaxed);
 }
 
-/// When the UI thread was given a picture of a received stream that it has not taken yet
-/// (microseconds on `rx_clock`, 0: it has none waiting).
-static RX_UI_PENDING_SINCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// A picture that has waited this long (half a frame at 60 FPS) means the UI thread is
-/// busy drawing and falling behind the stream. A shorter wait says nothing: the picture
-/// may have been handed over a moment ago.
-const RX_UI_BEHIND_US: u64 = 8_000;
-
-fn rx_clock_us() -> u64 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64 + 1
-}
-
-/// The UI's side of the hand-over says whether a picture is waiting for it.
-pub fn set_rx_ui_pending(pending: bool) {
-    if pending {
-        // The oldest wait counts: a newer picture replacing the waiting one does not restart it.
-        let _ = RX_UI_PENDING_SINCE.compare_exchange(0, rx_clock_us(), Ordering::AcqRel, Ordering::Relaxed);
-    } else {
-        RX_UI_PENDING_SINCE.store(0, Ordering::Release);
-    }
-}
-
-/// Whether a picture decoded now would only replace, unseen, the one the UI thread still
-/// has to take: that one has waited long enough to say the UI is not keeping up, or the
-/// decoder itself is (`decoder_busy`: frames are queueing up behind it, and reading this
-/// one back would put it further behind).
-pub fn rx_ui_behind(decoder_busy: bool) -> bool {
-    let since = RX_UI_PENDING_SINCE.load(Ordering::Acquire);
-    since != 0 && (decoder_busy || rx_clock_us().saturating_sub(since) >= RX_UI_BEHIND_US)
-}
-
 /// Whether any window can show a received stream right now. When none can (Litecord in
 /// the tray or minimized while a game runs, popout closed or minimized) the decoder skips
 /// the frames instead of decoding them, and asks for a keyframe once a window shows the
@@ -571,6 +538,10 @@ pub fn decode_video_frame(decoders: &mut StreamDecoders, peer_uid: u64, frame_da
             }
         }
     }
+    // This stream's pictures come from the CPU decoder: the last one a GPU decoder left
+    // for the windows is not shown again.
+    #[cfg(all(target_os = "linux", feature = "vaapi"))]
+    super::hw_decode::gl_present::clear(peer_uid);
     match decode_on_cpu(&mut decoders.cpu, peer_uid, &annex_b) {
         Some((b, w, h)) => Decoded::Picture(b, w, h),
         None => Decoded::Failed,
@@ -791,8 +762,12 @@ pub fn decode_jpeg(jpeg_data: &[u8]) -> Option<(SharedPixelBuffer<Rgba8Pixel>, u
     Some((pixel_buffer, width, height))
 }
 
-/// Largest size that fits `max_w` x `max_h` with the frame's aspect ratio, never larger
-/// than the frame itself (even dimensions; 0 means "no limit").
+/// Size for a frame shown in `max_w` x `max_h` with its aspect ratio kept, never larger
+/// than the frame itself (0 means "no limit"). Dimensions are rounded up to even ones, so
+/// the picture is the area's size or a pixel or two more, never less: then it is drawn
+/// pixel for pixel. One that is a pixel short gets stretched, which blurs it on the GPU
+/// renderer, and the software renderer (it steps through a picture in 1/256ths) draws it
+/// 0.4% too large and cuts off its right and bottom edges.
 pub fn fit_within(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     if max_w == 0 || max_h == 0 || w == 0 || h == 0 {
         return (w, h);
@@ -801,8 +776,8 @@ pub fn fit_within(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     if scale >= 1.0 {
         return (w, h);
     }
-    let even = |v: f64| ((v.round() as u32) & !1).max(2);
-    (even(w as f64 * scale), even(h as f64 * scale))
+    let even = |v: f64, max: u32| ((((v - 1e-6).ceil() as u32) + 1) & !1).clamp(2, max.max(2));
+    (even(w as f64 * scale, w), even(h as f64 * scale, h))
 }
 
 /// How a stream's YUV samples map to RGB (from the SPS VUI).
@@ -962,10 +937,10 @@ mod scaled_conversion_tests {
 
     #[test]
     fn fit_keeps_aspect_and_never_upscales() {
-        assert_eq!(fit_within(1920, 1080, 980, 620), (980, 550));
+        assert_eq!(fit_within(1920, 1080, 980, 620), (980, 552));
         assert_eq!(fit_within(1920, 1080, 3840, 2160), (1920, 1080));
         assert_eq!(fit_within(1920, 1080, 0, 0), (1920, 1080));
-        assert_eq!(fit_within(1080, 1920, 620, 620), (348, 620));
+        assert_eq!(fit_within(1080, 1920, 620, 620), (350, 620));
     }
 
     fn solid_i420(w: usize, h: usize, yv: u8, uv: u8, vv: u8) -> (Vec<u8>, Vec<u8>, Vec<u8>) {

@@ -42,6 +42,7 @@ const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
 const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
 const GL_TEXTURE_WRAP_S: u32 = 0x2802;
 const GL_TEXTURE_WRAP_T: u32 = 0x2803;
+const GL_NEAREST: i32 = 0x2600;
 const GL_LINEAR: i32 = 0x2601;
 const GL_CLAMP_TO_EDGE: i32 = 0x812F;
 const GL_RENDERER: u32 = 0x1F01;
@@ -301,8 +302,10 @@ impl Presenter {
         let mut tex = 0u32;
         (gl.gen_textures)(1, &mut tex);
         (gl.bind_texture)(GL_TEXTURE_2D, tex);
-        (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        // A picture made for the area it is drawn in is shown pixel for pixel.
+        let filter = if crate::ui::gpu_video::drawn_at_own_size(!self.main, (p.width, p.height)) { GL_NEAREST } else { GL_LINEAR };
+        (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+        (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
         (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         while (gl.get_error)() != 0 {}

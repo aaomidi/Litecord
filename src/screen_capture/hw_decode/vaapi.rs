@@ -105,8 +105,8 @@ impl From<StateError> for HwError {
 
 /// What a decoded picture comes back as, at the size asked for.
 pub enum Output {
-    /// Pixels in memory. `None`: decoded, and not read back because nobody asked.
-    Rgba(Option<SharedPixelBuffer<Rgba8Pixel>>),
+    /// Pixels in memory.
+    Rgba(SharedPixelBuffer<Rgba8Pixel>),
     /// The GPU's own buffer (a `video/x-raw(memory:DMABuf)` sample, RGB).
     Dmabuf(gst::Sample),
 }
@@ -154,9 +154,8 @@ impl VaapiDecoder {
     }
 
     /// Decodes one access unit (Annex B) and returns its picture at the size `fit(width,
-    /// height)` chooses. `None` when it holds no picture (parameter sets only). Without
-    /// `read_back` the picture is decoded (later ones need it) and stays on the GPU.
-    pub fn decode(&mut self, au: &[u8], fit: impl Fn(u32, u32) -> (u32, u32), read_back: bool) -> Result<Option<Picture>, HwError> {
+    /// height)` chooses. `None` when it holds no picture (parameter sets only).
+    pub fn decode(&mut self, au: &[u8], fit: impl Fn(u32, u32) -> (u32, u32)) -> Result<Option<Picture>, HwError> {
         let ranges = nal_ranges(au);
         let Some(p) = self.state.parse(au)? else {
             self.append_units(au, &ranges, false)?;
@@ -210,7 +209,7 @@ impl VaapiDecoder {
         // format the driver cannot make after all, buffers the windows hold on to): such
         // a stream first goes back to pixels, on this decoder, before it is given up on.
         let (dmabuf, first) = (session.drm_format.is_some(), session.pictures == 0);
-        match session.decode(feed, out_w, out_h, stall, read_back) {
+        match session.decode(feed, out_w, out_h, stall) {
             Ok(output) => {
                 self.state.finish(&p, &pic);
                 self.pictures += 1;
@@ -453,7 +452,7 @@ impl Session {
     }
 
     /// Pushes one access unit and waits for its picture. `stall` leaves the push out (test).
-    fn decode(&mut self, feed: Vec<u8>, w: u32, h: u32, stall: bool, read_back: bool) -> Result<Output, Failure> {
+    fn decode(&mut self, feed: Vec<u8>, w: u32, h: u32, stall: bool) -> Result<Output, Failure> {
         if let Some(e) = self.bus_error() {
             return Err(Failure::Broken(e));
         }
@@ -475,14 +474,12 @@ impl Session {
         self.waited += pulled_at - pushed_at;
         let output = if self.drm_format.is_some() {
             Output::Dmabuf(sample)
-        } else if read_back {
+        } else {
             let (rgba, mapped) = copy_rgbx(&sample).map_err(Failure::Broken)?;
             self.mapped += mapped;
             self.copied += pulled_at.elapsed().saturating_sub(mapped);
             self.read_back += 1;
-            Output::Rgba(Some(rgba))
-        } else {
-            Output::Rgba(None)
+            Output::Rgba(rgba)
         };
         self.pictures += 1;
         if self.pictures % REPORT_EVERY == 0 {
@@ -652,8 +649,8 @@ fn self_test() -> Result<(), String> {
     let started = Instant::now();
     let mut decoder = VaapiDecoder::with(TestFail::None, true);
     for (name, au) in [("keyframe", PROBE_AU), ("second picture", PROBE_P)] {
-        let (picture, rgba) = match decoder.decode(au, |w, h| (w, h), true) {
-            Ok(Some(Picture { output: Output::Rgba(Some(rgba)), width, height })) => ((width, height), rgba),
+        let (picture, rgba) = match decoder.decode(au, |w, h| (w, h)) {
+            Ok(Some(Picture { output: Output::Rgba(rgba), width, height })) => ((width, height), rgba),
             Ok(_) => return Err(format!("self-test: no {name}")),
             Err(e) => return Err(format!("self-test, {name}: {e:?}")),
         };

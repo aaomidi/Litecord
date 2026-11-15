@@ -109,6 +109,9 @@ struct DemoStream {
 
 static DEMO_STREAM: std::sync::Mutex<Option<DemoStream>> = std::sync::Mutex::new(None);
 static DEMO_FED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Sequence number of the last access unit played (fed, dropped or paused over): it goes
+/// on when another file takes over, as a sender's does.
+static DEMO_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The access units of an Annex B stream, start codes included. A new one starts at a
 /// delimiter, parameter set or SEI that follows a slice, or at a picture's first slice.
@@ -180,18 +183,23 @@ fn demo_stream(cmd: &Value) -> Result<Value, String> {
         .spawn(move || {
             let period = Duration::from_secs_f64(1.0 / fps);
             let (mut start, mut n) = (std::time::Instant::now(), 0u64);
-            let mut seq = 0u32;
+            let mut at = 0usize;
             while !stop.load(Ordering::Relaxed) {
                 let due = start + period.mul_f64(n as f64);
                 let now = std::time::Instant::now();
                 if due > now {
                     std::thread::sleep(due - now);
+                    // Another file may have taken over meanwhile: nothing more from this one.
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
                 } else if now - due > Duration::from_millis(500) {
                     // Far behind (the machine slept): start pacing again from here.
                     (start, n) = (now, 0);
                 }
-                let unit = &units[seq as usize % units.len()];
-                seq = seq.wrapping_add(1);
+                let unit = &units[at % units.len()];
+                let seq = DEMO_SEQ.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                at += 1;
                 n += 1;
                 if paused.load(Ordering::Relaxed) {
                     continue;
@@ -202,7 +210,7 @@ fn demo_stream(cmd: &Value) -> Result<Value, String> {
                     continue;
                 }
                 if let Some(feed) = crate::screen_capture::DEMO_FEED.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                    feed(peer, name.clone(), fps.round() as u8, seq, (seq as f64 * 1000.0 / fps) as u32, unit.clone());
+                    feed(peer, name.clone(), fps.round() as u8, seq, (at as f64 * 1000.0 / fps) as u32, unit.clone());
                     DEMO_FED.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -624,6 +632,7 @@ fn execute(ui: &AppWindow, cmd: &Value) -> Result<Value, String> {
                 is_self,
                 is_streaming,
                 is_stream_hidden,
+                watch_note: Default::default(),
             };
             let people = vec![
                 person("1", "Me", true, false, false),

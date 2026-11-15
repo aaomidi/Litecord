@@ -6,6 +6,11 @@
 //! holds no GL: the decode thread offers its newest picture, the UI thread takes it when
 //! it draws.
 //!
+//! The newest picture of a stream stays here until the stream ends, also while nothing
+//! arrives and its decoder is let go: a window that starts showing the stream then (the
+//! popout opened or closed during a stall, the main window back from the tray) has the
+//! last picture to show, as it has with pixels.
+//!
 //! Whether this works is only known once a window has drawn its first frame, and it can
 //! stop working (an import fails). `give_up` is final for the run: streams go back to
 //! pixels from their next keyframe, still decoded on the GPU.
@@ -33,7 +38,8 @@ pub struct GpuFrame {
     pub stream_height: u32,
 }
 
-static LATEST: Mutex<Option<GpuFrame>> = Mutex::new(None);
+/// The newest picture of each stream (a handful at most).
+static LATEST: Mutex<Vec<GpuFrame>> = Mutex::new(Vec::new());
 static SEQ: AtomicU64 = AtomicU64::new(0);
 /// Pictures offered and pictures a window imported (read by tests).
 pub static OFFERED: AtomicU64 = AtomicU64::new(0);
@@ -102,12 +108,23 @@ pub fn set_wake(wake: Wake) {
 /// The decoder's newest picture of `peer`. False when it cannot be shown this way (any
 /// more): the caller asks for a keyframe and decodes to pixels from there.
 pub fn offer(peer: u64, sample: gst::Sample, stream_height: u32) -> bool {
-    if !ready() {
-        return false;
-    }
     let frame = GpuFrame { peer, seq: SEQ.fetch_add(1, Ordering::Relaxed) + 1, sample, stream_height };
-    // The picture it replaces (never taken, or already imported) is released here.
-    let old = LATEST.lock().unwrap_or_else(|e| e.into_inner()).replace(frame);
+    // The picture it replaces (never taken, or already imported) is released here, outside
+    // the lock.
+    let old = {
+        let mut latest = LATEST.lock().unwrap_or_else(|e| e.into_inner());
+        // Looked at under the lock: `give_up` empties the list after turning this off.
+        if !ready() {
+            return false;
+        }
+        match latest.iter_mut().find(|f| f.peer == peer) {
+            Some(slot) => Some(std::mem::replace(slot, frame)),
+            None => {
+                latest.push(frame);
+                None
+            }
+        }
+    };
     drop(old);
     OFFERED.fetch_add(1, Ordering::Relaxed);
     if let Some(wake) = WAKE.get() {
@@ -116,19 +133,22 @@ pub fn offer(peer: u64, sample: gst::Sample, stream_height: u32) -> bool {
     true
 }
 
-/// The newest picture offered, if it is of `peer`.
+/// The newest picture offered of `peer`'s stream.
 pub fn latest(peer: u64) -> Option<GpuFrame> {
-    LATEST.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|f| f.peer == peer).cloned()
+    LATEST.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|f| f.peer == peer).cloned()
 }
 
-/// The stream of `peer` ended: its last picture is not shown again.
+/// The stream of `peer` ended, or its pictures come as pixels from now on: its last
+/// picture is not shown again.
 pub fn clear(peer: u64) {
-    let mut latest = LATEST.lock().unwrap_or_else(|e| e.into_inner());
-    if latest.as_ref().is_some_and(|f| f.peer == peer) {
-        *latest = None;
-    }
+    let gone = {
+        let mut latest = LATEST.lock().unwrap_or_else(|e| e.into_inner());
+        latest.iter().position(|f| f.peer == peer).map(|at| latest.swap_remove(at))
+    };
+    drop(gone);
 }
 
 pub fn clear_all() {
-    *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let gone = std::mem::take(&mut *LATEST.lock().unwrap_or_else(|e| e.into_inner()));
+    drop(gone);
 }

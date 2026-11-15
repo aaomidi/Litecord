@@ -1444,8 +1444,6 @@ impl ScreenCaptureManager {
                                 waiting_for_idr.insert(peer_uid, true);
                                 // Also free the GPU decoder (device and surfaces) meanwhile.
                                 decoders.release_gpu();
-                                #[cfg(all(target_os = "linux", feature = "vaapi"))]
-                                super::hw_decode::gl_present::clear_all();
                                 continue;
                             }
 
@@ -1570,14 +1568,14 @@ impl ScreenCaptureManager {
                                 CURRENT_RX_FPS.store(0, Ordering::Relaxed);
                                 // No stream arriving: let the GPU decoder go until the next one.
                                 decoders.release_gpu();
-                                #[cfg(all(target_os = "linux", feature = "vaapi"))]
-                                super::hw_decode::gl_present::clear_all();
                             }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
                 CURRENT_RX_FPS.store(0, Ordering::Relaxed);
+                #[cfg(all(target_os = "linux", feature = "vaapi"))]
+                super::hw_decode::gl_present::clear_all();
                 info!("🎬 [VIDEO DECODER WORKER] Thread de decodificação finalizada.");
             })
             .ok();

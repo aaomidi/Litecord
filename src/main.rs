@@ -615,10 +615,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let my_uid = gateway::get_my_user_id().to_string();
             let is_pop_self = uid == "self" || uid == my_uid;
             let cur_frame = if is_pop_self { ui.get_active_stream_frame() } else { ui.get_remote_stream_frame() };
-            // A picture shown from the GPU is a texture of the main window's own context:
-            // the popout imports the picture itself before its first frame.
+            // A picture shown from the GPU is a texture of the main window's own context (it
+            // has no pixels to give): the popout imports the picture itself before its
+            // first frame.
             #[cfg(all(target_os = "linux", feature = "vaapi"))]
-            let cur_frame = if !is_pop_self && screen_capture::hw_decode::gl_present::ready() { Image::default() } else { cur_frame };
+            let cur_frame = if !is_pop_self && cur_frame.to_rgba8().is_none() { Image::default() } else { cur_frame };
             if let Some(pop_win) = pop_w_cb.upgrade() {
                 pop_win.set_user_id(uid.clone().into());
                 pop_win.set_username(if uname.is_empty() { ui.get_active_stream_user() } else { uname.into() });
@@ -937,15 +938,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             move |uid, uname, quality, pixel_buf| {
                 {
                     // Linux: a 1x1 buffer only says the stream goes on (its pictures are
-                    // shown or skipped elsewhere); it does not replace a waiting picture.
+                    // shown from the GPU); it does not replace a waiting picture.
                     let mut slot = latest_rx_frame_cb.lock().unwrap();
                     let no_picture = cfg!(all(target_os = "linux", feature = "vaapi")) && pixel_buf.width() <= 1;
                     let waiting = slot.as_ref().is_some_and(|(id, _, _, buf)| *id == uid && buf.width() > 1);
                     if !(no_picture && waiting) {
                         *slot = Some((uid, uname, quality, pixel_buf));
                     }
-                    // The decoder does not read back pictures that would only replace this one.
-                    screen_capture::set_rx_ui_pending(slot.as_ref().is_some_and(|(_, _, _, buf)| buf.width() > 1));
                 }
                 if !is_rx_ui_pending_cb.swap(true, Ordering::AcqRel) {
                     let app_w2 = app_w.clone();
@@ -956,12 +955,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     if let Err(_) = slint::invoke_from_event_loop(move || {
                         pending_flag_inner.store(false, Ordering::Release);
-                        let taken = {
-                            let mut slot = latest_slot.lock().unwrap();
-                            screen_capture::set_rx_ui_pending(false);
-                            slot.take()
-                        };
-                        if let Some((uid, uname, quality, pixel_buf)) = taken {
+                        if let Some((uid, uname, quality, pixel_buf)) = latest_slot.lock().unwrap().take() {
                             // The stop may have been handled while this frame was waiting
                             // for the UI thread; showing it would re-open a dead stream.
                             if screen_capture::is_stream_recently_stopped(uid) {
@@ -991,6 +985,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ui.set_active_stream_user(uname.into());
                                 ui.set_tr_stream_quality(quality.into());
                                 if !no_picture {
+                                    let size = frame.size();
+                                    ui.set_remote_stream_exact(crate::ui::gpu_video::drawn_at_own_size(false, (size.width, size.height)));
                                     ui.set_remote_stream_frame(frame.clone());
                                 }
                                 ui.set_remote_stream_fps(rx_fps_str.clone().into());
@@ -1014,6 +1010,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let pop_uid = pop.get_user_id().to_string();
                                     if pop_uid == uid_str || pop_uid.is_empty() {
                                         if !no_picture {
+                                            let size = frame.size();
+                                            pop.set_stream_exact(crate::ui::gpu_video::drawn_at_own_size(true, (size.width, size.height)));
                                             pop.set_stream_frame(frame);
                                         }
                                         pop.set_stream_fps(rx_fps_str.into());
@@ -1023,7 +1021,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }) {
                         pending_flag.store(false, Ordering::Release);
-                        screen_capture::set_rx_ui_pending(false);
                     }
                 }
             }
