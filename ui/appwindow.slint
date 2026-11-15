@@ -1396,11 +1396,15 @@ export component AppWindow inherits Window {
 
                             VerticalLayout {
                                 alignment: center;
+                                // A long channel name gives way to the buttons: in a narrow
+                                // window it is cut with an ellipsis instead of pushing
+                                // Disconnect off the right edge.
                                 Text {
                                     text: root.current_voice_channel;
                                     color: AppTheme.text-strong;
                                     font-size: TypeScale.title;
                                     font-weight: 800;
+                                    overflow: elide;
                                 }
                             }
 
