@@ -61,11 +61,11 @@ pub fn generate_qr_image(url: &str) -> Result<slint::Image, String> {
 fn generate_rsa_key_pair() -> Result<(RsaPrivateKey, String), String> {
     let mut rng = rand::thread_rng();
     let private_key = RsaPrivateKey::new(&mut rng, 2048)
-        .map_err(|e| format!("Falha ao gerar chave RSA 2048: {:?}", e))?;
+        .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Failed to generate the RSA 2048 key", "Falha ao gerar chave RSA 2048"), e))?;
     let public_key = RsaPublicKey::from(&private_key);
 
     let spki_der = public_key.to_public_key_der()
-        .map_err(|e| format!("Falha ao exportar SPKI DER: {:?}", e))?;
+        .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Failed to export SPKI DER", "Falha ao exportar SPKI DER"), e))?;
     let encoded_public_key = base64::engine::general_purpose::STANDARD.encode(spki_der.as_bytes());
 
     Ok((private_key, encoded_public_key))
@@ -107,22 +107,22 @@ async fn exchange_ticket_for_token(
         .json(&serde_json::json!({ "ticket": ticket }))
         .send()
         .await
-        .map_err(|e| format!("Erro HTTP ao trocar ticket: {:?}", e))?;
+        .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("HTTP error while exchanging the ticket", "Erro HTTP ao trocar ticket"), e))?;
 
     let json: serde_json::Value = res.json()
         .await
-        .map_err(|e| format!("Erro JSON na resposta de login: {:?}", e))?;
+        .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("JSON error in the login response", "Erro JSON na resposta de login"), e))?;
 
     if let Some(enc_token_b64) = json["encrypted_token"].as_str() {
         let enc_bytes = base64::engine::general_purpose::STANDARD.decode(enc_token_b64)
-            .map_err(|e| format!("Erro ao decodificar Base64 do token: {:?}", e))?;
+            .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Failed to decode the token's Base64", "Erro ao decodificar Base64 do token"), e))?;
         let decrypted = private_key.decrypt(Oaep::new::<Sha256>(), &enc_bytes)
-            .map_err(|e| format!("Erro ao decifrar token: {:?}", e))?;
+            .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Failed to decrypt the token", "Erro ao decifrar token"), e))?;
         let token_str = String::from_utf8(decrypted)
-            .map_err(|e| format!("Token inválido UTF-8: {:?}", e))?;
+            .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Token is not valid UTF-8", "Token inválido UTF-8"), e))?;
         Ok(token_str)
     } else {
-        Err(format!("Resposta sem encrypted_token: {:?}", json))
+        Err(format!("{}: {:?}", crate::utils::i18n_ui::pick("Response without encrypted_token", "Resposta sem encrypted_token"), json))
     }
 }
 
@@ -146,10 +146,10 @@ async fn run_remote_auth_loop(
         .header("Sec-WebSocket-Version", "13")
         .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
         .body(())
-        .map_err(|e| format!("Erro ao criar requisição WS: {:?}", e))?;
+        .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Failed to create the WebSocket request", "Erro ao criar requisição WS"), e))?;
 
     let (ws_stream, _) = connect_async(req).await
-        .map_err(|e| format!("Falha ao conectar no Remote Auth Gateway: {:?}", e))?;
+        .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Failed to connect to the Remote Auth Gateway", "Falha ao conectar no Remote Auth Gateway"), e))?;
 
     info!("📡 Conectado ao Discord Remote Auth Gateway!");
 
@@ -164,7 +164,7 @@ async fn run_remote_auth_loop(
 
         let msg = match msg_res {
             Ok(m) => m,
-            Err(e) => return Err(format!("Erro de leitura WebSocket: {:?}", e)),
+            Err(e) => return Err(format!("{}: {:?}", crate::utils::i18n_ui::pick("WebSocket read error", "Erro de leitura WebSocket"), e)),
         };
 
         if let Message::Text(text) = msg {
@@ -201,7 +201,7 @@ async fn run_remote_auth_loop(
                     });
                     let mut w = write_arc.lock().await;
                     w.send(Message::Text(init_payload.to_string().into())).await
-                        .map_err(|e| format!("Falha ao enviar init payload: {:?}", e))?;
+                        .map_err(|e| format!("{}: {:?}", crate::utils::i18n_ui::pick("Failed to send the init payload", "Falha ao enviar init payload"), e))?;
                     drop(w);
                     return handle_auth_steps(read, write_arc, private_key, event_tx, cancel_flag).await;
                 }
@@ -230,7 +230,7 @@ async fn handle_auth_steps(
 
         let msg = match msg_res {
             Ok(m) => m,
-            Err(e) => return Err(format!("Erro WebSocket: {:?}", e)),
+            Err(e) => return Err(format!("{}: {:?}", crate::utils::i18n_ui::pick("WebSocket error", "Erro WebSocket"), e)),
         };
 
         if let Message::Text(text) = msg {

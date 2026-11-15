@@ -46,7 +46,7 @@ pub async fn fetch_and_populate_guilds(
 
             for g in guilds_json {
                 let g_id = g["id"].as_str().unwrap_or("").to_string();
-                let g_name = g["name"].as_str().unwrap_or("Servidor").to_string();
+                let g_name = g["name"].as_str().unwrap_or(crate::utils::i18n_ui::pick("Server", "Servidor")).to_string();
                 let g_icon_hash = g["icon"].as_str().map(|s| s.to_string());
 
                 if !g_id.is_empty() {
@@ -223,7 +223,7 @@ pub async fn fetch_and_populate_channels(
     let g_name = guilds_map.lock().unwrap()
         .get(guild_id)
         .map(|g| g.name.clone())
-        .unwrap_or_else(|| "Servidor".to_string());
+        .unwrap_or_else(|| crate::utils::i18n_ui::pick("Server", "Servidor").to_string());
 
     let app_w_top = app_weak.clone();
     let g_name_top = g_name.clone();
@@ -310,7 +310,7 @@ pub async fn fetch_and_populate_channels(
 
     for ch in chans_json {
         let ch_id = ch["id"].as_str().unwrap_or("").to_string();
-        let ch_name = ch["name"].as_str().unwrap_or("canal").to_string();
+        let ch_name = ch["name"].as_str().unwrap_or(crate::utils::i18n_ui::pick("channel", "canal")).to_string();
         let ch_type = ch["type"].as_u64().unwrap_or(0);
         let parent_id = ch["parent_id"].as_str().map(|s| s.to_string());
         let position = ch["position"].as_i64().unwrap_or(0);
@@ -469,7 +469,7 @@ pub async fn fetch_and_populate_channels(
                 let empty_msgs = vec![ChatMessage {
                     id: "".into(),
                     author: "Litecord System".into(),
-                    content: "Este servidor não possui canais de texto acessíveis para a sua conta.".into(),
+                    content: crate::utils::i18n_ui::pick("This server has no text channels your account can access.", "Este servidor não possui canais de texto acessíveis para a sua conta.").into(),
                     commands: slint::ModelRc::default(),
                     content_lines: slint::ModelRc::default(),
                     embed_content: "".into(),
@@ -629,15 +629,15 @@ pub async fn fetch_and_populate_dms(
                 let (ch_name, avatar_text) = if ch_type == 3 {
                     // Grupo
                     let name = if let Some(n) = dm["name"].as_str() {
-                        if !n.is_empty() { n.to_string() } else { "Grupo".to_string() }
+                        if !n.is_empty() { n.to_string() } else { crate::utils::i18n_ui::pick("Group", "Grupo").to_string() }
                     } else if let Some(recipients) = dm["recipients"].as_array() {
                         let names: Vec<String> = recipients.iter()
                             .filter_map(|r| r["global_name"].as_str().or_else(|| r["username"].as_str()))
                             .map(|s| s.to_string())
                             .collect();
-                        if names.is_empty() { "Grupo".to_string() } else { names.join(", ") }
+                        if names.is_empty() { crate::utils::i18n_ui::pick("Group", "Grupo").to_string() } else { names.join(", ") }
                     } else {
-                        "Grupo".to_string()
+                        crate::utils::i18n_ui::pick("Group", "Grupo").to_string()
                     };
                     let initials = get_guild_initials(&name);
                     (name, initials)
@@ -646,14 +646,14 @@ pub async fn fetch_and_populate_dms(
                     let (name, initials) = if let Some(recipients) = dm["recipients"].as_array() {
                         if let Some(first_user) = recipients.first() {
                             let disp_name = first_user["global_name"].as_str()
-                                .unwrap_or_else(|| first_user["username"].as_str().unwrap_or("Amigo"));
+                                .unwrap_or_else(|| first_user["username"].as_str().unwrap_or(crate::utils::i18n_ui::pick("Friend", "Amigo")));
                             let inits = get_guild_initials(disp_name);
                             (disp_name.to_string(), inits)
                         } else {
-                            ("Amigo".to_string(), "DM".to_string())
+                            (crate::utils::i18n_ui::pick("Friend", "Amigo").to_string(), "DM".to_string())
                         }
                     } else {
-                        ("Amigo".to_string(), "DM".to_string())
+                        (crate::utils::i18n_ui::pick("Friend", "Amigo").to_string(), "DM".to_string())
                     };
                     (name, initials)
                 };
@@ -742,7 +742,7 @@ pub async fn fetch_and_populate_dms(
                 let target_name = ui_channels.iter()
                     .find(|c| c.id == cid.as_str())
                     .map(|c| c.name.to_string())
-                    .unwrap_or_else(|| "conversa".to_string());
+                    .unwrap_or_else(|| crate::utils::i18n_ui::pick("conversation", "conversa").to_string());
                 *active_channel_id.lock().unwrap() = cid.clone();
                 let app_w_name = app_weak.clone();
                 let cid_top = cid.clone();
@@ -821,7 +821,7 @@ pub async fn load_messages_for_channel(
                         vec![ChatMessage {
                             id: "".into(),
                             author: "Litecord System".into(),
-                            content: "Este canal está vazio ou não possui mensagens recentes.".into(),
+                            content: crate::utils::i18n_ui::pick("This channel is empty or has no recent messages.", "Este canal está vazio ou não possui mensagens recentes.").into(),
                             commands: slint::ModelRc::default(),
                             content_lines: slint::ModelRc::default(),
                             embed_content: "".into(),
@@ -892,9 +892,9 @@ pub async fn load_messages_for_channel(
         Err(err) => {
             error!("Erro ao carregar mensagens do canal {}: {}", channel_id, err);
             let friendly_msg = if err.contains("403") || err.contains("Forbidden") {
-                "Canal Privado\nEste canal é restrito e exige cargos específicos no servidor para visualizar as mensagens.".to_string()
+                crate::utils::i18n_ui::pick("Private Channel\nThis channel is restricted and requires specific server roles to view its messages.", "Canal Privado\nEste canal é restrito e exige cargos específicos no servidor para visualizar as mensagens.").to_string()
             } else {
-                format!("Não foi possível carregar as mensagens ({})", err)
+                format!("{} ({})", crate::utils::i18n_ui::pick("The messages could not be loaded", "Não foi possível carregar as mensagens"), err)
             };
 
             let _ = slint::invoke_from_event_loop(move || {

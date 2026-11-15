@@ -955,13 +955,13 @@ impl GatewayClient {
                 }
                 "GUILD_CREATE" => {
                     let id = v["d"]["id"].as_str().unwrap_or("").to_string();
-                    let name = v["d"]["name"].as_str().unwrap_or("Servidor").to_string();
+                    let name = v["d"]["name"].as_str().unwrap_or(crate::utils::i18n_ui::pick("Server", "Servidor")).to_string();
                     let mut channels = Vec::new();
 
                     if let Some(chans_arr) = v["d"]["channels"].as_array() {
                         for ch in chans_arr {
                             let ch_id = ch["id"].as_str().unwrap_or("").to_string();
-                            let ch_name = ch["name"].as_str().unwrap_or("canal").to_string();
+                            let ch_name = ch["name"].as_str().unwrap_or(crate::utils::i18n_ui::pick("channel", "canal")).to_string();
                             let ch_type = ch["type"].as_u64().unwrap_or(0);
 
                             // type 0 = text, type 2 = voice, type 4 = category, type 5 = news, type 13 = stage, type 15 = forum

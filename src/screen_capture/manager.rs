@@ -2179,7 +2179,7 @@ impl ScreenCaptureManager {
                                                     qos.frames_lost += lost_between(seq_before, seq, last_frame_at.insert(pkt_uid, Instant::now()));
                                                     last_stream_activity.insert(pkt_uid, Instant::now());
 
-                                                    let uname = peer_names.get(&pkt_uid).cloned().unwrap_or_else(|| format!("Usuário {}", pkt_uid));
+                                                    let uname = peer_names.get(&pkt_uid).cloned().unwrap_or_else(|| format!("{} {}", crate::utils::i18n_ui::pick("User", "Usuário"), pkt_uid));
                                                     let fps_val = peer_fps.get(&pkt_uid).copied().unwrap_or(60);
 
                                                     let q_item = QueuedVideoFrame {
@@ -2302,7 +2302,7 @@ impl ScreenCaptureManager {
                                                     qos.fec_recovered += 1;
                                                     last_stream_activity.insert(pkt_uid, Instant::now());
 
-                                                    let uname = peer_names.get(&pkt_uid).cloned().unwrap_or_else(|| format!("Usuário {}", pkt_uid));
+                                                    let uname = peer_names.get(&pkt_uid).cloned().unwrap_or_else(|| format!("{} {}", crate::utils::i18n_ui::pick("User", "Usuário"), pkt_uid));
                                                     let fps_val = peer_fps.get(&pkt_uid).copied().unwrap_or(60);
 
                                                     let q_item = QueuedVideoFrame {

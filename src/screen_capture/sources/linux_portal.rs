@@ -470,7 +470,7 @@ pub fn list_screens() -> Vec<MonitorItemInfo> {
             let root = &conn.setup().roots[screen_num];
             screens.push(MonitorItemInfo {
                 id: 0,
-                name: "Tela Principal".to_string(),
+                name: crate::utils::i18n_ui::pick("Main Screen", "Tela Principal").to_string(),
                 resolution: format!("{} × {}", root.width_in_pixels, root.height_in_pixels),
                 is_primary: true,
                 hwnd: root.root as isize,
@@ -481,7 +481,7 @@ pub fn list_screens() -> Vec<MonitorItemInfo> {
     if screens.is_empty() {
         screens.push(MonitorItemInfo {
             id: 0,
-            name: "Tela 1 (Principal)".to_string(),
+            name: crate::utils::i18n_ui::pick("Screen 1 (Primary)", "Tela 1 (Principal)").to_string(),
             resolution: "1920 × 1080".to_string(),
             is_primary: true,
             hwnd: 0,

@@ -371,6 +371,12 @@ pub fn ui_text() -> &'static UiStrings {
     }
 }
 
+/// For Rust-side text that has no row in the table: Portuguese only when the UI is in
+/// Portuguese, English for every other language.
+pub fn pick(en: &'static str, pt: &'static str) -> &'static str {
+    if CURRENT.load(Ordering::Relaxed) == 1 { pt } else { en }
+}
+
 pub fn table_for(lang: Language) -> &'static UiStrings {
     match lang {
         Language::Portuguese => &PT_UI,

@@ -39,9 +39,9 @@ pub fn list_screens() -> Vec<MonitorItemInfo> {
         let (w, h) = if width > 0 && height > 0 { (width, height) } else { (1920, 1080) };
 
         let name = if is_primary {
-            format!("Tela {} (Principal)", data.count)
+            format!("{} {} ({})", crate::utils::i18n_ui::pick("Screen", "Tela"), data.count, crate::utils::i18n_ui::pick("Primary", "Principal"))
         } else {
-            format!("Tela {}", data.count)
+            format!("{} {}", crate::utils::i18n_ui::pick("Screen", "Tela"), data.count)
         };
 
         data.screens.push(MonitorItemInfo {
@@ -63,7 +63,7 @@ pub fn list_screens() -> Vec<MonitorItemInfo> {
     if data.screens.is_empty() {
         data.screens.push(MonitorItemInfo {
             id: 0,
-            name: "Tela 1 (Principal)".to_string(),
+            name: crate::utils::i18n_ui::pick("Screen 1 (Primary)", "Tela 1 (Principal)").to_string(),
             resolution: "1920 × 1080".to_string(),
             is_primary: true,
             hwnd: 0,
@@ -112,7 +112,8 @@ pub fn list_capturable_windows() -> Vec<CapturableWindowItem> {
                 && !lower.starts_with("windows input")
                 && !lower.starts_with("msctfime ui")
                 && !lower.starts_with("default ime")
-                && !lower.starts_with("litecord - transmissão") 
+                && !lower.starts_with("litecord - transmissão")
+                && !lower.starts_with("litecord - detached stream")
             {
                 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
                 use windows_sys::Win32::System::ProcessStatus::GetModuleFileNameExW;
@@ -158,16 +159,16 @@ pub fn list_capturable_windows() -> Vec<CapturableWindowItem> {
                 } else if exe_name.contains("terminal") || exe_name.contains("powershell") || exe_name.contains("cmd") || lower.contains("terminal") {
                     "Terminal".to_string()
                 } else if exe_name.contains("notepad") || lower.contains("bloco de notas") {
-                    "Bloco de Notas".to_string()
+                    crate::utils::i18n_ui::pick("Notepad", "Bloco de Notas").to_string()
                 } else if !exe_name.is_empty() {
                     let clean = exe_name.trim_end_matches(".exe");
                     let mut chars = clean.chars();
                     match chars.next() {
-                        None => "Janela".to_string(),
+                        None => crate::utils::i18n_ui::pick("Window", "Janela").to_string(),
                         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
                     }
                 } else {
-                    "Janela".to_string()
+                    crate::utils::i18n_ui::pick("Window", "Janela").to_string()
                 };
 
                 let icon_rgba = extract_window_icon_rgba(hwnd);

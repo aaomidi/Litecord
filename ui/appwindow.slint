@@ -289,7 +289,7 @@ export component AppWindow inherits Window {
     in-out property <string> tr_chat_placeholder_prefix: "Message ";
     in-out property <string> tr_send: "Send";
     in-out property <string> tr_settings_title: "Voice & Audio Settings";
-    in-out property <string> tr_settings_language_label: "LANGUAGE / IDIOMA";
+    in-out property <string> tr_settings_language_label: "LANGUAGE";
     in-out property <string> tr_settings_input_device: "INPUT DEVICE (MICROPHONE)";
     in-out property <string> tr_settings_output_device: "OUTPUT DEVICE (SPEAKERS / HEADPHONES)";
     in-out property <string> tr_settings_threshold: "VOICE DETECTION SENSITIVITY (THRESHOLD)";
@@ -437,8 +437,8 @@ export component AppWindow inherits Window {
     in-out property <[LanguageItem]> languages: [];
     in-out property <[AudioDeviceItem]> input_devices: [];
     in-out property <[AudioDeviceItem]> output_devices: [];
-    in-out property <string> selected_input_device: "Microfone Padrão do Sistema";
-    in-out property <string> selected_output_device: "Alto-falantes Padrão do Sistema";
+    in-out property <string> selected_input_device: "";
+    in-out property <string> selected_output_device: "";
     in-out property <float> mic_level: 0.0; // Real-time mic volume level (0.0 to 1.0)
     in-out property <float> mic_volume: 1.0; // Microphone Input Gain Volume (0.0 to 2.0, 100% = 1.0)
     in-out property <float> vad_threshold: 0.05; // Voice Activity Detection Threshold (0.0 to 1.0)

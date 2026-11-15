@@ -343,7 +343,7 @@ pub fn get_voice_channel_participants(channel_id: &str) -> Vec<(u64, String)> {
                 .as_ref()
                 .and_then(|known_names| known_names.get(&user_id))
                 .cloned()
-                .unwrap_or_else(|| format!("Participante #{}", user_id));
+                .unwrap_or_else(|| display_user_name(&format!("{}{}", UNRESOLVED_NAME_PREFIX, user_id)));
             (user_id, name)
         })
         .collect();
@@ -373,9 +373,9 @@ pub fn set_my_username(name: String) {
 
 pub fn get_my_username() -> String {
     if let Ok(uname) = MY_USERNAME.get_or_init(|| Arc::new(std::sync::Mutex::new(String::new()))).lock() {
-        if uname.is_empty() { "Você".to_string() } else { uname.clone() }
+        if uname.is_empty() { crate::utils::i18n_ui::pick("You", "Você").to_string() } else { uname.clone() }
     } else {
-        "Você".to_string()
+        crate::utils::i18n_ui::pick("You", "Você").to_string()
     }
 }
 
@@ -614,6 +614,19 @@ pub fn get_user_avatar_url(user_id: u64) -> String {
         .unwrap_or_default()
 }
 
+/// Prefix of the stored placeholder name of a user that is not resolved yet. It is an
+/// identifier (callers test for it with `starts_with`), so it is never translated;
+/// `display_user_name` gives the text to show.
+pub const UNRESOLVED_NAME_PREFIX: &str = "Participante #";
+
+/// `name` as it should be shown: the unresolved placeholder in the UI language, anything else as is.
+pub fn display_user_name(name: &str) -> String {
+    match name.strip_prefix(UNRESOLVED_NAME_PREFIX) {
+        Some(id) => format!("{}{}", crate::utils::i18n_ui::pick("Participant #", UNRESOLVED_NAME_PREFIX), id),
+        None => name.to_string(),
+    }
+}
+
 pub fn get_user_name(user_id: u64) -> String {
     if let Ok(map) = get_user_names_store().lock() {
         if let Some(name) = map.get(&user_id) {
@@ -623,8 +636,7 @@ pub fn get_user_name(user_id: u64) -> String {
     match user_id {
         1307641538502725643 => "MusicMan [Bot]".to_string(),
         1323489999953465385 => "cortez".to_string(),
-        398203126630580225 => "Marido da juju (Você)".to_string(),
-        _ => format!("Participante #{}", user_id),
+        _ => format!("{}{}", UNRESOLVED_NAME_PREFIX, user_id),
     }
 }
 

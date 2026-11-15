@@ -66,8 +66,8 @@ impl SystemTrayManager {
         }
 
         let tray_menu = Menu::new();
-        let show_item = MenuItem::new("Exibir Litecord", true, None);
-        let quit_item = MenuItem::new("Sair", true, None);
+        let show_item = MenuItem::new(crate::utils::i18n_ui::pick("Show Litecord", "Exibir Litecord"), true, None);
+        let quit_item = MenuItem::new(crate::utils::i18n_ui::pick("Quit", "Sair"), true, None);
 
         let show_id = show_item.id().clone();
         let quit_id = quit_item.id().clone();
@@ -81,7 +81,7 @@ impl SystemTrayManager {
             .with_icon(icon)
             .with_menu(Box::new(tray_menu))
             .with_menu_on_left_click(true)
-            .with_tooltip("Litecord - Discord Client Ultra-Leve")
+            .with_tooltip(crate::utils::i18n_ui::pick("Litecord - Ultra-Lightweight Discord Client", "Litecord - Discord Client Ultra-Leve"))
             .build()
         {
             Ok(icon) => {
