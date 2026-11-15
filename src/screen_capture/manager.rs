@@ -1627,6 +1627,16 @@ impl ScreenCaptureManager {
                     fec_recovered: u32,
                 }
                 let mut qos_windows: HashMap<u64, PeerQosWindow> = HashMap::new();
+                // When each peer's last frame completed. The sender numbers every frame it sends,
+                // so a jump in the numbers while pictures were flowing is frames that never
+                // completed here (a pause in the stream is not loss).
+                let mut last_frame_at: HashMap<u64, Instant> = HashMap::new();
+                fn lost_between(before: Option<u32>, seq: u32, before_at: Option<Instant>) -> u32 {
+                    match (before, before_at) {
+                        (Some(before), Some(at)) if at.elapsed() < Duration::from_millis(500) => seq.wrapping_sub(before).saturating_sub(1).min(60),
+                        _ => 0,
+                    }
+                }
 
                 // Log throttling: these used to be written once per packet / per tick.
                 let mut rx_pkts_since_log: u64 = 0;
@@ -2127,7 +2137,7 @@ impl ScreenCaptureManager {
                                                 let is_newer = seq > last_seq || (last_seq.wrapping_sub(seq) > 0x8000_0000);
 
                                                 if is_newer || last_rendered_seq.get(&pkt_uid).is_none() {
-                                                    last_rendered_seq.insert(pkt_uid, seq);
+                                                    let seq_before = last_rendered_seq.insert(pkt_uid, seq);
 
                                                     let prev_state = active_streaming_users.insert(pkt_uid, true);
                                                     if prev_state != Some(true) {
@@ -2137,6 +2147,7 @@ impl ScreenCaptureManager {
 
                                                     let qos = qos_windows.entry(pkt_uid).or_default();
                                                     qos.frames_received += 1;
+                                                    qos.frames_lost += lost_between(seq_before, seq, last_frame_at.insert(pkt_uid, Instant::now()));
                                                     last_stream_activity.insert(pkt_uid, Instant::now());
 
                                                     let uname = peer_names.get(&pkt_uid).cloned().unwrap_or_else(|| format!("Usuário {}", pkt_uid));
@@ -2248,7 +2259,7 @@ impl ScreenCaptureManager {
                                                 let is_newer = seq > last_seq || (last_seq.wrapping_sub(seq) > 0x8000_0000);
 
                                                 if is_newer || last_rendered_seq.get(&pkt_uid).is_none() {
-                                                    last_rendered_seq.insert(pkt_uid, seq);
+                                                    let seq_before = last_rendered_seq.insert(pkt_uid, seq);
 
                                                     let prev_state = active_streaming_users.insert(pkt_uid, true);
                                                     if prev_state != Some(true) {
@@ -2258,6 +2269,7 @@ impl ScreenCaptureManager {
 
                                                     let qos = qos_windows.entry(pkt_uid).or_default();
                                                     qos.frames_received += 1;
+                                                    qos.frames_lost += lost_between(seq_before, seq, last_frame_at.insert(pkt_uid, Instant::now()));
                                                     qos.fec_recovered += 1;
                                                     last_stream_activity.insert(pkt_uid, Instant::now());
 
