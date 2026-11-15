@@ -175,28 +175,12 @@ pub async fn connect_voice_gateway(
 
                                     info!("🎉 VOICE GATEWAY PRONTA (Opcode 2 READY)! SSRC={}, IP={}:{}, Encryption Mode={}", ssrc, voice_ip, voice_port, selected_mode);
 
-                                    // Synthesize Join Voice Chime (523.25Hz C5 -> 659.25Hz E5) to test local audio playback
-                                    let mut chime_samples = Vec::new();
-                                    let sr = 48000.0f32;
-                                    for i in 0..(0.12 * sr) as usize {
-                                        let t = i as f32 / sr;
-                                        let s = (t * 523.25 * 2.0 * std::f32::consts::PI).sin() * 0.4;
-                                        chime_samples.push(s);
-                                    }
-                                    for i in 0..(0.18 * sr) as usize {
-                                        let t = i as f32 / sr;
-                                        let s = (t * 659.25 * 2.0 * std::f32::consts::PI).sin() * 0.4;
-                                        chime_samples.push(s);
-                                    }
-
+                                    // No chime here: joining already plays the quiet UiSound::JoinChannel
+                                    // tone. (Upstream injected a raw 0.4 full-scale sine pair at this point,
+                                    // on every voice READY, reconnects included.)
                                     if let Ok(mut queues) = get_speaker_pcm_queues().lock() {
-                                        let q = queues.entry(999999).or_insert_with(|| VecDeque::with_capacity(48000));
-                                        q.clear();
-                                        for &s in &chime_samples {
-                                            q.push_back((s, s));
-                                        }
+                                        queues.entry(999999).or_insert_with(|| VecDeque::with_capacity(48000)).clear();
                                     }
-                                    info!("🎵 Efeito sonoro de entrada no canal de voz injetado na fila dos alto-falantes!");
 
                                     // UDP IP Discovery & Opcode 1 Select Protocol Handshake
                                     if !voice_ip.is_empty() && voice_port > 0 {

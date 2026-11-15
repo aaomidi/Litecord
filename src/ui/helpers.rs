@@ -544,16 +544,9 @@ pub fn populate_voice_processing_settings(ui: &AppWindow) {
     ui.set_echo_cancellation(aec);
     ui.set_automatic_gain_control(agc);
 
-    let lang = i18n::load_persisted_language_config();
+    // The resolved UI language: the persisted choice may be "Auto", which is not a language.
+    let lang = i18n_ui::current_language();
     let (adv_name, adv_desc, std_name, std_desc, off_name, off_desc) = match lang {
-        i18n::Language::English => (
-            "Advanced Suppression",
-            "Deep neural network background noise removal and transient filtering.",
-            "Standard (RNNoise)",
-            "Classic recurrent neural network noise reduction.",
-            "Disabled (Default)",
-            "No noise suppression applied to microphone."
-        ),
         i18n::Language::Spanish => (
             "Supresión avanzada",
             "Supresión por red neuronal profunda y filtrado de transientes.",
@@ -562,13 +555,21 @@ pub fn populate_voice_processing_settings(ui: &AppWindow) {
             "Desactivado (Predeterminado)",
             "Sin procesamiento de supresión de ruido en el micrófono."
         ),
-        _ => (
+        i18n::Language::Portuguese => (
             "Supressão Avançada",
             "Supressão por rede neural profunda e filtragem de transientes.",
             "Padrão (RNNoise)",
             "Redução de ruído clássica baseada em rede neural recorrente.",
             "Desativado (Padrão)",
             "Sem processamento de supressão de ruído no microfone."
+        ),
+        _ => (
+            "Advanced Suppression",
+            "Deep neural network background noise removal and transient filtering.",
+            "Standard (RNNoise)",
+            "Classic recurrent neural network noise reduction.",
+            "Disabled (Default)",
+            "No noise suppression applied to microphone."
         ),
     };
 
@@ -609,29 +610,32 @@ pub fn populate_network_proxy_settings(ui: &AppWindow) {
     }
     ui.set_proxy_route_media_enabled(settings.route_media);
 
+    // Portuguese only when the UI is in Portuguese; these have no entry in the UI string table.
+    let portuguese = i18n_ui::current_language() == i18n::Language::Portuguese;
+    let pick = |en: &'static str, pt: &'static str| if portuguese { pt } else { en };
     let mode_items = vec![
         SettingOptionItem {
             id: "off".into(),
-            name: "Desativado (Conexão Direta)".into(),
-            desc: "Conexão direta aos servidores do Discord (Padrão).".into(),
+            name: pick("Disabled (Direct Connection)", "Desativado (Conexão Direta)").into(),
+            desc: pick("Direct connection to Discord servers (default).", "Conexão direta aos servidores do Discord (Padrão).").into(),
             is_selected: settings.proxy_mode == "off",
         },
         SettingOptionItem {
             id: "http".into(),
-            name: "Proxy HTTP / HTTPS".into(),
-            desc: "Túnel HTTP CONNECT para redes restritas e proxies.".into(),
+            name: pick("HTTP / HTTPS Proxy", "Proxy HTTP / HTTPS").into(),
+            desc: pick("HTTP CONNECT tunnel for restricted networks and proxies.", "Túnel HTTP CONNECT para redes restritas e proxies.").into(),
             is_selected: settings.proxy_mode == "http" || settings.proxy_mode == "https",
         },
         SettingOptionItem {
             id: "socks5".into(),
-            name: "Proxy SOCKS5".into(),
-            desc: "Túnel SOCKS5 compatível com Tor, Shadowsocks e SSH.".into(),
+            name: pick("SOCKS5 Proxy", "Proxy SOCKS5").into(),
+            desc: pick("SOCKS5 tunnel, compatible with Tor, Shadowsocks and SSH.", "Túnel SOCKS5 compatível com Tor, Shadowsocks e SSH.").into(),
             is_selected: settings.proxy_mode == "socks5",
         },
         SettingOptionItem {
             id: "system".into(),
-            name: "Proxy do Sistema".into(),
-            desc: "Detecta automaticamente o proxy global do sistema.".into(),
+            name: pick("System Proxy", "Proxy do Sistema").into(),
+            desc: pick("Detects the system-wide proxy automatically.", "Detecta automaticamente o proxy global do sistema.").into(),
             is_selected: settings.proxy_mode == "system",
         },
     ];
