@@ -6,6 +6,10 @@
 //! lacks a colour description so that it carries one: inside its video signal type, or with
 //! a whole video signal type (limited range) when there is none. Every other bit of the SPS
 //! is kept, and the RBSP trailing bits are realigned.
+//!
+//! NVENC writes a VUI without bitstream restrictions: for Main nothing then tells decoders
+//! that no picture is reordered, and they may hold pictures back. `declare_no_reordering`
+//! adds them (`max_num_reorder_frames` 0).
 
 /// Annex B `stream` with every SPS declaring (primaries, transfer, matrix); unchanged when
 /// no SPS needs it.
@@ -28,11 +32,29 @@ pub fn declare_colour(stream: &[u8], primaries: u8, transfer: u8, matrix: u8) ->
     out
 }
 
-/// One SPS NAL (header byte included, emulation prevention bytes in place), with the
-/// colour description added; `None` when it has none to add or cannot be read.
-fn rewrite_sps(nal: &[u8], primaries: u8, transfer: u8, matrix: u8) -> Option<Vec<u8>> {
-    let rbsp = unescape(&nal[1..]);
-    let mut r = BitReader::new(&rbsp);
+/// Annex B `stream` with every SPS that has a VUI but no bitstream restrictions declaring
+/// that no picture is reordered; unchanged when no SPS needs it.
+pub fn declare_no_reordering(stream: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(stream.len() + 8);
+    let mut last = 0;
+    for range in crate::screen_capture::hw_decode::h264_state::nal_ranges(stream) {
+        if stream[range.start] & 0x1f != 7 {
+            continue;
+        }
+        let Some(rewritten) = restrict_sps(&stream[range.clone()]) else { continue };
+        out.extend_from_slice(&stream[last..range.start]);
+        out.extend_from_slice(&rewritten);
+        last = range.end;
+    }
+    if last == 0 {
+        return stream.to_vec();
+    }
+    out.extend_from_slice(&stream[last..]);
+    out
+}
+
+/// Reads an SPS RBSP up to its VUI: `None` without one. Returns max_num_ref_frames.
+fn skip_to_vui(r: &mut BitReader) -> Option<u32> {
     let profile = r.bits(8)?;
     r.bits(16)?; // constraint flags, level
     r.ue()?; // seq_parameter_set_id
@@ -47,7 +69,7 @@ fn rewrite_sps(nal: &[u8], primaries: u8, transfer: u8, matrix: u8) -> Option<Ve
         if r.bits(1)? == 1 {
             for i in 0..if chroma == 3 { 12 } else { 8 } {
                 if r.bits(1)? == 1 {
-                    skip_scaling_list(&mut r, if i < 6 { 16 } else { 64 })?;
+                    skip_scaling_list(r, if i < 6 { 16 } else { 64 })?;
                 }
             }
         }
@@ -67,7 +89,7 @@ fn rewrite_sps(nal: &[u8], primaries: u8, transfer: u8, matrix: u8) -> Option<Ve
         }
         _ => {}
     }
-    r.ue()?; // max_num_ref_frames
+    let max_refs = r.ue()?;
     r.bits(1)?;
     r.ue()?;
     r.ue()?;
@@ -83,6 +105,15 @@ fn rewrite_sps(nal: &[u8], primaries: u8, transfer: u8, matrix: u8) -> Option<Ve
     if r.bits(1)? == 0 {
         return None; // no VUI
     }
+    Some(max_refs)
+}
+
+/// One SPS NAL (header byte included, emulation prevention bytes in place), with the
+/// colour description added; `None` when it has none to add or cannot be read.
+fn rewrite_sps(nal: &[u8], primaries: u8, transfer: u8, matrix: u8) -> Option<Vec<u8>> {
+    let rbsp = unescape(&nal[1..]);
+    let mut r = BitReader::new(&rbsp);
+    skip_to_vui(&mut r)?;
     if r.bits(1)? == 1 && r.bits(8)? == 255 {
         r.bits(32)?; // sar_width, sar_height
     }
@@ -106,16 +137,91 @@ fn rewrite_sps(nal: &[u8], primaries: u8, transfer: u8, matrix: u8) -> Option<Ve
         v.extend(byte_bits(&[primaries, transfer, matrix]));
         (signal_at, v)
     };
+    splice(nal[0], &rbsp, flag_at, insert)
+}
 
-    // Copy up to the flag, replace it with the inserted bits, copy the rest without the
-    // old trailing bits, then end the RBSP again.
+/// One SPS NAL with `bitstream_restriction_flag` set: no reordering, as many pictures
+/// buffered as are referenced, everything else at its inferred value. `None` when it has
+/// restrictions already, no VUI, or cannot be read.
+fn restrict_sps(nal: &[u8]) -> Option<Vec<u8>> {
+    let rbsp = unescape(&nal[1..]);
+    let mut r = BitReader::new(&rbsp);
+    let max_refs = skip_to_vui(&mut r)?;
+    if r.bits(1)? == 1 && r.bits(8)? == 255 {
+        r.bits(32)?;
+    }
+    if r.bits(1)? == 1 {
+        r.bits(1)?;
+    }
+    if r.bits(1)? == 1 {
+        r.bits(4)?;
+        if r.bits(1)? == 1 {
+            r.bits(24)?;
+        }
+    }
+    if r.bits(1)? == 1 {
+        r.ue()?; // chroma_sample_loc_type_top_field
+        r.ue()?;
+    }
+    if r.bits(1)? == 1 {
+        r.bits(32)?; // num_units_in_tick
+        r.bits(32)?;
+        r.bits(1)?;
+    }
+    let nal_hrd = r.bits(1)? == 1;
+    if nal_hrd {
+        skip_hrd(&mut r)?;
+    }
+    let vcl_hrd = r.bits(1)? == 1;
+    if vcl_hrd {
+        skip_hrd(&mut r)?;
+    }
+    if nal_hrd || vcl_hrd {
+        r.bits(1)?; // low_delay_hrd_flag
+    }
+    r.bits(1)?; // pic_struct_present_flag
+    let flag_at = r.pos;
+    if r.bits(1)? == 1 {
+        return None; // already restricted
+    }
+    // motion_vectors_over_pic_boundaries_flag, max_bytes_per_pic_denom 2, max_bits_per_mb_denom
+    // 1, log2_max_mv_length_horizontal/vertical 16, max_num_reorder_frames 0,
+    // max_dec_frame_buffering.
+    let mut insert = vec![1, 1];
+    for v in [2, 1, 16, 16, 0, max_refs] {
+        insert.extend(ue_bits(v));
+    }
+    splice(nal[0], &rbsp, flag_at, insert)
+}
+
+fn skip_hrd(r: &mut BitReader) -> Option<()> {
+    let cpb_cnt = r.ue()?;
+    r.bits(8)?; // bit_rate_scale, cpb_size_scale
+    for _ in 0..=cpb_cnt {
+        r.ue()?;
+        r.ue()?;
+        r.bits(1)?;
+    }
+    r.bits(20)?; // four 5-bit lengths
+    Some(())
+}
+
+fn ue_bits(v: u32) -> impl Iterator<Item = u8> {
+    let x = v as u64 + 1;
+    let len = 64 - x.leading_zeros();
+    (0..len - 1).map(|_| 0).chain((0..len).rev().map(move |i| ((x >> i) & 1) as u8))
+}
+
+/// The NAL `header` + `rbsp` with the one bit at `flag_at` replaced by `insert`, the rest
+/// copied without the old trailing bits, and the RBSP ended again.
+fn splice(header: u8, rbsp: &[u8], flag_at: usize, insert: Vec<u8>) -> Option<Vec<u8>> {
     let mut payload_end = rbsp.len() * 8;
     while payload_end > 0 && (rbsp[(payload_end - 1) / 8] >> (7 - (payload_end - 1) % 8)) & 1 == 0 {
         payload_end -= 1;
     }
     payload_end = payload_end.checked_sub(1)?; // the stop bit
     let mut w = BitWriter::default();
-    let mut src = BitReader::new(&rbsp);
+    let mut src = BitReader::new(rbsp);
     for _ in 0..flag_at {
         w.bit(src.bits(1)? as u8);
     }
@@ -130,7 +236,7 @@ fn rewrite_sps(nal: &[u8], primaries: u8, transfer: u8, matrix: u8) -> Option<Ve
     while w.n % 8 != 0 {
         w.bit(0);
     }
-    let mut out = vec![nal[0]];
+    let mut out = vec![header];
     out.extend_from_slice(&escape(&w.bytes));
     Some(out)
 }
@@ -385,6 +491,49 @@ mod tests {
         assert_eq!((c.colour_primaries, c.transfer_characteristics, c.matrix_coefficients), (1, 1, 1));
         assert_eq!(vui.bitstream_restrictions.as_ref().unwrap().max_num_reorder_frames, 0);
         assert_eq!(a.pic_width_in_mbs_minus1, 79);
+    }
+
+    /// The Quick Sync SPS with its bitstream restrictions taken off (as NVENC writes them).
+    fn sps_without_restrictions() -> Vec<u8> {
+        let before = quick_sync_like_sps();
+        let nal_end = before.windows(4).skip(4).position(|w| w == [0, 0, 0, 1]).unwrap() + 4;
+        let rbsp = unescape(&before[5..nal_end]);
+        let mut r = BitReader::new(&rbsp);
+        skip_to_vui(&mut r).unwrap();
+        r.bits(12).unwrap(); // aspect, overscan, signal type (1 + 5), chroma loc, timing, nal/vcl hrd
+        r.bits(1).unwrap(); // pic_struct
+        let at = r.pos;
+        let mut w = BitWriter::default();
+        let mut src = BitReader::new(&rbsp);
+        for _ in 0..at {
+            w.bit(src.bits(1).unwrap() as u8);
+        }
+        w.bit(0); // bitstream_restriction_flag
+        w.bit(1);
+        while w.n % 8 != 0 {
+            w.bit(0);
+        }
+        let mut nal = vec![0, 0, 0, 1, 0x67];
+        nal.extend_from_slice(&escape(&w.bytes));
+        nal
+    }
+
+    #[test]
+    fn adds_bitstream_restrictions_when_there_are_none() {
+        let before = sps_without_restrictions();
+        let b = sps_of(&before);
+        assert!(b.vui_parameters.as_ref().unwrap().bitstream_restrictions.is_none());
+        let after = declare_no_reordering(&before);
+        let a = sps_of(&after);
+        let vui = a.vui_parameters.as_ref().unwrap();
+        let br = vui.bitstream_restrictions.as_ref().expect("bitstream restrictions");
+        assert_eq!(br.max_num_reorder_frames, 0);
+        assert_eq!(br.max_dec_frame_buffering, 1);
+        assert!(!vui.video_signal_type.as_ref().unwrap().video_full_range_flag);
+        assert_eq!(a.pic_width_in_mbs_minus1, 79);
+        // Already restricted: left alone.
+        assert_eq!(declare_no_reordering(&after), after);
+        assert_eq!(declare_no_reordering(&quick_sync_like_sps()), quick_sync_like_sps());
     }
 
     #[test]
