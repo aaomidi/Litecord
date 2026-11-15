@@ -4,6 +4,13 @@
 //!                                                    \-> a few pictures a second, read back
 //!                                                        for the local preview
 //!
+//! The stream's frame is the preset's (854x480, 1280x720, 1920x1080) whatever the source's
+//! shape: the picture is scaled to fit it, centred, and the rest is black bars, where the
+//! gst-launch capture's `videoscale` puts them (`linux_portal::letterbox`), so a share that
+//! falls back to that capture keeps its geometry. A bar a single pixel thin is not made
+//! (`picture_rect`): the picture fills the frame then, and the gst-launch capture does the
+//! same for a monitor (a shared window in such a shape gets the one-pixel bar there).
+//!
 //! Everything from vapostproc on is `encoder::vaapi::EncodeChain`, the same text and the
 //! same rules as the encoder that takes frames from memory; only what feeds it differs. No
 //! raw frame is copied by the CPU except the preview's.
@@ -47,16 +54,70 @@
 //!   one start in ten. No picture has been handed out then, so that one is let pass.
 //! - `path=N` is only a wish: with the node gone, the session manager links the stream to
 //!   whatever video source it likes best. `node.dont-fallback` makes that an error.
+//! - `vapostproc add-borders=true` keeps the picture's shape, but radeonsi (Mesa 26.2) only
+//!   draws the picture: the bars keep whatever the surface held (new surfaces show green).
+//!   Nothing else writes those surfaces either, and the buffer pool hands the same few out
+//!   again and again, so each surface's bars are painted here once, the first time it comes
+//!   out of vapostproc (`paint_bars`: the surface is mapped and written by the CPU, 1-2 ms
+//!   at 1080p, five surfaces per encoder; keyframes and previews checked over whole shares
+//!   stayed black). A driver that fills the borders itself fills them black, as gst-va asks
+//!   it to: the same colour, which is why the bars are black and not the #111214 of the
+//!   Windows capture (`videoscale` on the gst-launch path only does black as well). Should
+//!   a surface refuse to be painted, its picture goes to nobody, the stream is given up and
+//!   gst-launch takes over.
+//! - Where the picture's edge falls on an odd row or column, it shares a chroma sample with
+//!   the bar next to it. radeonsi writes the picture's chroma from ceil(start / 2) to
+//!   ceil(end / 2) (plane dumps of vapostproc alone): at an odd left or top edge the shared
+//!   sample is never written and keeps the bar's paint, so the picture's first column or
+//!   row has the right brightness and no colour; at an odd right or bottom edge it is
+//!   written with every picture, so the bar's first row or column is black with the
+//!   picture's colour over it (pure red: 153,0,0 where the gst-launch path, whose encoder
+//!   averages the chroma, shows 86,0,0), and the picture's last row is grey only in the
+//!   first picture of each surface. One line of pixels either way; taking the tint away
+//!   would mean mapping and painting every picture.
+//! - The H.264 profile follows the viewers (Main only while all of them decode it), and
+//!   vah264enc cannot change it while it runs. Only the encoder is replaced
+//!   (`vaapi::EncoderSection`): the capture, the queue and vapostproc go on, and the new
+//!   encoder's first picture is an IDR one or two frame slots after the old encoder's last
+//!   picture (starting a whole pipeline again takes 70-520 ms to its first picture, on a
+//!   connection the old one may not have left yet). The new encoder is linked
+//!   in while its input pad is idle (a picture held in that pad's probe at that moment goes
+//!   to the new encoder), and the renegotiation request that linking sends
+//!   upstream is stopped at the queue (see above for what pipewiresrc does with one).
+//!   The encoder is replaced in 1-6 ms and the picture that was in the old one is not sent,
+//!   so viewers wait about one picture's slot longer than between two pictures: measured
+//!   from the last access unit of the old profile to the IDR of the new one, in both
+//!   directions, 19-41 ms at 60 pictures a second (Mutter at 144 Hz, synthetic sources at
+//!   60; some 150 changes), 34-55 ms at 30, up to 83 ms at 15, and 47-125 ms on a still
+//!   screen (the 100 ms repeat and one keepalive).
+//!   The new encoder is made and told the format on a thread of its own, waited for 300 ms
+//!   at most (`prepare_section`): the send loop is not left inside a driver that hangs.
+//!   Its rate control starts anew: on a game at 8 Mbit/s (QP floor 30) the new encoder's
+//!   first keyframe came out at a mean QP of 41 (50-60 KB) where the keyframes that follow
+//!   are at 30-36 (95-150 KB), and the pictures behind it were back at the floor after
+//!   10-12 of them; a keyframe of the running encoder is followed by much the same climb
+//!   back, from 36-39.
+//! - Main is only used once it is proven, by the rules of `VaapiEncoder`: the new encoder is
+//!   told the format before the old one is touched (it opens its VA context for the profile
+//!   then; refused, the stream stays as it is), its first keyframe must say profile_idc 77,
+//!   one late first picture is forgiven, and until that keyframe an error inside it is kept
+//!   from the rest of the pipeline (a flow error would stop the capture's thread). Whatever
+//!   fails, the stream goes back to a Constrained Baseline encoder on the GPU. The one
+//!   exception is the capture's own thread not coming back from the encoder (a driver that
+//!   hangs): no encoder can be fed then, and after `ENCODER_SILENCE` the share goes to
+//!   gst-launch, as it does for an encoder that has proven itself.
 //!
 //! Threads: the portal thread calls `begin`, then `run_until_end` (which watches the
 //! pipeline's health) and takes the capture over with gst-launch when that reports a failure;
 //! the "screen-capture-tx" thread calls `wait_ready` / `next_au` / `set_watched`.
 
-use crate::encoder::vaapi::{self, EncodeChain};
+use crate::encoder::vaapi::{self, EncodeChain, EncoderSection};
+pub use crate::screen_capture::sources::linux_portal::{letterbox, picture_rect};
 use crate::screen_capture::hw_decode::h264_state::nal_ranges;
 use gst::prelude::*;
 use gst_video::prelude::*;
 use gstreamer as gst;
+use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use log::{info, warn};
 use slint::{Rgba8Pixel, SharedPixelBuffer};
@@ -85,6 +146,10 @@ const SOURCE_SILENCE: Duration = Duration::from_millis(400);
 const ENCODER_SILENCE: Duration = Duration::from_millis(400);
 /// An asked-for keyframe that has not come out after this long is asked for again.
 const KEYFRAME_RETRY: Duration = Duration::from_millis(300);
+/// Asked for this many times in a row without coming out, the keyframe is not going to:
+/// pictures no longer reach the encoder (the streaming thread is stuck somewhere the other
+/// checks do not look, such as in vapostproc).
+const KEYFRAME_TRIES: u32 = 3;
 /// The health checks run every 25 ms or less. A longer pause between two of them means this
 /// process itself did not run (stopped, suspended, starved): silence is then counted anew.
 const CHECK_GAP: Duration = Duration::from_millis(150);
@@ -92,6 +157,14 @@ const CHECK_GAP: Duration = Duration::from_millis(150);
 /// a moment later (7 ms with Mutter); a source that only changed its format reports none.
 /// How long "buffers taken away" waits to learn which it was.
 const SOURCE_GONE_WAIT: Duration = Duration::from_millis(100);
+/// Replacing the encoder waits for the picture on its way into the old one: a frame's time
+/// at most. After this long the streaming thread is stuck in it.
+const SWITCH_IDLE_TIMEOUT: Duration = Duration::from_millis(300);
+/// Building the new encoder and telling it the format (it opens its VA context then) takes
+/// 1-5 ms. After this long the driver is not answering and the send loop stops waiting.
+const SWITCH_PREPARE_TIMEOUT: Duration = Duration::from_millis(300);
+/// How long a Main encoder that has not proven itself may take for its first keyframe.
+const MAIN_FIRST_PICTURE: Duration = vaapi::FIRST_FRAME_TIMEOUT;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Memory {
@@ -114,9 +187,6 @@ pub struct Config {
     pub max_fps: Option<u32>,
     /// The encoder's QP floor (the stream quality setting).
     pub min_qp: u32,
-    /// H.264 Main instead of Constrained Baseline, for the whole share: this pipeline
-    /// cannot change its profile while it runs.
-    pub main: bool,
 }
 
 impl Config {
@@ -129,11 +199,10 @@ impl Config {
             _ => Memory::Auto,
         };
         let max_fps = std::env::var("LITECORD_VAAPI_CAPTURE_MAXFPS").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0);
-        // Automatic stays on Constrained Baseline here (see `main`); only the explicit
-        // Efficient setting gives Main on this path.
+        // (The profile is not a setting of the capture: it starts in Constrained Baseline
+        // and follows what the send loop asks for with every `next_picture`.)
         let min_qp = crate::video_settings::get_stream_min_qp();
-        let main = crate::video_settings::get_stream_profile() == crate::video_settings::StreamProfile::Efficient;
-        Self { fd, node, width, height, fps, memory, max_fps, min_qp, main }
+        Self { fd, node, width, height, fps, memory, max_fps, min_qp }
     }
 }
 
@@ -141,6 +210,13 @@ impl Config {
 /// picture through at the start, and from the Nth access unit on `after:N` reports an
 /// error, `stall:N` swallows the encoder's output, `nosrc:N` swallows the capture's and
 /// `hang:N` blocks the streaming thread at the encoder for 20 s (a driver that hangs).
+/// H.264 Main going wrong: `nomain` makes every Main encoder ask for a profile the driver
+/// does not have, `mainrefuse` makes it refuse the pictures' format, `mainprofile` makes it
+/// produce Constrained Baseline, `mainbreak` makes it fail on its first picture, and
+/// `mainlate:N` withholds the first picture of a Main encoder N times (one is forgiven).
+/// `prepstuck:N` blocks the making of a new encoder from the Nth replacement on (a driver
+/// that hangs while a VA context is created), and `nobars` makes the painting of the bars
+/// around the picture fail.
 #[derive(Clone, Copy, PartialEq)]
 enum TestFail {
     None,
@@ -150,6 +226,13 @@ enum TestFail {
     Stall(u64),
     NoSource(u64),
     Hang(u64),
+    NoMain,
+    MainRefuse,
+    MainProfile,
+    MainBreak,
+    MainLate(u64),
+    PrepStuck(u64),
+    NoBars,
 }
 
 fn test_fail() -> TestFail {
@@ -160,6 +243,13 @@ fn test_fail() -> TestFail {
         Some(("stall", s)) => TestFail::Stall(n(s)),
         Some(("nosrc", s)) => TestFail::NoSource(n(s)),
         Some(("hang", s)) => TestFail::Hang(n(s)),
+        Some(("mainlate", s)) => TestFail::MainLate(n(s)),
+        Some(("prepstuck", s)) => TestFail::PrepStuck(n(s)),
+        _ if v == "nobars" => TestFail::NoBars,
+        _ if v == "nomain" => TestFail::NoMain,
+        _ if v == "mainrefuse" => TestFail::MainRefuse,
+        _ if v == "mainprofile" => TestFail::MainProfile,
+        _ if v == "mainbreak" => TestFail::MainBreak,
         _ if v == "start" => TestFail::Start,
         _ if v == "first" => TestFail::First,
         _ => TestFail::None,
@@ -198,6 +288,20 @@ pub struct Stats {
     /// Access units handed to the caller, and thrown away while a keyframe was awaited.
     pub delivered: u64,
     pub dropped_before_keyframe: u64,
+    /// The encoder now in the pipeline produces H.264 Main; Main was found not to work on
+    /// this stream (it stays on Constrained Baseline); times the encoder was replaced, and
+    /// how long the last replacement kept the caller, in microseconds.
+    pub main: bool,
+    pub main_unavailable: bool,
+    pub profile_switches: u64,
+    pub last_switch_us: u64,
+    /// Where the picture lies in the stream's frame (x, y, width, height); surfaces whose
+    /// bars were painted, the microseconds that took in all, and surfaces that could not be
+    /// painted.
+    pub picture_rect: (u32, u32, u32, u32),
+    pub bars_painted: u64,
+    pub bars_us: u64,
+    pub bars_failed: u64,
 }
 
 /// One access unit with what is known about its picture.
@@ -223,8 +327,13 @@ struct Shared {
     /// Nothing more is taken from the source: it took its buffers back (see the module's
     /// notes), or the test hook says so.
     source_shut: AtomicBool,
-    /// Test hook: the streaming thread blocks at the encoder.
+    /// Test hooks: the streaming thread blocks at the encoder; the bars cannot be painted.
     hang: AtomicBool,
+    no_bars: bool,
+    /// Milliseconds after `started` (never 0) at which the streaming thread began handing a
+    /// picture to the encoder, while it has not come back from that; 0 otherwise. A thread
+    /// that stays there is stuck (a driver that hangs), whatever the encoder still owes.
+    at_encoder_ms: AtomicU64,
     /// Times the source took its buffers back before it had delivered any.
     early_renegotiations: AtomicU64,
     buffers: AtomicU64,
@@ -239,8 +348,27 @@ struct Shared {
     stamped_pictures: AtomicU64,
     source_delay_us: AtomicU64,
     source_delay_max_us: AtomicU64,
+    /// The size of the pictures pipewiresrc delivers (width << 32 | height; 0 before the
+    /// first format), and the stream's frame.
+    source_size: AtomicU64,
+    frame: (u32, u32),
+    bars_painted: AtomicU64,
+    bars_us: AtomicU64,
+    bars_failed: AtomicU64,
     /// Set when the stream is being dropped (the preview thread ends).
     closing: AtomicBool,
+    /// A new encoder is being linked in: the renegotiation request this sends upstream is
+    /// stopped before it reaches pipewiresrc.
+    drop_reconfigure: AtomicBool,
+    /// The encoder is a Main one that has not put out its keyframe yet: pictures are handed
+    /// to it in a way that keeps its errors from the capture (`add_encoder_probe`), and
+    /// `main_broke` says it failed. Both hold that encoder's number (`Tx::switches` when it
+    /// was put in; 0 for none): what a replaced encoder still reports counts for nothing.
+    guard_main: AtomicU64,
+    main_broke: AtomicU64,
+    /// That encoder's elements, set with `guard_main` at the moment it is linked in: an error
+    /// message of theirs is the encoder's own.
+    guarded: Mutex<Vec<gst::Object>>,
     /// What the gate decided for the pictures now inside vapostproc.
     decisions: Mutex<VecDeque<Decision>>,
     /// Pictures in the encoder: timestamp, whether a repeat, when it went in.
@@ -259,6 +387,13 @@ impl Shared {
     fn now_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
     }
+
+    /// Where the picture lies in the stream's frame: all of it until the source's size is
+    /// known, and whenever the two have the same shape.
+    fn picture_rect(&self) -> (u32, u32, u32, u32) {
+        let source = self.source_size.load(Ordering::Relaxed);
+        picture_rect(((source >> 32) as u32, source as u32), self.frame)
+    }
 }
 
 /// The send thread's side: bitrate, keyframes, output.
@@ -266,19 +401,54 @@ struct Tx {
     requested_bps: u32,
     asked_at: Instant,
     applied_bps: u32,
-    /// A keyframe was asked of the encoder and has not come out yet.
+    /// A keyframe was asked of the encoder and has not come out yet; and how many times it
+    /// has been asked for.
     keyframe_asked_at: Option<Instant>,
+    keyframe_tries: u32,
     /// Output is thrown away until a keyframe (a viewer just arrived).
     await_keyframe: bool,
     ready: VecDeque<gst::Sample>,
     delivered: u64,
     dropped_before_keyframe: u64,
+    /// The encoder in the pipeline is a Main one (the same as `Stream::section`'s).
+    main: bool,
+    /// The encoder was replaced and its first keyframe has not been checked yet.
+    first_keyframe_due: bool,
+    /// The encoder was replaced and nothing has been taken from the new one yet: whatever
+    /// it puts out first is an IDR with SPS and PPS, without being asked.
+    fresh: bool,
+    /// The rules of `VaapiEncoder` for Main: not available on this stream; a Main encoder
+    /// of this stream has put out its keyframe; the one late first picture that is forgiven
+    /// has happened.
+    main_failed: bool,
+    main_proven: bool,
+    main_was_late: bool,
+    /// Since when an unproven Main encoder has been asked for its first keyframe.
+    main_wait: Option<Instant>,
+    /// Test hook `mainlate`: first pictures of a Main encoder still to be withheld.
+    mute_main: u64,
+    switches: u64,
+    last_switch_us: u64,
+}
+
+/// Why the encoder could not be replaced.
+enum SwitchError {
+    /// The new encoder was not put in: the old one goes on as if nothing had been tried.
+    Refused(String),
+    /// The pipeline is of no use any more.
+    Broken(String),
 }
 
 struct Stream {
     id: u64,
-    /// `None` only while being dropped.
+    /// `None` only while being dropped. Its `encoder` and `sink` are the ones the pipeline
+    /// started with: the ones in use are `section`'s.
     chain: Option<EncodeChain>,
+    /// The encoder now in the pipeline, with its appsink. Locked for a moment at a time
+    /// (after `tx`, where both are held).
+    section: Mutex<EncoderSection>,
+    element: &'static str,
+    min_qp: u32,
     /// The duplicate of the PipeWire fd pipewiresrc was pointed at.
     fd: Option<OwnedFd>,
     shared: Arc<Shared>,
@@ -291,7 +461,6 @@ struct Stream {
     gone: AtomicBool,
     /// The first picture came out: the pipeline's start is over.
     start_over: bool,
-    main: bool,
     test_fail: TestFail,
     source_caps: String,
     converter_caps: String,
@@ -384,6 +553,11 @@ impl Stream {
         self.chain.as_ref().expect("stream chain")
     }
 
+    /// The appsink of the encoder now in the pipeline.
+    fn sink(&self) -> gst_app::AppSink {
+        lock(&self.section).sink.clone()
+    }
+
     fn start(cfg: &Config, test_fail: TestFail, wanted: &dyn Fn() -> bool) -> Result<Self, String> {
         gst::init().map_err(|e| format!("GStreamer: {e}"))?;
         for element in ["pipewiresrc", "vapostproc", "capssetter"] {
@@ -421,7 +595,7 @@ impl Stream {
              ! queue name=cap_queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream \
              ! {chain}",
             node = cfg.node,
-            chain = EncodeChain::description_scaled(element, width, height, vaapi::INITIAL_BITRATE_BPS, cfg.min_qp, cfg.main),
+            chain = EncodeChain::description_scaled(element, width, height, vaapi::INITIAL_BITRATE_BPS, cfg.min_qp, false),
         );
         let pipeline = gst::parse::launch(&description)
             .map_err(|e| e.to_string())?
@@ -442,6 +616,8 @@ impl Stream {
             last_check_ms: AtomicU64::new(0),
             source_shut: AtomicBool::new(false),
             hang: AtomicBool::new(false),
+            no_bars: test_fail == TestFail::NoBars,
+            at_encoder_ms: AtomicU64::new(0),
             early_renegotiations: AtomicU64::new(0),
             buffers: AtomicU64::new(0),
             pictures: AtomicU64::new(0),
@@ -454,14 +630,24 @@ impl Stream {
             stamped_pictures: AtomicU64::new(0),
             source_delay_us: AtomicU64::new(0),
             source_delay_max_us: AtomicU64::new(0),
+            source_size: AtomicU64::new(0),
+            frame: (width, height),
+            bars_painted: AtomicU64::new(0),
+            bars_us: AtomicU64::new(0),
+            bars_failed: AtomicU64::new(0),
             closing: AtomicBool::new(false),
+            drop_reconfigure: AtomicBool::new(false),
+            guard_main: AtomicU64::new(0),
+            main_broke: AtomicU64::new(0),
+            guarded: Mutex::new(Vec::new()),
             decisions: Mutex::new(VecDeque::new()),
             in_flight: Mutex::new(VecDeque::new()),
         });
         add_arrival_probe(&by_name("cap_set")?, &shared)?;
-        add_gate(&by_name("cap_queue")?, &shared, fps)?;
+        add_gate(&by_name("cap_queue")?, &shared, fps, by_name(vaapi::POSTPROC)?)?;
         let (preview_tx, preview_rx) = sync_channel(1);
-        add_encoder_probe(&chain.encoder, &shared, preview_tx)?;
+        add_encoder_probe(&by_name(vaapi::ENCODER_INPUT)?, &shared, preview_tx)?;
+        let section = Mutex::new(EncoderSection::of_chain(&chain, false));
         let preview_shared = shared.clone();
         std::thread::Builder::new().name("vaapi-capture-preview".into()).spawn(move || preview_thread(preview_rx, preview_shared)).map_err(|e| e.to_string())?;
 
@@ -469,6 +655,9 @@ impl Stream {
         let stream = Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             chain: Some(chain),
+            section,
+            element,
+            min_qp: cfg.min_qp,
             fd,
             shared,
             tx: Mutex::new(Tx {
@@ -476,16 +665,26 @@ impl Stream {
                 asked_at: Instant::now(),
                 applied_bps: vaapi::INITIAL_BITRATE_BPS,
                 keyframe_asked_at: None,
+                keyframe_tries: 0,
                 await_keyframe: false,
                 ready: VecDeque::new(),
                 delivered: 0,
                 dropped_before_keyframe: 0,
+                main: false,
+                first_keyframe_due: false,
+                fresh: false,
+                main_failed: false,
+                main_proven: false,
+                main_was_late: false,
+                main_wait: None,
+                mute_main: if let TestFail::MainLate(n) = test_fail { n } else { 0 },
+                switches: 0,
+                last_switch_us: 0,
             }),
             failure: Mutex::new(None),
             buffers_removed: AtomicBool::new(false),
             gone: AtomicBool::new(false),
             start_over: false,
-            main: cfg.main,
             test_fail,
             source_caps: String::new(),
             converter_caps: String::new(),
@@ -508,12 +707,17 @@ impl Stream {
     fn first_picture(mut self, filter: gst::Element, playing: Receiver<bool>, wanted: &dyn Fn() -> bool) -> Result<Self, String> {
         let deadline = Instant::now() + FIRST_PICTURE_TIMEOUT;
         let mut is_playing = false;
+        let sink = self.sink();
         let sample = loop {
-            if let Some(sample) = self.chain().sink.try_pull_sample(gst::ClockTime::from_mseconds(20)) {
+            if let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(20)) {
                 break sample;
             }
             if let Some(e) = self.bus_error() {
                 return Err(e);
+            }
+            if self.shared.bars_failed.load(Ordering::Relaxed) > 0 {
+                // (Such a picture is not let into the encoder: none would ever come.)
+                return Err("as barras em volta da imagem não puderam ser pintadas".into());
             }
             if !is_playing {
                 match playing.try_recv() {
@@ -523,7 +727,7 @@ impl Stream {
                 }
             }
             // (A sink that has not started yet says it is at the end too.)
-            if is_playing && self.chain().sink.is_eos() {
+            if is_playing && sink.is_eos() {
                 return Err("fim do fluxo".into());
             }
             if !wanted() {
@@ -536,7 +740,7 @@ impl Stream {
         };
         let buffer = sample.buffer().ok_or("amostra sem buffer")?;
         let map = buffer.map_readable().map_err(|e| e.to_string())?;
-        vaapi::check_keyframe(map.as_slice(), self.main)?;
+        vaapi::check_keyframe(map.as_slice(), false)?;
         lock(&self.shared.in_flight).clear();
 
         let caps = filter.static_pad("src").and_then(|p| p.current_caps()).ok_or("sem caps negociadas")?;
@@ -551,6 +755,13 @@ impl Stream {
         Ok(self)
     }
 
+    /// The next access unit of the encoder now in the pipeline, waiting up to `wait` for it.
+    fn pull(tx: &mut Tx, sink: &gst_app::AppSink, wait: Duration) -> Option<gst::Sample> {
+        let sample = sink.try_pull_sample(gst::ClockTime::from_nseconds(wait.as_nanos() as u64))?;
+        tx.fresh = false;
+        Some(sample)
+    }
+
     /// Opens or closes the way into the encoder. Opening it asks for a keyframe and throws
     /// away whatever the encoder still had from before.
     fn watch(&self, tx: &mut Tx, watched: bool) {
@@ -558,11 +769,15 @@ impl Stream {
             return;
         }
         if watched {
-            while self.chain().sink.try_pull_sample(gst::ClockTime::ZERO).is_some() {}
+            let sink = self.sink();
+            while Self::pull(tx, &sink, Duration::ZERO).is_some() {}
             tx.ready.clear();
             lock(&self.shared.in_flight).clear();
             tx.await_keyframe = true;
-            self.ask_keyframe(tx);
+            // A Main encoder still to prove itself is given its time from now.
+            tx.main_wait = tx.main_wait.map(|_| Instant::now());
+            tx.keyframe_tries = 0;
+            self.want_keyframe(tx, false);
         } else {
             self.shared.pass_next.store(false, Ordering::Relaxed);
         }
@@ -572,33 +787,217 @@ impl Stream {
     /// The next picture into the encoder becomes an IDR with SPS and PPS, and goes in at
     /// once (on a still screen: the next keepalive buffer, within 25 ms).
     fn ask_keyframe(&self, tx: &mut Tx) {
-        if self.chain().request_next_keyframe() {
+        if vaapi::request_next_keyframe(&self.sink()) {
             tx.keyframe_asked_at = Some(Instant::now());
         }
         self.shared.pass_next.store(true, Ordering::Relaxed);
     }
 
+    /// `ask_keyframe`, except of an encoder that has put out nothing yet: its first picture is
+    /// an IDR with SPS and PPS as it is, and asked for one after that picture went in, it
+    /// would make the one behind it an IDR too (seen once in four changes to Main: 40-60 KB
+    /// sent twice). `again`: the keyframe is overdue, and asked for whatever the encoder is.
+    fn want_keyframe(&self, tx: &mut Tx, again: bool) {
+        if tx.fresh && !again {
+            tx.keyframe_asked_at.get_or_insert_with(Instant::now);
+            self.shared.pass_next.store(true, Ordering::Relaxed);
+        } else {
+            self.ask_keyframe(tx);
+        }
+    }
+
     /// The bitrate and keyframe wishes for the pictures from now on.
-    fn control(&self, tx: &mut Tx, bitrate_bps: u32, want_idr: bool) {
+    fn control(&self, tx: &mut Tx, bitrate_bps: u32, want_idr: bool) -> Result<(), String> {
         if bitrate_bps != tx.requested_bps {
             tx.requested_bps = bitrate_bps;
             tx.asked_at = Instant::now();
         }
         let retry = tx.keyframe_asked_at.is_some_and(|t| t.elapsed() >= KEYFRAME_RETRY);
         if retry {
+            tx.keyframe_tries += 1;
+            if tx.keyframe_tries >= KEYFRAME_TRIES {
+                return Err(format!("keyframe pedido {} vezes e nenhum saiu em {} ms", KEYFRAME_TRIES, KEYFRAME_TRIES * KEYFRAME_RETRY.as_millis() as u32));
+            }
             warn!("⚠️ [VAAPI] Keyframe pedido à captura na GPU não saiu em {} ms; pedindo de novo", KEYFRAME_RETRY.as_millis());
         }
         let want_idr = want_idr || retry;
         // vah264enc starts a new sequence whenever its bitrate changes: the new rate rides
         // on a keyframe that was going to be made anyway (same rule as VaapiEncoder).
         if tx.applied_bps != tx.requested_bps && (want_idr || tx.asked_at.elapsed() >= vaapi::BITRATE_MAX_WAIT) {
-            self.chain().set_bitrate(tx.requested_bps);
+            vaapi::set_encoder_bitrate(&lock(&self.section).encoder, tx.requested_bps);
             tx.applied_bps = tx.requested_bps;
             tx.keyframe_asked_at = Some(Instant::now());
             self.shared.pass_next.store(true, Ordering::Relaxed);
         } else if want_idr {
-            self.ask_keyframe(tx);
+            self.want_keyframe(tx, retry);
         }
+        Ok(())
+    }
+
+    /// Main turned out not to work on this stream: it stays on Constrained Baseline.
+    fn main_unavailable(&self, tx: &mut Tx, why: &str) {
+        if !std::mem::replace(&mut tx.main_failed, true) {
+            warn!("⚠️ [VAAPI] Perfil Main indisponível na captura na GPU ({}); a transmissão segue em Constrained Baseline", why);
+        }
+    }
+
+    /// Makes the encoder's profile the one this turn's viewers decode (`main`), by the rules
+    /// of `VaapiEncoder`: to Constrained Baseline at once, since a viewer that cannot decode
+    /// Main is watching (the Main pictures still on their way are thrown away with their
+    /// encoder); to Main only with a keyframe that was asked for anyway. An error means the
+    /// stream is to be given up.
+    fn follow_profile(&self, tx: &mut Tx, main: bool, want_idr: bool) -> Result<(), String> {
+        let opening = !self.shared.watched.load(Ordering::Relaxed);
+        if tx.main && !tx.main_proven && !opening {
+            // A Main encoder that has not shown its keyframe yet.
+            if self.shared.main_broke.load(Ordering::SeqCst) == tx.switches {
+                self.main_unavailable(tx, "o codificador falhou no primeiro quadro");
+            } else if tx.main_wait.is_some_and(|since| since.elapsed() >= MAIN_FIRST_PICTURE) && self.shared.at_encoder_ms.load(Ordering::Relaxed) == 0 {
+                // (While the streaming thread has not come back from the encoder there is
+                // nobody to try again with: `health` gives the stream up when that lasts.)
+                if std::mem::replace(&mut tx.main_was_late, true) {
+                    self.main_unavailable(tx, &format!("sem primeiro quadro em {} ms, pela segunda vez", MAIN_FIRST_PICTURE.as_millis()));
+                } else {
+                    // Forgiven once: a busy GPU does that to any new encoder.
+                    warn!("⚠️ [VAAPI] Primeiro quadro Main da captura na GPU não saiu em {} ms; mais uma tentativa", MAIN_FIRST_PICTURE.as_millis());
+                    tx.mute_main = tx.mute_main.saturating_sub(1);
+                    tx.main_wait = Some(Instant::now());
+                    tx.keyframe_tries = 0;
+                    lock(&self.shared.in_flight).clear();
+                    self.ask_keyframe(tx);
+                }
+            }
+        }
+        let want_main = main && !tx.main_failed;
+        if want_main == tx.main || (want_main && !want_idr && !opening) {
+            return Ok(());
+        }
+        match self.switch_profile(tx, want_main) {
+            Ok(()) => Ok(()),
+            Err(SwitchError::Refused(why)) if want_main => {
+                self.main_unavailable(tx, &why);
+                Ok(())
+            }
+            Err(SwitchError::Refused(why)) | Err(SwitchError::Broken(why)) => Err(format!("a troca do codificador para {} falhou: {why}", vaapi::profile_name(want_main))),
+        }
+    }
+
+    /// Replaces the encoder (with its profile filter and appsink) by one for the other
+    /// profile, while everything in front of it keeps running. Its first picture is an IDR
+    /// with SPS and PPS; whatever the old encoder still held is gone with it.
+    fn switch_profile(&self, tx: &mut Tx, main: bool) -> Result<(), SwitchError> {
+        use SwitchError::{Broken, Refused};
+        let started = Instant::now();
+        let pipeline = &self.chain().pipeline;
+        let input = pipeline.by_name(vaapi::ENCODER_INPUT).and_then(|e| e.static_pad("src")).ok_or_else(|| Refused("sem a entrada do codificador".into()))?;
+        let mut description = EncodeChain::encoder_description(self.element, tx.requested_bps, self.min_qp, main && self.test_fail != TestFail::MainProfile);
+        if main && self.test_fail == TestFail::NoMain {
+            description = description.replace("profile=main", "profile=high-4:4:4");
+        } else if main && self.test_fail == TestFail::MainRefuse {
+            description = format!("capsfilter caps=\"video/x-raw(memory:VAMemory),width=640,height=368\" ! {description}");
+        } else if main && self.test_fail == TestFail::MainBreak {
+            description = format!("identity error-after=1 ! {description}");
+        }
+        // Told the format, the encoder picks its profile and opens its VA context: one that
+        // cannot do it says so here, while the old one still encodes. (The same events come
+        // again once it is linked, and change nothing then.)
+        let start = input.sticky_event::<gst::event::StreamStart>(0).map(gst::Event::from);
+        let Some(caps) = input.sticky_event::<gst::event::Caps>(0).map(gst::Event::from) else { return Err(Refused("sem formato na entrada do codificador".into())) };
+        let stuck = matches!(self.test_fail, TestFail::PrepStuck(n) if tx.switches >= n);
+        let new = prepare_section(pipeline, description, main, start.into_iter().chain([caps]).collect(), stuck).map_err(Refused)?;
+        let Some(new_input) = new.input() else {
+            new.remove(pipeline, vaapi::TEARDOWN_WAIT);
+            return Err(Refused("codificador sem entrada".into()));
+        };
+
+        // The pad is idle between two pictures: the callback runs at once on this thread, or
+        // on the streaming thread when the picture now going through is done.
+        let (old_input, old_sink) = {
+            let old = lock(&self.section);
+            (old.input(), old.sink.clone())
+        };
+        // This encoder's number, when it is a Main one still to prove itself.
+        let guard = if main && !tx.main_proven { tx.switches + 1 } else { 0 };
+        let guarded = if guard != 0 { new.objects() } else { Vec::new() };
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = sync_channel::<Result<(), String>>(1);
+        let (shared, gave_up) = (self.shared.clone(), abandoned.clone());
+        input.add_probe(gst::PadProbeType::IDLE, move |pad, _| {
+            if gave_up.load(Ordering::SeqCst) {
+                return gst::PadProbeReturn::Remove;
+            }
+            if let Some(old) = &old_input {
+                let _ = pad.unlink(old);
+            }
+            // Linking asks everything upstream to negotiate again.
+            shared.drop_reconfigure.store(true, Ordering::SeqCst);
+            let result = match pad.link(&new_input) {
+                Ok(_) => {
+                    // Before the first picture can go in (pictures wait for this callback).
+                    *lock(&shared.guarded) = guarded.clone();
+                    shared.guard_main.store(guard, Ordering::SeqCst);
+                    Ok(())
+                }
+                Err(e) => match old_input.as_ref().map(|old| pad.link(old)) {
+                    // The old encoder is back in its place.
+                    Some(Ok(_)) => Err(format!("{e:?}")),
+                    _ => Err(String::new()),
+                },
+            };
+            shared.drop_reconfigure.store(false, Ordering::SeqCst);
+            let _ = done_tx.send(result);
+            gst::PadProbeReturn::Remove
+        });
+        let deadline = Instant::now() + SWITCH_IDLE_TIMEOUT;
+        let linked = loop {
+            match done_rx.recv_timeout(Duration::from_millis(2)) {
+                Ok(result) => break result,
+                Err(_) if Instant::now() >= deadline => {
+                    // The whole pipeline is given up by the caller, the new encoder with it.
+                    abandoned.store(true, Ordering::SeqCst);
+                    return Err(Broken(format!("o codificador não liberou a entrada em {} ms", SWITCH_IDLE_TIMEOUT.as_millis())));
+                }
+                // The streaming thread may be waiting for room in the old appsink.
+                Err(_) => while old_sink.try_pull_sample(gst::ClockTime::ZERO).is_some() {},
+            }
+        };
+        match linked {
+            Ok(()) => {}
+            Err(why) if why.is_empty() => return Err(Broken("o codificador novo não pôde ser ligado, nem o anterior de volta".into())),
+            Err(why) => {
+                new.remove(pipeline, vaapi::TEARDOWN_WAIT);
+                return Err(Refused(format!("o codificador novo não pôde ser ligado: {why}")));
+            }
+        }
+        let old = std::mem::replace(&mut *lock(&self.section), new);
+        old.remove(pipeline, vaapi::TEARDOWN_WAIT);
+
+        // The pictures that went into the old encoder stay on the list of those awaited:
+        // the new encoder's first one clears them, and one that the streaming thread is
+        // stuck with still tells the health check so. (Not those of a Main encoder given
+        // up before its first keyframe: it had its own deadline.)
+        let unproven = tx.main && !tx.main_proven;
+        if unproven {
+            lock(&self.shared.in_flight).clear();
+        }
+        tx.main = main;
+        tx.ready.clear();
+        tx.applied_bps = tx.requested_bps;
+        tx.first_keyframe_due = true;
+        tx.fresh = true;
+        tx.await_keyframe = true;
+        tx.keyframe_asked_at = Some(Instant::now());
+        // The viewers of a Main encoder given up for being late have been without pictures
+        // for twice `MAIN_FIRST_PICTURE` already: the encoder that follows it gets one
+        // `KEYFRAME_RETRY` for its keyframe, not all of them, before gst-launch takes over.
+        tx.keyframe_tries = if unproven && tx.main_failed && tx.main_was_late { KEYFRAME_TRIES - 1 } else { 0 };
+        tx.main_wait = (guard != 0).then(Instant::now);
+        tx.switches += 1;
+        tx.last_switch_us = started.elapsed().as_micros() as u64;
+        // The new encoder's first picture, at once.
+        self.shared.pass_next.store(true, Ordering::Relaxed);
+        info!("🔀 [VAAPI] Perfil H.264 da captura na GPU muda para {} (codificador trocado em {:.1} ms)", vaapi::profile_name(main), started.elapsed().as_secs_f64() * 1000.0);
+        Ok(())
     }
 
     /// The sample as the access unit that goes on the wire.
@@ -636,8 +1035,27 @@ impl Stream {
             }
             return Ok(Some(Picture { data: au, idr, repeat, latency }));
         }
+        if tx.first_keyframe_due {
+            // The first keyframe of a new encoder: what the viewers were promised?
+            if let Err(e) = vaapi::check_keyframe(&au, tx.main) {
+                if tx.main && !tx.main_proven {
+                    // Thrown away, and so is whatever follows it: the next turn replaces
+                    // this encoder.
+                    self.main_unavailable(tx, &e);
+                    return Ok(None);
+                }
+                return Err(e);
+            }
+            tx.first_keyframe_due = false;
+            if tx.main && !tx.main_proven {
+                tx.main_proven = true;
+                self.shared.guard_main.store(0, Ordering::SeqCst);
+            }
+            tx.main_wait = None;
+        }
         tx.await_keyframe = false;
         tx.keyframe_asked_at = None;
+        tx.keyframe_tries = 0;
         Ok(Some(Picture { data: crate::encoder::h264_vui::declare_colour(&au, 1, 1, 6), idr, repeat, latency }))
     }
 
@@ -647,6 +1065,21 @@ impl Stream {
         let mut first = None;
         while let Some(msg) = self.chain().bus.pop_filtered(&[gst::MessageType::Error]) {
             let gst::MessageView::Error(e) = msg.view() else { continue };
+            if let Some(src) = msg.src() {
+                // An encoder that was replaced since has nothing to say about the stream.
+                let pipeline = self.chain().pipeline.upcast_ref::<gst::Object>();
+                if src != pipeline && !src.has_as_ancestor(pipeline) {
+                    continue;
+                }
+                // A Main encoder that fails before its first keyframe is replaced by a
+                // Constrained Baseline one (`follow_profile`).
+                let guarded = self.shared.guard_main.load(Ordering::SeqCst);
+                if guarded != 0 && lock(&self.shared.guarded).iter().any(|part| src == part || src.has_as_ancestor(part)) {
+                    warn!("⚠️ [VAAPI] Erro do codificador Main antes do primeiro keyframe: {}", e.error());
+                    self.shared.main_broke.store(guarded, Ordering::SeqCst);
+                    continue;
+                }
+            }
             if msg.src().is_some_and(|s| s.name() == "cap_src") {
                 if e.error().matches(gst::ResourceError::Failed) {
                     // "stream error: ...": PipeWire failed the stream (its node is gone).
@@ -666,14 +1099,20 @@ impl Stream {
     }
 
     /// What can be told without pulling: errors on the bus, the end of the stream, a
-    /// capture that stopped delivering and, for the send loop, an encoder that stopped
+    /// capture that stopped delivering and, for the send loop (`sending`: it has just found
+    /// nothing to take, so the encoder is not waiting for it), a streaming thread that does
+    /// not come back from the encoder and, with `encoder_too`, an encoder that stopped
     /// answering.
-    fn health(&self, encoder_too: bool) -> Result<(), String> {
+    fn health(&self, sending: bool, encoder_too: bool) -> Result<(), String> {
         if let Some(e) = self.bus_error() {
             return Err(e);
         }
-        if self.chain().sink.is_eos() {
+        if self.sink().is_eos() {
             return Err("fim do fluxo".into());
+        }
+        if self.shared.bars_failed.load(Ordering::Relaxed) > 0 {
+            // Pictures with whatever the surfaces held around them: not to be shown.
+            return Err("as barras em volta da imagem não puderam ser pintadas".into());
         }
         let now = self.shared.now_ms();
         if now.saturating_sub(self.shared.last_check_ms.swap(now, Ordering::Relaxed)) > CHECK_GAP.as_millis() as u64 {
@@ -681,9 +1120,19 @@ impl Stream {
             // pipeline's threads. They get the full time to deliver again.
             self.shared.last_buffer_ms.fetch_max(now, Ordering::Relaxed);
             lock(&self.shared.in_flight).iter_mut().for_each(|picture| picture.2 = Instant::now());
+            let entered = self.shared.at_encoder_ms.load(Ordering::Relaxed);
+            if entered != 0 {
+                // (Not if the thread came back in the meantime.)
+                let _ = self.shared.at_encoder_ms.compare_exchange(entered, now.max(1), Ordering::Relaxed, Ordering::Relaxed);
+            }
             return Ok(());
         }
-        if encoder_too {
+        // The streaming thread went to hand a picture to the encoder and has not come back.
+        let entered = self.shared.at_encoder_ms.load(Ordering::Relaxed);
+        if sending && entered != 0 && now.saturating_sub(entered) >= ENCODER_SILENCE.as_millis() as u64 {
+            return Err(format!("a captura está parada no codificador há {} ms", now.saturating_sub(entered)));
+        }
+        if sending && encoder_too {
             // A picture that went in long ago and never came out: the encoder (or the
             // driver under it) stopped answering.
             let waiting = lock(&self.shared.in_flight).front().map(|(_, _, since)| since.elapsed());
@@ -719,8 +1168,67 @@ impl Stream {
             source_delay_max_us: load(&self.shared.source_delay_max_us),
             delivered: tx.delivered,
             dropped_before_keyframe: tx.dropped_before_keyframe,
+            main: tx.main,
+            main_unavailable: tx.main_failed,
+            profile_switches: tx.switches,
+            last_switch_us: tx.last_switch_us,
+            picture_rect: self.shared.picture_rect(),
+            bars_painted: load(&self.shared.bars_painted),
+            bars_us: load(&self.shared.bars_us),
+            bars_failed: load(&self.shared.bars_failed),
         }
     }
+}
+
+/// A new encoder for `pipeline`, running in it, linked to nothing and told its format
+/// (`events`: the stream's start and its caps, with which it opens its VA context). All of
+/// that is the driver's work, so it is done on a thread of its own and waited for no longer
+/// than `SWITCH_PREPARE_TIMEOUT`: a driver that hangs there must not hold the send loop,
+/// which is also the one that sends the gst-launch capture's pictures. An encoder that
+/// comes too late takes itself out of the pipeline again.
+fn prepare_section(pipeline: &gst::Pipeline, description: String, main: bool, events: Vec<gst::Event>, test_stuck: bool) -> Result<EncoderSection, String> {
+    let given_up = Arc::new(Mutex::new(false));
+    let (done_tx, done_rx) = sync_channel::<Result<EncoderSection, String>>(1);
+    let (target, too_late) = (pipeline.clone(), given_up.clone());
+    let make = move || {
+        if test_stuck {
+            std::thread::sleep(Duration::from_secs(5));
+        }
+        let made = EncoderSection::build(&description, main).and_then(|new| {
+            let refused = match new.input() {
+                None => Some("codificador sem entrada".to_string()),
+                Some(input) => match new.add_to(&target) {
+                    Err(e) => Some(e),
+                    Ok(()) if events.into_iter().all(|event| input.send_event(event)) => None,
+                    Ok(()) => Some("o codificador recusou o formato".to_string()),
+                },
+            };
+            match refused {
+                Some(why) => {
+                    new.remove(&target, vaapi::TEARDOWN_WAIT);
+                    Err(why)
+                }
+                None => Ok(new),
+            }
+        });
+        // (Held while the result is handed over: the caller gives up under the same lock.)
+        let too_late = lock(&too_late);
+        match made {
+            Ok(new) if *too_late => new.remove(&target, vaapi::TEARDOWN_WAIT),
+            made => {
+                let _ = done_tx.send(made);
+            }
+        }
+    };
+    std::thread::Builder::new().name("vaapi-capture-switch".into()).spawn(make).map_err(|e| e.to_string())?;
+    if let Ok(made) = done_rx.recv_timeout(SWITCH_PREPARE_TIMEOUT) {
+        return made;
+    }
+    let mut given_up = lock(&given_up);
+    done_rx.try_recv().unwrap_or_else(|_| {
+        *given_up = true;
+        Err(format!("o codificador novo não ficou pronto em {} ms", SWITCH_PREPARE_TIMEOUT.as_millis()))
+    })
 }
 
 impl Drop for Stream {
@@ -831,7 +1339,7 @@ fn add_arrival_probe(after: &gst::Element, shared: &Arc<Shared>) -> Result<(), S
 /// picture again every 100 ms while the screen is still, and at once when a keyframe waits
 /// for a picture to ride on. To the preview: one picture every 150 ms, and only one a
 /// second while nothing changes.
-fn add_gate(queue: &gst::Element, shared: &Arc<Shared>, fps: u32) -> Result<(), String> {
+fn add_gate(queue: &gst::Element, shared: &Arc<Shared>, fps: u32, postproc: gst::Element) -> Result<(), String> {
     struct Gate {
         last_picture: u64,
         last_pass: Instant,
@@ -844,6 +1352,41 @@ fn add_gate(queue: &gst::Element, shared: &Arc<Shared>, fps: u32) -> Result<(), 
     let start = Instant::now();
     let gate = Mutex::new(Gate { last_picture: 0, last_pass: start, due: start, preview_picture: 0, last_preview: start.checked_sub(PREVIEW_STILL_EVERY).unwrap_or(start) });
     let pad = queue.static_pad("src").ok_or("pad src ausente")?;
+    // While a new encoder is linked in, its request to negotiate again ends here: passed
+    // on, pipewiresrc would reconnect its stream (see the module's notes). vapostproc has
+    // seen it by then and settles the format and the buffers with the new encoder itself.
+    let switching = shared.clone();
+    pad.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, info| {
+        let reconfigure = matches!(&info.data, Some(gst::PadProbeData::Event(event)) if event.type_() == gst::EventType::Reconfigure);
+        if reconfigure && switching.drop_reconfigure.load(Ordering::SeqCst) {
+            return gst::PadProbeReturn::Drop;
+        }
+        gst::PadProbeReturn::Ok
+    })
+    .ok_or("probe não instalado")?;
+    // The size of the pictures to come, for the bars around them, and vapostproc told
+    // whether to keep the picture's shape (bars) or to fill the frame (`picture_rect`). The
+    // format is taken here, on the thread that carries the pictures through vapostproc to
+    // the encoder's door and right before vapostproc gets it: every picture of the format
+    // before has had its bars by then, painted around its own rectangle.
+    let on_caps = shared.clone();
+    pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        if let Some(gst::PadProbeData::Event(event)) = &info.data {
+            if let gst::EventView::Caps(caps) = event.view() {
+                let size = caps.caps().structure(0).map(|s| (s.get::<i32>("width").unwrap_or(0).max(0) as u64, s.get::<i32>("height").unwrap_or(0).max(0) as u64));
+                let (w, h) = size.unwrap_or((0, 0));
+                on_caps.source_size.store(w << 32 | h, Ordering::Relaxed);
+                let rect = on_caps.picture_rect();
+                // (set_property panics on a property that is not there; the pipeline's
+                // description named it, so it is.)
+                if postproc.find_property("add-borders").is_some() {
+                    postproc.set_property("add-borders", (rect.2, rect.3) != on_caps.frame);
+                }
+            }
+        }
+        gst::PadProbeReturn::Ok
+    })
+    .ok_or("probe não instalado")?;
     pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
         let Some(buffer) = info.buffer() else { return gst::PadProbeReturn::Ok };
         let Some(pts) = buffer.pts() else { return gst::PadProbeReturn::Drop };
@@ -899,13 +1442,25 @@ fn add_gate(queue: &gst::Element, shared: &Arc<Shared>, fps: u32) -> Result<(), 
     Ok(())
 }
 
-/// At the encoder's door, behind vapostproc: pictures meant for the preview are handed to
-/// its thread (as NV12 at the stream's size, still on the GPU), and only the ones the gate
-/// chose for encoding go in.
-fn add_encoder_probe(encoder: &gst::Element, shared: &Arc<Shared>, preview: SyncSender<(gst::Buffer, gst::Caps)>) -> Result<(), String> {
+/// At the encoder's door, behind vapostproc (on the pad that stays when the encoder is
+/// replaced): pictures meant for the preview are handed to its thread (as NV12 at the
+/// stream's size, still on the GPU), and only the ones the gate chose for encoding go in.
+fn add_encoder_probe(encoder_input: &gst::Element, shared: &Arc<Shared>, preview: SyncSender<(gst::Buffer, gst::Caps)>) -> Result<(), String> {
     let shared = shared.clone();
-    let pad = encoder.static_pad("sink").ok_or("pad sink ausente")?;
+    let pad = encoder_input.static_pad("src").ok_or("pad src ausente")?;
     pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+        // First of all, for the encoder and the preview alike: the bars around a picture
+        // of another shape than the frame's.
+        let rect = shared.picture_rect();
+        if (rect.2, rect.3) != shared.frame {
+            if let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_mut() {
+                if !paint_new_surface(pad, buffer, rect, &shared) {
+                    // Whatever the surface held would show around the picture (green, when
+                    // new): shown to nobody. `health` gives the stream up.
+                    return gst::PadProbeReturn::Drop;
+                }
+            }
+        }
         let Some(buffer) = info.buffer() else { return gst::PadProbeReturn::Ok };
         let Some(pts) = buffer.pts() else { return gst::PadProbeReturn::Drop };
         let decision = {
@@ -936,13 +1491,115 @@ fn add_encoder_probe(encoder: &gst::Element, shared: &Arc<Shared>, preview: Sync
         }
         in_flight.push_back((pts, decision.repeat, Instant::now()));
         drop(in_flight);
+        shared.at_encoder_ms.store(shared.now_ms().max(1), Ordering::Relaxed);
         if shared.hang.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_secs(20));
         }
+        let guarded = shared.guard_main.load(Ordering::SeqCst);
+        if guarded != 0 {
+            // A Main encoder that has not proven itself: the picture is handed to it from
+            // here, so that an error of its own is not one of the capture's (the flow error
+            // would stop the streaming threads up to pipewiresrc for good). Nothing tells a
+            // late first picture from a thread that never comes back out of the driver but
+            // this call returning (vah264enc encodes inside it): `at_encoder_ms`.
+            if let (Some(encoder), Some(gst::PadProbeData::Buffer(buffer))) = (pad.peer(), info.data.take()) {
+                if encoder.chain(buffer).is_err() {
+                    shared.main_broke.store(guarded, Ordering::SeqCst);
+                }
+                shared.at_encoder_ms.store(0, Ordering::Relaxed);
+                info.flow_res = Ok(gst::FlowSuccess::Ok);
+                return gst::PadProbeReturn::Handled;
+            }
+        }
+        // (An encoder that has proven itself gets the picture when this returns: one that
+        // keeps it is found by the pictures still awaited, `in_flight`.)
+        shared.at_encoder_ms.store(0, Ordering::Relaxed);
         gst::PadProbeReturn::Ok
     })
     .ok_or("probe não instalado")?;
     Ok(())
+}
+
+/// Paints the bars of a picture fresh out of vapostproc, unless its surface already has them:
+/// the surface's memory object, which the buffer pool hands out again with the surface,
+/// carries the rectangle its bars were painted around.
+fn paint_new_surface(pad: &gst::Pad, buffer: &mut gst::Buffer, rect: (u32, u32, u32, u32), shared: &Shared) -> bool {
+    use gst::glib::translate::IntoGlib;
+    static PAINTED: std::sync::OnceLock<gst::glib::Quark> = std::sync::OnceLock::new();
+    let quark = PAINTED.get_or_init(|| gst::glib::Quark::from_str("litecord-bars-painted")).into_glib();
+    if buffer.n_memory() == 0 {
+        return true;
+    }
+    // Never 0: the picture has a width.
+    let mark = ((rect.0 as usize) << 48 | (rect.1 as usize) << 32 | (rect.2 as usize) << 16 | rect.3 as usize) as gst::glib::ffi::gpointer;
+    let memory = buffer.peek_memory(0).as_ptr() as *mut gst::ffi::GstMiniObject;
+    // (The memory outlives this call: the buffer holds it.)
+    if unsafe { gst::ffi::gst_mini_object_get_qdata(memory, quark) } == mark {
+        return true;
+    }
+    let started = Instant::now();
+    let painted = if shared.no_bars {
+        Err("falha simulada (LITECORD_VAAPI_CAPTURE_TEST_FAIL=nobars)".to_string())
+    } else {
+        pad.current_caps().ok_or("sem caps".to_string()).and_then(|caps| paint_bars(buffer.make_mut(), &caps, rect))
+    };
+    match painted {
+        Ok(()) => {
+            // The mapping may have replaced the memory by a copy: the one in the buffer now.
+            let memory = buffer.peek_memory(0).as_ptr() as *mut gst::ffi::GstMiniObject;
+            unsafe { gst::ffi::gst_mini_object_set_qdata(memory, quark, mark, None) };
+            shared.bars_painted.fetch_add(1, Ordering::Relaxed);
+            shared.bars_us.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            true
+        }
+        Err(e) => {
+            if shared.bars_failed.fetch_add(1, Ordering::Relaxed) == 0 {
+                warn!("⚠️ [VAAPI] As barras em volta da imagem não puderam ser pintadas ({})", e);
+            }
+            false
+        }
+    }
+}
+
+/// Black (BT.601 limited range: Y 16, Cb and Cr 128) over everything outside `rect` in an
+/// NV12 picture. Where the picture's edge is odd, a chroma sample is shared by its outermost
+/// row or column and the bar's first; those are painted with the bar. radeonsi writes the
+/// picture's chroma from ceil(start / 2) to ceil(end / 2): the shared sample at the left or
+/// the top stays as painted, the one at the right or the bottom is the picture's again from
+/// the surface's next use on (see the module's notes). Painting it all the same costs
+/// nothing and leaves no sample unwritten on a driver that rounds the other way.
+fn paint_bars(buffer: &mut gst::BufferRef, caps: &gst::Caps, (x, y, width, height): (u32, u32, u32, u32)) -> Result<(), String> {
+    let info = gst_video::VideoInfo::from_caps(caps).map_err(|e| e.to_string())?;
+    if info.format() != gst_video::VideoFormat::Nv12 {
+        return Err(format!("formato {:?}", info.format()));
+    }
+    let (w, h) = (info.width() as usize, info.height() as usize);
+    let (x, y, width, height) = (x as usize, y as usize, width as usize, height as usize);
+    if w % 2 != 0 || x + width > w || y + height > h {
+        return Err("retângulo fora do quadro".into());
+    }
+    let mut frame = gst_video::VideoFrameRef::from_buffer_ref_writable(buffer, &info).map_err(|e| e.to_string())?;
+    let (y_stride, uv_stride) = (frame.plane_stride()[0] as usize, frame.plane_stride()[1] as usize);
+    // Rows `rows` of a plane hold the picture in their bytes `cols`; the rest is bars.
+    let fill = |plane: &mut [u8], stride: usize, lines: usize, rows: std::ops::Range<usize>, cols: std::ops::Range<usize>, value: u8| -> Result<(), String> {
+        if stride < w || plane.len() < stride * (lines - 1) + w {
+            return Err("plano menor que o quadro".into());
+        }
+        for (row, line) in plane.chunks_mut(stride).take(lines).enumerate() {
+            let line = &mut line[..w];
+            if rows.contains(&row) {
+                line[..cols.start].fill(value);
+                line[cols.end..].fill(value);
+            } else {
+                line.fill(value);
+            }
+        }
+        Ok(())
+    };
+    fill(frame.plane_data_mut(0).map_err(|e| e.to_string())?, y_stride, h, y..y + height, x..x + width, 16)?;
+    // Chroma samples wholly inside the picture: two bytes each, for two columns and two rows.
+    let (cols, rows) = (x.div_ceil(2) * 2..(x + width) / 2 * 2, y.div_ceil(2)..(y + height) / 2);
+    fill(frame.plane_data_mut(1).map_err(|e| e.to_string())?, uv_stride, h.div_ceil(2), rows, cols, 128)
 }
 
 /// Reads each preview picture back from the GPU and hands it to the UI callback as RGBA at
@@ -1134,7 +1791,7 @@ pub fn run_until_end(id: u64, wanted: impl Fn() -> bool) -> Ended {
             }
             return Ended::Stopped;
         }
-        if let Err(reason) = stream.health(false) {
+        if let Err(reason) = stream.health(false, false) {
             give_up_stream(&stream, &reason);
             break reason;
         }
@@ -1156,10 +1813,15 @@ pub fn run_until_end(id: u64, wanted: impl Fn() -> bool) -> Ended {
     }
 }
 
-/// Somebody started or stopped watching: nothing is encoded while nobody does.
+/// Somebody started or stopped watching: nothing is encoded while nobody does. The way into
+/// the encoder is closed here and opened by the next `next_picture`, which knows the profile
+/// the new viewers decode.
 pub fn set_watched(watched: bool) {
+    if watched {
+        return;
+    }
     if let Some(stream) = current() {
-        stream.watch(&mut lock(&stream.tx), watched);
+        stream.watch(&mut lock(&stream.tx), false);
     }
 }
 
@@ -1171,7 +1833,8 @@ pub fn wait_ready(max: Duration) -> bool {
         if !tx.ready.is_empty() {
             return true;
         }
-        if let Some(sample) = stream.chain().sink.try_pull_sample(gst::ClockTime::from_nseconds(max.as_nanos() as u64)) {
+        let sink = stream.sink();
+        if let Some(sample) = Stream::pull(&mut tx, &sink, max) {
             tx.ready.push_back(sample);
             return true;
         }
@@ -1185,11 +1848,27 @@ pub fn wait_ready(max: Duration) -> bool {
 
 /// The send loop's turn while somebody watches: sets the bitrate and keyframe wishes for
 /// the pictures to come and returns the oldest finished access unit, if there is one.
-pub fn next_picture(bitrate_bps: u32, want_idr: bool) -> Option<Picture> {
+/// `main`: every viewer of this turn decodes H.264 Main (`watch::ProfileChoice`). When that
+/// is false no Main access unit is returned, from this call on.
+pub fn next_picture(bitrate_bps: u32, want_idr: bool, main: bool) -> Option<Picture> {
     let stream = current()?;
     let mut tx = lock(&stream.tx);
+    if bitrate_bps != tx.requested_bps {
+        // A new encoder starts at the rate asked for now.
+        tx.requested_bps = bitrate_bps;
+        tx.asked_at = Instant::now();
+    }
+    if let Err(reason) = stream.follow_profile(&mut tx, main, want_idr) {
+        drop(tx);
+        give_up_stream(&stream, &reason);
+        return None;
+    }
     stream.watch(&mut tx, true);
-    stream.control(&mut tx, bitrate_bps, want_idr);
+    if let Err(reason) = stream.control(&mut tx, bitrate_bps, want_idr) {
+        drop(tx);
+        give_up_stream(&stream, &reason);
+        return None;
+    }
     let swallow = match stream.test_fail {
         TestFail::After(n) if tx.delivered >= n => {
             drop(tx);
@@ -1207,13 +1886,18 @@ pub fn next_picture(bitrate_bps: u32, want_idr: bool) -> Option<Picture> {
         TestFail::Stall(n) => tx.delivered >= n,
         _ => false,
     };
+    let sink = stream.sink();
     let failure = loop {
-        let sample = tx.ready.pop_front().or_else(|| stream.chain().sink.try_pull_sample(gst::ClockTime::ZERO));
-        let Some(sample) = sample else {
-            // Nothing finished.
-            break stream.health(true);
+        let sample = match tx.ready.pop_front() {
+            Some(sample) => Some(sample),
+            None => Stream::pull(&mut tx, &sink, Duration::ZERO),
         };
-        if swallow {
+        let Some(sample) = sample else {
+            // Nothing finished. (A Main encoder that has not shown its first keyframe has
+            // its own deadline, in `follow_profile`.)
+            break stream.health(true, !tx.main || tx.main_proven);
+        };
+        if swallow || (tx.mute_main > 0 && tx.main && !tx.main_proven) {
             continue;
         }
         match stream.finish(&mut tx, &sample) {
@@ -1233,8 +1917,8 @@ pub fn next_picture(bitrate_bps: u32, want_idr: bool) -> Option<Picture> {
 }
 
 /// `next_picture` for the send loop, which only wants the bytes.
-pub fn next_au(bitrate_bps: u32, want_idr: bool) -> Option<Vec<u8>> {
-    next_picture(bitrate_bps, want_idr).map(|p| p.data)
+pub fn next_au(bitrate_bps: u32, want_idr: bool, main: bool) -> Option<Vec<u8>> {
+    next_picture(bitrate_bps, want_idr, main).map(|p| p.data)
 }
 
 /// New pictures the compositor delivered since the last call (the send loop's telemetry).

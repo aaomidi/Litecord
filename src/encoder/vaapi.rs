@@ -36,7 +36,7 @@ pub(crate) const ENCODER_ELEMENTS: [&str; 2] = ["vah264enc", "vah264lpenc"];
 pub(crate) const INITIAL_BITRATE_BPS: u32 = 8_000_000;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 /// A new pipeline creates the VA context on its first frame (measured: 16-82 ms at 1080p).
-const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(400);
+pub(crate) const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(400);
 const FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 /// Time without a picture before the stream goes to OpenH264. Viewers drop a stream after
 /// 2.5 s; a GPU hiccup shorter than this only costs the frames it lasted and a keyframe.
@@ -52,7 +52,12 @@ const GPU_RETRY_MAX: Duration = Duration::from_secs(480);
 /// vah264enc starts a new sequence (an IDR) whenever its bitrate changes, so a new rate
 /// waits for the next keyframe the caller asks for (at least every 2 s), up to this long.
 pub(crate) const BITRATE_MAX_WAIT: Duration = Duration::from_millis(3000);
-const TEARDOWN_WAIT: Duration = Duration::from_millis(300);
+pub(crate) const TEARDOWN_WAIT: Duration = Duration::from_millis(300);
+/// The capsfilter between vapostproc and the encoder: the last element that stays when the
+/// encoder is replaced.
+pub(crate) const ENCODER_INPUT: &str = "enc_in";
+/// vapostproc in a pipeline made from `EncodeChain::description_scaled`.
+pub(crate) const POSTPROC: &str = "enc_scale";
 const PROBE_SIZE: (u32, u32) = (640, 360);
 
 /// Test hook: `LITECORD_VAAPI_TEST_FAIL=init` fails construction, `after:N` makes every GPU
@@ -219,19 +224,31 @@ impl EncodeChain {
     /// The size is named after vapostproc: an encoder that cannot take it fails to
     /// negotiate instead of getting a scaled picture.
     fn description(element: &str, width: u32, height: u32, bitrate_bps: u32, min_qp: u32, main: bool) -> String {
-        Self::description_with(element, width, height, bitrate_bps, min_qp, main, "")
+        Self::description_with(element, width, height, bitrate_bps, min_qp, main, "", "")
     }
 
     /// For a source of any size (the in-process screen capture hands vapostproc pictures
-    /// of the monitor's size): vapostproc scales to this size, stretched to fill it.
+    /// of the monitor's size): vapostproc scales the picture to fit this size, its shape
+    /// kept and centred (`linux_portal::letterbox` says where). With square pixels named on both sides,
+    /// `add-borders` leaves the rest of the frame to "borders" that some drivers never write
+    /// (radeonsi: whatever the surface held, green when new): the caller paints them.
     pub(crate) fn description_scaled(element: &str, width: u32, height: u32, bitrate_bps: u32, min_qp: u32, main: bool) -> String {
-        Self::description_with(element, width, height, bitrate_bps, min_qp, main, ",pixel-aspect-ratio=1/1")
+        Self::description_with(element, width, height, bitrate_bps, min_qp, main, &format!(" name={POSTPROC} add-borders=true"), ",pixel-aspect-ratio=1/1")
     }
 
-    fn description_with(element: &str, width: u32, height: u32, bitrate_bps: u32, min_qp: u32, main: bool, more_caps: &str) -> String {
+    fn description_with(element: &str, width: u32, height: u32, bitrate_bps: u32, min_qp: u32, main: bool, postproc_props: &str, more_caps: &str) -> String {
         format!(
-            "vapostproc ! video/x-raw(memory:VAMemory),format=NV12,width={width},height={height},colorimetry=(string)2:4:7:1{more_caps} \
-             ! {element} name=enc {ENCODER_PROPS} min-qp={min_qp} max-qp={} bitrate={} cpb-size={} \
+            "vapostproc{postproc_props} ! capsfilter name={ENCODER_INPUT} caps=\"video/x-raw(memory:VAMemory),format=NV12,width={width},height={height},colorimetry=(string)2:4:7:1{more_caps}\" \
+             ! {}",
+            Self::encoder_description(element, bitrate_bps, min_qp, main)
+        )
+    }
+
+    /// The chain from the encoder on: what is replaced, behind the element named
+    /// `ENCODER_INPUT`, when a running pipeline changes its profile (`EncoderSection`).
+    pub(crate) fn encoder_description(element: &str, bitrate_bps: u32, min_qp: u32, main: bool) -> String {
+        format!(
+            "{element} name=enc {ENCODER_PROPS} min-qp={min_qp} max-qp={} bitrate={} cpb-size={} \
              ! video/x-h264,profile={},stream-format=byte-stream,alignment=au \
              ! appsink name=sink sync=false async=false max-buffers=4 drop=false emit-signals=false enable-last-sample=false",
             MAX_QP.max(min_qp),
@@ -250,26 +267,13 @@ impl EncodeChain {
 
     /// Takes effect on the next frame, which the encoder turns into an IDR.
     pub(crate) fn set_bitrate(&self, bitrate_bps: u32) {
-        for (name, value) in [("bitrate", bitrate_bps / 1000), ("cpb-size", cpb_size_kbit(bitrate_bps))] {
-            // set_property panics on a missing property, another type or a value out of range.
-            if let Some(spec) = self.encoder.find_property(name) {
-                if let Some(range) = spec.downcast_ref::<gst::glib::ParamSpecUInt>() {
-                    self.encoder.set_property(name, value.clamp(range.minimum(), range.maximum()));
-                }
-            }
-        }
+        set_encoder_bitrate(&self.encoder, bitrate_bps);
     }
 
     /// The frame stamped `pts` becomes an IDR with SPS and PPS; not an earlier one that is
     /// still on its way to the encoder (given up on, its output is thrown away).
     fn request_keyframe(&self, pts: gst::ClockTime) -> bool {
         self.sink.send_event(gst_video::UpstreamForceKeyUnitEvent::builder().running_time(pts).all_headers(true).build())
-    }
-
-    /// The next frame entering the encoder becomes an IDR with SPS and PPS (for a source
-    /// that stamps its own pictures).
-    pub(crate) fn request_next_keyframe(&self) -> bool {
-        self.sink.send_event(gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build())
     }
 
     fn bus_error(&self) -> Option<String> {
@@ -348,6 +352,108 @@ impl Drop for EncodeChain {
             Err(_) => {
                 let _ = self.pipeline.set_state(gst::State::Null);
             }
+        }
+    }
+}
+
+/// Sets the rate of a running encoder element; it takes effect on the next frame, which the
+/// encoder turns into an IDR.
+pub(crate) fn set_encoder_bitrate(encoder: &gst::Element, bitrate_bps: u32) {
+    for (name, value) in [("bitrate", bitrate_bps / 1000), ("cpb-size", cpb_size_kbit(bitrate_bps))] {
+        // set_property panics on a missing property, another type or a value out of range.
+        if let Some(spec) = encoder.find_property(name) {
+            if let Some(range) = spec.downcast_ref::<gst::glib::ParamSpecUInt>() {
+                encoder.set_property(name, value.clamp(range.minimum(), range.maximum()));
+            }
+        }
+    }
+}
+
+/// The next frame entering the encoder in front of `sink` becomes an IDR with SPS and PPS
+/// (for a source that stamps its own pictures).
+pub(crate) fn request_next_keyframe(sink: &gst_app::AppSink) -> bool {
+    sink.send_event(gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build())
+}
+
+/// The encoder of a running pipeline with what follows it (profile filter, appsink). vah264enc
+/// cannot change its profile while it runs, but the part of the pipeline in front of it can
+/// stay as it is: measured on radeonsi at 1080p60, taking one section out and linking a new
+/// one in takes under 5 ms and the new encoder's first picture (an IDR with SPS and PPS)
+/// comes out in the next frame's slot, where a whole new capture pipeline takes 70-520 ms to
+/// its first picture.
+pub(crate) struct EncoderSection {
+    pub(crate) encoder: gst::Element,
+    pub(crate) sink: gst_app::AppSink,
+    /// What `remove` takes out of the pipeline: the elements `gst::parse::launch` made, or
+    /// the one bin of a section built by `build`.
+    parts: Vec<gst::Element>,
+    pub(crate) main: bool,
+}
+
+impl EncoderSection {
+    /// The section a pipeline made from `EncodeChain::description*` starts with.
+    pub(crate) fn of_chain(chain: &EncodeChain, main: bool) -> Self {
+        // The encoder, and everything linked behind it.
+        let mut parts = vec![chain.encoder.clone()];
+        while let Some(next) = parts.last().and_then(|e| e.static_pad("src")).and_then(|p| p.peer()).and_then(|p| p.parent_element()) {
+            parts.push(next);
+        }
+        Self { encoder: chain.encoder.clone(), sink: chain.sink.clone(), parts, main }
+    }
+
+    /// A new section, in no pipeline yet. `description`: `EncodeChain::encoder_description`.
+    pub(crate) fn build(description: &str, main: bool) -> Result<Self, String> {
+        let bin = gst::parse::bin_from_description(description, true).map_err(|e| e.to_string())?;
+        let encoder = bin.by_name("enc").ok_or("encoder element missing")?;
+        let sink = bin.by_name("sink").and_then(|e| e.downcast::<gst_app::AppSink>().ok()).ok_or("appsink missing")?;
+        Ok(Self { encoder, sink, parts: vec![bin.upcast()], main })
+    }
+
+    /// The pad pictures go in through.
+    pub(crate) fn input(&self) -> Option<gst::Pad> {
+        self.parts.first().and_then(|e| e.static_pad("sink"))
+    }
+
+    /// The section's elements (the source of a bus message is one of them, or inside one).
+    pub(crate) fn objects(&self) -> Vec<gst::Object> {
+        self.parts.iter().map(|part| part.clone().upcast()).collect()
+    }
+
+    /// Puts the section into `pipeline`, running, linked to nothing.
+    pub(crate) fn add_to(&self, pipeline: &gst::Pipeline) -> Result<(), String> {
+        for part in &self.parts {
+            pipeline.add(part).map_err(|e| e.to_string())?;
+        }
+        // The sink first, as a pipeline does.
+        for part in self.parts.iter().rev() {
+            part.sync_state_with_parent().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Takes the section out of `pipeline` (already unlinked from what feeds it, or never
+    /// linked) and stops it, waiting up to `wait` for that: the VA context of an encoder
+    /// should be gone before the next one is made, but a driver that hangs must not hold
+    /// the caller. Measured: 0.2-3 ms.
+    pub(crate) fn remove(self, pipeline: &gst::Pipeline, wait: Duration) {
+        for part in &self.parts {
+            let _ = pipeline.remove(part);
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let stop = move || {
+            // (Mesa's VA driver and a process that exits meanwhile: see `begin_teardown`.)
+            let Some(_stopping) = begin_teardown() else {
+                std::mem::forget(self);
+                return;
+            };
+            for part in &self.parts {
+                let _ = part.set_state(gst::State::Null);
+            }
+            drop(self);
+            let _ = done_tx.send(());
+        };
+        if std::thread::Builder::new().name("vaapi-teardown".into()).spawn(stop).is_ok() && done_rx.recv_timeout(wait).is_err() {
+            warn!("⚠️ [VAAPI] O codificador substituído não parou em {} ms; segue encerrando em segundo plano", wait.as_millis());
         }
     }
 }
@@ -765,7 +871,7 @@ impl VaapiEncoder {
     }
 }
 
-fn profile_name(main: bool) -> &'static str {
+pub(crate) fn profile_name(main: bool) -> &'static str {
     if main {
         "Main"
     } else {
