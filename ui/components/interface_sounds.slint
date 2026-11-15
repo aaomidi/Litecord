@@ -1,0 +1,31 @@
+import { AppTheme, TypeScale } from "../theme.slint";
+import { Tr } from "tr.slint";
+import { SettingsSection, OptionSelect } from "settings_kit.slint";
+
+// The "interface sounds" setting (ui_sound_pack in src/utils/video_settings.rs): which pack
+// of src/audio/sound_effects.rs plays for mute, deafen, join and leave. Rust sets the
+// current pack (populate_voice_processing_settings) and, when one is picked, saves it and
+// plays its "join" sound once.
+export global InterfaceSounds {
+    // "soft-mallet", "glass-bell", "breath-pad" or "off".
+    in-out property <string> pack: "soft-mallet";
+    callback select-pack(string);
+}
+
+export component InterfaceSoundsSection inherits SettingsSection {
+    title: Tr.ui_sounds_title;
+    OptionSelect {
+        options: [
+            { id: "soft-mallet", name: Tr.ui_sounds_mallet, desc: Tr.ui_sounds_mallet_desc },
+            { id: "glass-bell", name: Tr.ui_sounds_glass, desc: Tr.ui_sounds_glass_desc },
+            { id: "breath-pad", name: Tr.ui_sounds_breath, desc: Tr.ui_sounds_breath_desc },
+            { id: "off", name: Tr.ui_sounds_off, desc: Tr.ui_sounds_off_desc },
+        ];
+        selected-id: InterfaceSounds.pack;
+        picked(id) => {
+            InterfaceSounds.pack = id;
+            InterfaceSounds.select-pack(id);
+        }
+    }
+    Text { text: Tr.ui_sounds_desc; color: AppTheme.text-muted; font-size: TypeScale.small; wrap: word-wrap; }
+}

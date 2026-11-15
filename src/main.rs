@@ -2522,6 +2522,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Interface sounds: save the pack, then let it be heard once. The pack is read again for
+    // every sound, so this already plays the new one (and nothing at all for "off").
+    {
+        use slint::ComponentHandle;
+        app.global::<InterfaceSounds>().on_select_pack(|id: SharedString| {
+            video_settings::set_ui_sound_pack(id.as_str());
+            sound_effects::play_ui_sound(sound_effects::UiSound::JoinChannel);
+        });
+    }
+
     // Voice Processing Settings Callbacks
     let app_weak_ns = app_weak.clone();
     app.on_select_noise_suppression(move |id: SharedString| {

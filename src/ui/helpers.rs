@@ -608,6 +608,12 @@ pub fn populate_voice_processing_settings(ui: &AppWindow) {
     ];
 
     ui.set_noise_suppression_options(std::rc::Rc::new(slint::VecModel::from(ns_items)).into());
+
+    // Interface sounds: the names of the packs are in the Slint file, from the `Tr` strings.
+    {
+        use slint::ComponentHandle;
+        ui.global::<crate::InterfaceSounds>().set_pack(video_settings::get_ui_sound_pack().id().into());
+    }
 }
 
 pub fn populate_network_proxy_settings(ui: &AppWindow) {
