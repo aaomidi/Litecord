@@ -46,6 +46,8 @@ struct VoiceParticipant {
     is_self: bool,
     is_streaming: bool,
     is_stream_hidden: bool,
+    // Watch was pressed and this sender has not answered for a few seconds: what its card says.
+    watch_note: string,
 }
 
 export struct ScreenSourceItem {
@@ -1676,8 +1678,11 @@ export component AppWindow inherits Window {
                                 for p in root.voice_participants: Rectangle {
                                     property <bool> is_streaming_attached: (p.is_self && root.is_screen_sharing)
                                         ? (!p.is_stream_hidden && root.popped_out_stream_uid != p.user_id && root.popped_out_stream_uid != "self")
-                                        : (root.has_active_stream && (p.is_streaming || root.active_stream_user_id == p.user_id || root.active_stream_user_id == "") && !p.is_stream_hidden && root.popped_out_stream_uid != p.user_id);
+                                        : (root.has_active_stream && (p.is_streaming || root.active_stream_user_id == p.user_id || root.active_stream_user_id == "") && !p.is_stream_hidden && root.popped_out_stream_uid != p.user_id && p.watch_note == "");
                                     property <bool> is_this_stream_focused: (root.focused_stream_uid == p.user_id || (p.is_self && (root.focused_stream_uid == "self" || root.focused_stream_uid == p.user_id)));
+                                    // Room under the controls for the note while Watch goes unanswered; the
+                                    // card stays small then, also with another stream on screen.
+                                    property <length> watch_note_height: p.watch_note != "" ? watch_note_text.preferred-height + 6px : 0px;
                                     // The stream area goes away (hidden, popped out): no GPU video here.
                                     changed is_streaming_attached => {
                                         if (!is_streaming_attached && p.user_id == root.active_stream_user_id) {
@@ -1689,7 +1694,7 @@ export component AppWindow inherits Window {
                                         ? (is_this_stream_focused
                                             ? Math.max(360px, voice_stage_container.height - 52px)
                                             : Math.max(200px, Math.min(280px, (voice_stage_container.height - 80px) * 0.5)))
-                                        : 76px;
+                                        : 76px + watch_note_height;
                                     animate height { duration: 200ms; }
                                     background: transparent;
 
@@ -2239,7 +2244,7 @@ export component AppWindow inherits Window {
                                     // 2. STANDARD VOICE AUDIO RECTANGLE (When NOT streaming OR when Popped Out)
                                     if !is_streaming_attached: Rectangle {
                                         y: 4px;
-                                        height: 68px;
+                                        height: 68px + watch_note_height;
                                         background: p.is_self ? AppTheme.surface-reply : AppTheme.surface-sidebar;
                                         border-radius: 8px;
                                         border-width: p.is_speaking ? 2px : (p.is_self ? 1px : 0px);
@@ -2285,6 +2290,7 @@ export component AppWindow inherits Window {
                                                  alignment: center;
                                                  spacing: 6px;
                                                  padding: 0px;
+                                                 padding-bottom: watch_note_height;
 
                                                  // Row 1: Username & Badges
                                                  HorizontalLayout {
@@ -2704,6 +2710,19 @@ export component AppWindow inherits Window {
                                                  }
                                              }
                                         }
+                                    }
+
+                                    // Under the controls of 2: Watch was pressed and the sender has not answered.
+                                    // As wide as the card shows and as many lines as that takes.
+                                    watch_note_text := Text {
+                                        visible: p.watch_note != "";
+                                        x: 66px;
+                                        y: 70px;
+                                        width: Math.max(40px, parent.width - 78px);
+                                        text: p.watch_note;
+                                        color: AppTheme.text-muted;
+                                        font-size: TypeScale.caption;
+                                        wrap: word-wrap;
                                     }
                                 }
                             }

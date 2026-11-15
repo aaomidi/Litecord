@@ -1337,6 +1337,7 @@ impl ScreenCaptureManager {
                 let mut rx_error_streak: HashMap<u64, u32> = HashMap::new();
                 // Aguardando IDR por peer: quando true, dropa frames até receber SPS/IDR
                 let mut waiting_for_idr: HashMap<u64, bool> = HashMap::new();
+                let mut last_decoded_seq: HashMap<u64, u32> = HashMap::new();
 
                 while is_running_decoder.load(Ordering::Relaxed) {
                     // The timeout only exists to zero the FPS readout after a stream
@@ -1426,6 +1427,12 @@ impl ScreenCaptureManager {
                             // Frames of this peer were dropped at the full queue: the ones after them
                             // cannot be decoded cleanly, so wait for a keyframe (and ask for it).
                             if take_decode_resync(peer_uid) {
+                                waiting_for_idr.insert(peer_uid, true);
+                            }
+                            // A frame of this peer never arrived whole. The decoder does not always
+                            // notice (after a lost keyframe that directly followed another one it
+                            // decodes on, against the wrong picture), so this waits for a keyframe too.
+                            if last_decoded_seq.insert(peer_uid, seq).is_some_and(|prev| seq != prev.wrapping_add(1)) {
                                 waiting_for_idr.insert(peer_uid, true);
                             }
 
@@ -1705,9 +1712,9 @@ impl ScreenCaptureManager {
                     let wanted: Vec<u64> = if in_call && current_cid > 0 && my_uid > 0 { super::watch::streams_to_request() } else { Vec::new() };
                     if (wanted != requested || last_watch_request.elapsed() >= super::watch::RENEW_EVERY) && (!wanted.is_empty() || !requested.is_empty()) {
                         last_watch_request = Instant::now();
-                        let my_public = get_or_create_local_ecdh_keypair();
+                        let my_public = watch_public_key();
                         for &peer in &wanted {
-                            let mut pkt = Vec::with_capacity(65);
+                            let mut pkt = Vec::with_capacity(66);
                             pkt.extend_from_slice(MAGIC);
                             pkt.extend_from_slice(&my_instance_id.to_be_bytes());
                             pkt.push(OP_WATCH);
@@ -1715,11 +1722,15 @@ impl ScreenCaptureManager {
                             pkt.extend_from_slice(&my_uid.to_be_bytes());
                             pkt.extend_from_slice(&peer.to_be_bytes());
                             pkt.extend_from_slice(&my_public);
+                            // The capability byte: one more than upstream sends (it reads the first 65 and ignores the rest).
+                            pkt.push(super::watch::CAP_H264_MAIN);
                             for addr in peer_addrs(peer, &peers_store) {
                                 let _ = socket.send_to(&pkt, addr);
                             }
+                            super::watch::asked(peer);
                         }
                         for &peer in requested.iter().filter(|p| !wanted.contains(p)) {
+                            super::watch::stopped_asking(peer);
                             let mut pkt = Vec::with_capacity(33);
                             pkt.extend_from_slice(MAGIC);
                             pkt.extend_from_slice(&my_instance_id.to_be_bytes());
@@ -2350,10 +2361,10 @@ impl ScreenCaptureManager {
                                 OP_WATCH_ACK => {
                                     if len >= 125 && u64::from_be_bytes(recv_buf[25..33].try_into().unwrap()) == my_uid {
                                         let sender_public: [u8; 32] = recv_buf[33..65].try_into().unwrap();
-                                        let key = pair_key(&sender_public, my_uid, pkt_uid, my_current_cid)
-                                            .and_then(|pair| decrypt_signaling_payload(&pair, &recv_buf[65..125]))
+                                        let key = decrypt_signaling_payload(&watch_pair_key(&sender_public, my_uid, pkt_uid, my_current_cid), &recv_buf[65..125])
                                             .and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok());
                                         if let Some(key) = key {
+                                            super::watch::answered(pkt_uid);
                                             if super::watch::stream_key(pkt_uid) != Some(key) {
                                                 info!("🔑 [ASSISTIR SOB DEMANDA] Chave da transmissão de UID={} recebida.", pkt_uid);
                                                 super::watch::set_stream_key(pkt_uid, key);

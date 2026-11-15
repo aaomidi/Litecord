@@ -626,7 +626,7 @@ fn main() {
     w.check("while the viewer's own key is answered in the same moment", w.replies_sent == replies_before + 1);
     w.drain_sockets();
     // The binding is the one watch requests use.
-    let bound = watch::on_watch(VIEWER, other_id.public(), w.viewer_addr, true);
+    let bound = watch::on_watch(VIEWER, other_id.public(), w.viewer_addr, 0, true);
     w.check("and that key cannot watch either: the binding is shared with OP_WATCH", bound == Some(watch::Verdict::KeyMismatch));
     w.check("a link request did not put the viewer on the watch list (no video is sent to it)", watch::viewer_addrs().is_empty());
 
