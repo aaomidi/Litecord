@@ -18,6 +18,8 @@ pub mod gpu_encode_worker;
 pub mod gpu_tx;
 #[cfg(windows)]
 pub mod gpu_capture;
+#[cfg(all(target_os = "linux", feature = "vaapi"))]
+pub mod linux_gpu_tx;
 
 pub use types::*;
 pub use crypto::*;

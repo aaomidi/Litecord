@@ -17,6 +17,9 @@ static PORTAL_LAST_ATTEMPT: std::sync::Mutex<Option<std::time::Instant>> = std::
 pub static PORTAL_LOCAL_CB: std::sync::Mutex<Option<std::sync::Arc<dyn Fn(SharedPixelBuffer<Rgba8Pixel>) + Send + Sync + 'static>>> = std::sync::Mutex::new(None);
 #[cfg(target_os = "linux")]
 pub static PORTAL_CHILD: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
+/// Counts the portal threads started, so one can tell that PORTAL_INITIALIZED is still its own.
+#[cfg(all(target_os = "linux", feature = "vaapi"))]
+static PORTAL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(target_os = "linux")]
 pub fn reset_wayland_portal_cancelled() {
@@ -57,6 +60,8 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
     if let Ok(mut guard) = PORTAL_LAST_ATTEMPT.lock() {
         *guard = Some(std::time::Instant::now());
     }
+    #[cfg(feature = "vaapi")]
+    let generation = PORTAL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
 
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
@@ -184,6 +189,58 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
             }
 
             log::info!("🎉 Conectando GStreamer ao PipeWire Node ID={}, FD={} ({}x{} @ {} FPS)...", node_id, raw_fd, target_w, target_h, target_fps);
+
+            // Capture and encode on the GPU inside this process when that works. If it cannot
+            // start, or fails later, the gst-launch capture below runs on the same session.
+            #[cfg(feature = "vaapi")]
+            let (raw_fd, _gst_fd, gpu_ran) = {
+                use crate::screen_capture::linux_gpu_tx as gpu;
+                use std::sync::atomic::Ordering;
+                let mut fallback = (raw_fd, None, false);
+                // The share this thread was started for is still running.
+                let mine = move || PORTAL_INITIALIZED.load(Ordering::Relaxed) && PORTAL_GENERATION.load(Ordering::Relaxed) == generation;
+                if gpu::allowed(stream.source_type() == Some(SourceType::Window)) {
+                    let begun = gpu::begin(Some(raw_fd), node_id, target_w, target_h, target_fps as u32, &mine);
+                    let ended = match begun {
+                        Some(id) => gpu::run_until_end(id, &mine),
+                        None => gpu::Ended::Failed,
+                    };
+                    if ended != gpu::Ended::Failed || !mine() {
+                        // The share was stopped, or the compositor ended the session. In the
+                        // second case the next capture poll asks the portal again, as it does
+                        // when the gst-launch capture ends.
+                        let _ = session.close().await;
+                        log::info!("🛑 Sessão do XDG Desktop Portal ScreenCast fechada com sucesso via D-Bus!");
+                        if ended == gpu::Ended::SourceGone && PORTAL_GENERATION.load(Ordering::Relaxed) == generation {
+                            PORTAL_INITIALIZED.store(false, Ordering::SeqCst);
+                        }
+                        return;
+                    }
+                    // gst-launch gets a PipeWire connection of its own. The pipeline that
+                    // failed stops in the background and may never finish (a driver that
+                    // hangs); two clients on one connection break it, so the old one is shut.
+                    match proxy.open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default()).await {
+                        Ok(fd) => {
+                            let new_fd = fd.as_raw_fd();
+                            unsafe {
+                                libc::shutdown(raw_fd, libc::SHUT_RDWR);
+                                let flags = libc::fcntl(new_fd, libc::F_GETFD);
+                                if flags >= 0 {
+                                    libc::fcntl(new_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                                }
+                            }
+                            fallback = (new_fd, Some(fd), begun.is_some());
+                        }
+                        Err(e) => {
+                            log::warn!("⚠️ Falha ao abrir um segundo PipeWire Remote ({:?}); a captura por gst-launch usa a conexão anterior", e);
+                            fallback.2 = begun.is_some();
+                        }
+                    }
+                }
+                fallback
+            };
+            #[cfg(not(feature = "vaapi"))]
+            let gpu_ran = false;
 
             let (dst_w, dst_h) = (target_w, target_h);
             let frame_size = (dst_w * dst_h * 4) as usize;
@@ -330,7 +387,10 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
                 }
             }
 
-            if !got_first_frame {
+            // (After a GPU capture that had been running, gst-launch delivering nothing is a
+            // capture that ended mid-share, not one that never started: the session is closed
+            // below and the next capture poll asks the portal again.)
+            if !got_first_frame && !gpu_ran {
                 log::error!("❌ GStreamer PipeWire encerrou sem produzir nenhum quadro! Pipeline falhou.");
                 // Check if child exited with an error
                 if let Ok(mut lock) = PORTAL_CHILD.lock() {

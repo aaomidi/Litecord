@@ -29,9 +29,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Preferred first; `vah264lpenc` is the only one Intel's low-power encoders register.
-const ENCODER_ELEMENTS: [&str; 2] = ["vah264enc", "vah264lpenc"];
+pub(crate) const ENCODER_ELEMENTS: [&str; 2] = ["vah264enc", "vah264lpenc"];
 /// Streams start at this rate (types::REQUESTED_BITRATE_BPS).
-const INITIAL_BITRATE_BPS: u32 = 8_000_000;
+pub(crate) const INITIAL_BITRATE_BPS: u32 = 8_000_000;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 /// A new pipeline creates the VA context on its first frame (measured: 16-82 ms at 1080p).
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(400);
@@ -49,7 +49,7 @@ const GPU_RETRY_AFTER: Duration = Duration::from_secs(30);
 const GPU_RETRY_MAX: Duration = Duration::from_secs(480);
 /// vah264enc starts a new sequence (an IDR) whenever its bitrate changes, so a new rate
 /// waits for the next keyframe the caller asks for (at least every 2 s), up to this long.
-const BITRATE_MAX_WAIT: Duration = Duration::from_millis(3000);
+pub(crate) const BITRATE_MAX_WAIT: Duration = Duration::from_millis(3000);
 const TEARDOWN_WAIT: Duration = Duration::from_millis(300);
 const PROBE_SIZE: (u32, u32) = (640, 360);
 
@@ -103,7 +103,7 @@ impl TestHook {
 /// The access unit without filler data NAL units (type 12): in CBR mode radeonsi pads
 /// every picture smaller than the frame budget with them, megabits of nothing on a still
 /// screen.
-fn without_filler(au: Vec<u8>) -> Vec<u8> {
+pub(crate) fn without_filler(au: Vec<u8>) -> Vec<u8> {
     let ranges = nal_ranges(&au);
     if !ranges.iter().any(|r| au[r.start] & 0x1f == 12) {
         return au;
@@ -126,12 +126,20 @@ fn without_filler(au: Vec<u8>) -> Vec<u8> {
 static TEARDOWNS: AtomicUsize = AtomicUsize::new(0);
 static EXITING: AtomicBool = AtomicBool::new(false);
 
-struct Teardown;
+pub(crate) struct Teardown;
 
 impl Drop for Teardown {
     fn drop(&mut self) {
         TEARDOWNS.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// For a VA pipeline stopped outside `EncodeChain`'s own drop: hold the result until it
+/// has stopped. `None` means the process is exiting and the pipeline must be left alone.
+pub(crate) fn begin_teardown() -> Option<Teardown> {
+    TEARDOWNS.fetch_add(1, Ordering::SeqCst);
+    let teardown = Teardown;
+    (!EXITING.load(Ordering::SeqCst)).then_some(teardown)
 }
 
 /// To be called right before `std::process::exit`: pipelines still running are left to the
@@ -146,11 +154,11 @@ pub fn before_exit() {
 
 /// The pipeline from colour conversion to the encoded access units. The bitrate, keyframe
 /// requests and the output only touch this part, so the frame source can be replaced.
-struct EncodeChain {
-    pipeline: gst::Pipeline,
-    bus: gst::Bus,
-    encoder: gst::Element,
-    sink: gst_app::AppSink,
+pub(crate) struct EncodeChain {
+    pub(crate) pipeline: gst::Pipeline,
+    pub(crate) bus: gst::Bus,
+    pub(crate) encoder: gst::Element,
+    pub(crate) sink: gst_app::AppSink,
     /// How long dropping this waits for the pipeline to stop.
     teardown_wait: Duration,
     /// Set while it stops. Last field: released after the pipeline.
@@ -166,8 +174,18 @@ impl EncodeChain {
     /// The size is named after vapostproc: an encoder that cannot take it fails to
     /// negotiate instead of getting a scaled picture.
     fn description(element: &str, width: u32, height: u32, bitrate_bps: u32) -> String {
+        Self::description_with(element, width, height, bitrate_bps, "")
+    }
+
+    /// For a source of any size (the in-process screen capture hands vapostproc pictures
+    /// of the monitor's size): vapostproc scales to this size, stretched to fill it.
+    pub(crate) fn description_scaled(element: &str, width: u32, height: u32, bitrate_bps: u32) -> String {
+        Self::description_with(element, width, height, bitrate_bps, ",pixel-aspect-ratio=1/1")
+    }
+
+    fn description_with(element: &str, width: u32, height: u32, bitrate_bps: u32, more_caps: &str) -> String {
         format!(
-            "vapostproc ! video/x-raw(memory:VAMemory),format=NV12,width={width},height={height},colorimetry=(string)2:4:7:1 \
+            "vapostproc ! video/x-raw(memory:VAMemory),format=NV12,width={width},height={height},colorimetry=(string)2:4:7:1{more_caps} \
              ! {element} name=enc {ENCODER_PROPS} bitrate={} cpb-size={} \
              ! video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au \
              ! appsink name=sink sync=false async=false max-buffers=4 drop=false emit-signals=false enable-last-sample=false",
@@ -176,7 +194,7 @@ impl EncodeChain {
         )
     }
 
-    fn from_pipeline(pipeline: gst::Pipeline) -> Result<Self, String> {
+    pub(crate) fn from_pipeline(pipeline: gst::Pipeline) -> Result<Self, String> {
         let bus = pipeline.bus().ok_or("pipeline without bus")?;
         let encoder = pipeline.by_name("enc").ok_or("encoder element missing")?;
         let sink = pipeline.by_name("sink").and_then(|e| e.downcast::<gst_app::AppSink>().ok()).ok_or("appsink missing")?;
@@ -184,7 +202,7 @@ impl EncodeChain {
     }
 
     /// Takes effect on the next frame, which the encoder turns into an IDR.
-    fn set_bitrate(&self, bitrate_bps: u32) {
+    pub(crate) fn set_bitrate(&self, bitrate_bps: u32) {
         for (name, value) in [("bitrate", bitrate_bps / 1000), ("cpb-size", cpb_size_kbit(bitrate_bps))] {
             // set_property panics on a missing property, another type or a value out of range.
             if let Some(spec) = self.encoder.find_property(name) {
@@ -199,6 +217,12 @@ impl EncodeChain {
     /// still on its way to the encoder (given up on, its output is thrown away).
     fn request_keyframe(&self, pts: gst::ClockTime) -> bool {
         self.sink.send_event(gst_video::UpstreamForceKeyUnitEvent::builder().running_time(pts).all_headers(true).build())
+    }
+
+    /// The next frame entering the encoder becomes an IDR with SPS and PPS (for a source
+    /// that stamps its own pictures).
+    pub(crate) fn request_next_keyframe(&self) -> bool {
+        self.sink.send_event(gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build())
     }
 
     fn bus_error(&self) -> Option<String> {
@@ -609,7 +633,7 @@ impl VaapiEncoder {
 
 /// An access unit that opens a stream the receivers accept: Annex B, IDR with SPS and PPS,
 /// Constrained Baseline.
-fn check_keyframe(au: &[u8]) -> Result<(), String> {
+pub(crate) fn check_keyframe(au: &[u8]) -> Result<(), String> {
     if !matches!(au, [0, 0, 1, ..] | [0, 0, 0, 1, ..]) {
         return Err("saída sem start code".into());
     }
