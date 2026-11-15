@@ -162,6 +162,13 @@ pub fn mute_output() -> bool {
     *ON.get_or_init(|| env("LITECORD_TEST_MUTE_OUTPUT").is_some())
 }
 
+/// An interface sound that was asked for while output is muted, so it was not played:
+/// event `ui_sound:<pack>:<sound>`, for example `ui_sound:glass-bell:JoinChannel`
+/// (pack `off` would have played nothing unmuted either).
+pub fn ui_sound_muted(pack: &str, sound: &str) {
+    record(&format!("ui_sound:{pack}:{sound}"), 0, false);
+}
+
 struct VoiceLog {
     file: std::io::BufWriter<std::fs::File>,
     t0: Instant,

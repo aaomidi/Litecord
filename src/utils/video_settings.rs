@@ -48,6 +48,11 @@ pub struct VideoSettings {
     pub stream_max_bitrate_mbps: Option<u32>,
     #[serde(default, deserialize_with = "lenient")]
     pub stream_profile: Option<String>,
+    /// Which interface sounds play: "soft-mallet", "glass-bell", "breath-pad" or "off" (see
+    /// `UiSoundPack`). None (never set, or not text in the file) and any other text are the
+    /// default pack.
+    #[serde(default, deserialize_with = "lenient")]
+    pub ui_sound_pack: Option<String>,
 }
 
 /// Position in physical pixels (a logical position is ambiguous across monitors with
@@ -141,6 +146,38 @@ pub enum StreamProfile {
     Efficient,
 }
 
+/// The set of interface sounds (mute, deafen, join and leave; audio::sound_effects).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiSoundPack {
+    SoftMallet,
+    GlassBell,
+    BreathPad,
+    /// No interface sounds at all.
+    Off,
+}
+
+impl UiSoundPack {
+    /// The pack a `ui_sound_pack` value stands for: the default for none or an unknown one.
+    pub fn from_setting(value: Option<&str>) -> Self {
+        match value {
+            Some("glass-bell") => Self::GlassBell,
+            Some("breath-pad") => Self::BreathPad,
+            Some("off") => Self::Off,
+            _ => Self::SoftMallet,
+        }
+    }
+
+    /// The value kept in the settings file, also the id of the option in the settings page.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::SoftMallet => "soft-mallet",
+            Self::GlassBell => "glass-bell",
+            Self::BreathPad => "breath-pad",
+            Self::Off => "off",
+        }
+    }
+}
+
 impl Default for VideoSettings {
     fn default() -> Self {
         Self {
@@ -161,6 +198,7 @@ impl Default for VideoSettings {
             stream_min_qp: None,
             stream_max_bitrate_mbps: None,
             stream_profile: None,
+            ui_sound_pack: None,
         }
     }
 }
@@ -434,6 +472,18 @@ pub fn set_stream_profile(val: String) {
     save_video_settings(&store);
 }
 
+/// Read each time an interface sound plays, so a change applies to the next sound.
+pub fn get_ui_sound_pack() -> UiSoundPack {
+    UiSoundPack::from_setting(get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner()).ui_sound_pack.as_deref())
+}
+
+pub fn set_ui_sound_pack(id: &str) {
+    let pack = UiSoundPack::from_setting(Some(id));
+    let mut store = get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner());
+    store.ui_sound_pack = Some(pack.id().to_string());
+    save_video_settings(&store);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,5 +527,22 @@ mod tests {
         // A file from upstream, without the fork's settings.
         let (s, damaged) = load("");
         assert!(!damaged && s.allow_web_link_requests && s.use_light_theme);
+    }
+
+    #[test]
+    fn the_sound_pack_falls_back_to_the_default_without_costing_other_settings() {
+        let pack = |s: &VideoSettings| UiSoundPack::from_setting(s.ui_sound_pack.as_deref());
+        for (id, expected) in [("soft-mallet", UiSoundPack::SoftMallet), ("glass-bell", UiSoundPack::GlassBell), ("breath-pad", UiSoundPack::BreathPad), ("off", UiSoundPack::Off)] {
+            let (s, damaged) = load(&format!(r#","ui_sound_pack":"{id}""#));
+            assert!(!damaged && pack(&s) == expected && expected.id() == id, "{id}");
+        }
+        // Missing (an older file), unknown text (the removed original set included), not text.
+        for rest in ["", r#","ui_sound_pack":"original""#, r#","ui_sound_pack":"Glass-Bell""#, r#","ui_sound_pack":"""#, r#","ui_sound_pack":null"#, r#","ui_sound_pack":3"#, r#","ui_sound_pack":false"#, r#","ui_sound_pack":["off"]"#] {
+            let (s, damaged) = load(&format!(r#","allow_web_link_requests":false,"stream_min_qp":24{rest}"#));
+            assert!(!damaged, "{rest}");
+            assert_eq!(pack(&s), UiSoundPack::SoftMallet, "{rest}");
+            assert_eq!((s.video_encoder.as_str(), s.use_light_theme, s.noise_suppression.as_str(), s.allow_web_link_requests, s.stream_min_qp), ("openh264", true, "standard", false, Some(24)), "{rest}");
+        }
+        assert_eq!(pack(&VideoSettings::default()), UiSoundPack::SoftMallet);
     }
 }

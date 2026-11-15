@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use log::{info, warn};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use crate::utils::video_settings::{get_ui_sound_pack, UiSoundPack};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiSound {
@@ -15,7 +16,10 @@ pub enum UiSound {
     LeaveChannel,
 }
 
-static SOUND_SENDER: std::sync::OnceLock<SyncSender<UiSound>> = std::sync::OnceLock::new();
+/// A sound and the pack (never `Off`) that was selected when it was asked for.
+type Cue = (UiSoundPack, UiSound);
+
+static SOUND_SENDER: std::sync::OnceLock<SyncSender<Cue>> = std::sync::OnceLock::new();
 
 /// Initializes the background audio thread for instant, zero-latency UI sound playback.
 pub fn init_sound_effects() {
@@ -23,7 +27,7 @@ pub fn init_sound_effects() {
         return;
     }
 
-    let (tx, rx) = sync_channel::<UiSound>(16);
+    let (tx, rx) = sync_channel::<Cue>(16);
     let _ = SOUND_SENDER.set(tx);
 
     std::thread::Builder::new()
@@ -31,39 +35,61 @@ pub fn init_sound_effects() {
         .spawn(move || {
             info!("🔊 [SOUND EFFECTS] Motor de áudio tátil iniciado com sucesso via CPAL");
 
-            while let Ok(sound) = rx.recv() {
+            while let Ok(cue) = rx.recv() {
                 // Drain any excessive queued sounds to only play the latest if flooded
-                let mut current_sound = sound;
+                let (mut pack, mut current_sound) = cue;
                 while let Ok(next) = rx.try_recv() {
-                    current_sound = next;
+                    (pack, current_sound) = next;
                 }
 
-                if let Err(e) = play_sound_cpal(current_sound) {
+                if let Err(e) = play_sound_cpal(pack, current_sound) {
                     warn!("⚠️ [SOUND EFFECTS] Falha na reprodução CPAL ({:?}), tentando fallback nativo...", e);
-                    play_sound_fallback(current_sound);
+                    play_sound_fallback(pack, current_sound);
                 }
             }
         })
         .expect("Falha ao iniciar thread de áudio de efeitos sonoros");
 }
 
-/// Plays a tactile UI sound effect immediately.
+/// Plays a tactile UI sound effect immediately, from the sound pack chosen in the settings.
 pub fn play_ui_sound(sound: UiSound) {
     #[cfg(feature = "automation")]
     if crate::utils::test_hooks::mute_output() || crate::utils::test_hooks::silent_playback() {
+        // Still nothing is played; the voice log only notes what would have been.
+        crate::utils::test_hooks::ui_sound_muted(get_ui_sound_pack().id(), &format!("{sound:?}"));
+        return;
+    }
+    // Read for every sound, so a change in the settings applies to the next one.
+    let pack = get_ui_sound_pack();
+    if pack == UiSoundPack::Off {
+        // Nothing is queued: the player thread is not woken and no output stream is opened.
         return;
     }
     if let Some(sender) = SOUND_SENDER.get() {
-        let _ = sender.try_send(sound);
+        let _ = sender.try_send((pack, sound));
     } else {
         init_sound_effects();
         if let Some(sender) = SOUND_SENDER.get() {
-            let _ = sender.try_send(sound);
+            let _ = sender.try_send((pack, sound));
         } else {
-            play_sound_fallback(sound);
+            play_sound_fallback(pack, sound);
         }
     }
 }
+
+/// The samples of `sound` in `pack`: mono, full scale = 1.0, at `sample_rate` Hz. Every
+/// pack starts and ends its buffers with exact silence and stays below 0.2 of full scale
+/// (the tests at the end of this file render all of them and check). Nothing for `Off`.
+fn generate_sound_samples(pack: UiSoundPack, sound: UiSound, sample_rate: u32) -> Vec<f32> {
+    match pack {
+        UiSoundPack::SoftMallet => soft_mallet_samples(sound, sample_rate),
+        UiSoundPack::GlassBell => glass_bell_samples(sound, sample_rate),
+        UiSoundPack::BreathPad => breath_pad_samples(sound, sample_rate),
+        UiSoundPack::Off => Vec::new(),
+    }
+}
+
+// Pack "soft-mallet" (the default).
 
 /// UI tones, "soft mallet" set: every sound is two gentle strikes of a felted
 /// mallet on a wooden bar ("tok-dong"). The second strike is the one that lands.
@@ -90,7 +116,7 @@ pub fn play_ui_sound(sound: UiSound) {
 /// 15 ms of exact silence so that opening and closing the output stream cannot
 /// click. Everything is in seconds and Hz, so the result is the same at any
 /// sample rate.
-fn generate_sound_samples(sound: UiSound, sample_rate: u32) -> Vec<f32> {
+fn soft_mallet_samples(sound: UiSound, sample_rate: u32) -> Vec<f32> {
     // Exact silence after the last strike has faded out.
     const LEAD_OUT: f64 = 0.015;
 
@@ -237,7 +263,275 @@ fn mallet_sample(voice: &MalletVoice, t: f64, rate: f64) -> f64 {
     voice.gain * mallet_window(x, voice.attack, voice.len) * decay * wave
 }
 
-fn play_sound_cpal(sound: UiSound) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+// Pack "glass-bell".
+
+/// Synthesises a UI tone as mono f32 samples at the device sample rate.
+///
+/// The set is six quiet glass chimes built from one just-intonation pentatonic
+/// scale (A4 = 440 Hz), so every interval is beat-free and the sounds belong together:
+///
+/// * Mute / Unmute         - two close notes a major third apart (E5 <-> C5), ~0.3 s
+/// * Deafen / Undeafen     - two slow, low, rounder notes a fifth apart (D5 <-> G4), ~0.45 s
+/// * Leave / Join channel  - quick three-note ripple over an octave (A5 <-> E5 <-> A4), ~0.45 s
+///
+/// Falling means off / leaving, rising means on / arriving; each pair is the same
+/// notes in reverse order.
+///
+/// Everything is expressed in seconds and Hz, so the result is the same sound at any
+/// sample rate. Notes are summed into the buffer (never spliced), each one swells in
+/// with a raised cosine and fades to exactly zero, and the buffer starts and ends with
+/// digital silence so opening / dropping the output stream cannot click or clip the tail.
+fn glass_bell_samples(sound: UiSound, sample_rate: u32) -> Vec<f32> {
+    // Just-intonation pitches in Hz (ratios 3:2, 4:3, 5:4, 2:1 between the notes used together).
+    const G4: f64 = 396.0;
+    const A4: f64 = 440.0;
+    const C5: f64 = 528.0;
+    const D5: f64 = 594.0;
+    const E5: f64 = 660.0;
+    const A5: f64 = 880.0;
+
+    /// Peak amplitude of a 528 Hz note. Higher notes are scaled down and lower notes up
+    /// (see below) so all notes are about equally loud; the loudest sound of the set
+    /// peaks near 0.16 of full scale (-16 dBFS).
+    const LEVEL: f64 = 0.13;
+    const LEVEL_REF_HZ: f64 = 528.0;
+    /// Notes before the last one are slightly softer, so the last note is the "landing".
+    const LEAD_IN_GAIN: f64 = 0.8;
+    /// Digital silence before the first note and after the last one, in seconds. The
+    /// trailing part is longer because the player drops the stream shortly after handing
+    /// over the last sample, while the end of the buffer may still be queued in the device.
+    const LEAD_SILENCE: f64 = 0.008;
+    const TRAIL_SILENCE: f64 = 0.030;
+
+    // (notes low -> high, seconds between note onsets, swell time, decay time constant,
+    //  total buffer length, level of the upper partials)
+    let (rising, gap, swell, tau, total, brightness): (&[f64], f64, f64, f64, f64, f64) = match sound {
+        UiSound::Mute | UiSound::Unmute => (&[C5, E5], 0.100, 0.036, 0.046, 0.300, 1.0),
+        UiSound::Deafen | UiSound::Undeafen => (&[G4, D5], 0.160, 0.048, 0.068, 0.450, 0.5),
+        UiSound::JoinChannel | UiSound::LeaveChannel => (&[A4, E5, A5], 0.085, 0.036, 0.066, 0.450, 1.0),
+    };
+    let falling = matches!(sound, UiSound::Mute | UiSound::Deafen | UiSound::LeaveChannel);
+
+    let sr = sample_rate.max(1) as f64;
+    let mut samples = vec![0.0f32; (total * sr).round() as usize];
+
+    // Every note rings on underneath the following ones and they all reach zero together.
+    let end = total - TRAIL_SILENCE;
+    let count = rising.len();
+    let release = 0.4 * (end - (LEAD_SILENCE + gap * (count - 1) as f64));
+    for slot in 0..count {
+        let freq = if falling { rising[count - 1 - slot] } else { rising[slot] };
+        let onset = LEAD_SILENCE + gap * slot as f64;
+        let slot_gain = if slot + 1 == count { 1.0 } else { LEAD_IN_GAIN };
+        let level = LEVEL * slot_gain * (LEVEL_REF_HZ / freq).sqrt();
+        add_chime(&mut samples, sr, onset, end, freq, level, swell, tau, release, brightness);
+    }
+
+    samples
+}
+
+/// Adds one glass-chime note to `samples`: a sine with a little 2nd and 3rd harmonic
+/// that die away two and three times faster than the fundamental.
+///
+/// Envelope = raised-cosine swell (`swell` s) x exponential decay (`tau` s) x raised-cosine
+/// release over the last `release` s before `end`. It is smooth (continuous slope)
+/// everywhere and exactly zero at `onset` and at `end`; `level` is its true peak.
+#[allow(clippy::too_many_arguments)]
+fn add_chime(
+    samples: &mut [f32],
+    sr: f64,
+    onset: f64,
+    end: f64,
+    freq: f64,
+    level: f64,
+    swell: f64,
+    tau: f64,
+    release: f64,
+    brightness: f64,
+) {
+    use std::f64::consts::{PI, TAU};
+
+    /// Starting level of the 2nd / 3rd harmonic relative to the fundamental. Because they
+    /// decay faster, they are down to roughly -17 dB / -30 dB when the note peaks and gone
+    /// soon after, leaving a pure sine tail.
+    const SECOND: f64 = 0.26;
+    const THIRD: f64 = 0.10;
+
+    // The swell x decay product peaks slightly before the swell completes; normalise by
+    // that maximum so `level` is the real peak of the fundamental's envelope.
+    let t_peak = (2.0 * swell / PI) * (PI * tau / swell).atan();
+    let norm = level / ((0.5 - 0.5 * (PI * t_peak / swell).cos()) * (-t_peak / tau).exp());
+
+    let first = (onset * sr).ceil().max(0.0) as usize;
+    let last = ((end * sr).ceil().max(0.0) as usize).min(samples.len());
+    for (i, out) in samples.iter_mut().enumerate().take(last).skip(first) {
+        let t = i as f64 / sr - onset;
+        let left = end - onset - t;
+        if left <= 0.0 {
+            break;
+        }
+        let rise = if t < swell { 0.5 - 0.5 * (PI * t / swell).cos() } else { 1.0 };
+        let fall = if left < release { 0.5 - 0.5 * (PI * left / release).cos() } else { 1.0 };
+
+        let decay = (-t / tau).exp();
+        let (s, c) = (TAU * freq * t).sin_cos();
+        let second = 2.0 * s * c; // sin(2x)
+        let third = s * (3.0 - 4.0 * s * s); // sin(3x)
+        let tone = decay
+            * (s + brightness * decay * (SECOND * second + THIRD * decay * third));
+
+        *out += (norm * rise * fall * tone) as f32;
+    }
+}
+
+// Pack "breath-pad".
+
+/// Synthesises one UI cue as mono samples at `sample_rate` Hz.
+///
+/// All six cues are the same quiet gesture: two soft sine notes, the second
+/// swelling in while the first is still fading. "Off" cues (mute, deafen,
+/// leave) step down; the matching "on" cue plays the same two notes in the
+/// opposite order. The three families differ in register, interval and pace:
+///
+/// | family            | notes (Hz)   | interval    | character              |
+/// |-------------------|--------------|-------------|------------------------|
+/// | mute / unmute     | 440, 550     | major third | middle, quick, legato  |
+/// | deafen / undeafen | 293.3, 440   | fifth       | low, slow, humming     |
+/// | join / leave      | 660, 880     | fourth      | higher, lightly struck |
+///
+/// Every envelope is a raised cosine in and a raised cosine (to a power) out,
+/// so each note starts and ends at exactly zero with no step in level or slope.
+/// All timing is in seconds and all pitch in Hz, so a cue sounds the same at
+/// any device sample rate.
+fn breath_pad_samples(sound: UiSound, sample_rate: u32) -> Vec<f32> {
+    /// Silence before the first note, so a stream that is still starting up
+    /// has nothing to clip.
+    const LEAD_SILENCE: f64 = 0.010;
+    /// Silence after the last note, so the stream is only ever closed on
+    /// silence. (`play_sound_cpal` keeps the stream open until the device has
+    /// played everything it was handed, so a few ms are enough.)
+    const TAIL_SILENCE: f64 = 0.010;
+    /// Peak amplitude of a 500 Hz note, full scale = 1.0 (about -19 dBFS).
+    const LEVEL: f64 = 0.11;
+    /// The first note is a pickup into the second, so it is a little softer.
+    const PICKUP: f64 = 0.8;
+
+    struct Family {
+        low: f64,
+        high: f64,
+        /// Seconds between the two note onsets.
+        gap: f64,
+        /// Swell time of the first and of the second note, seconds.
+        swell: [f64; 2],
+        /// Fade time of the first and of the second note, seconds.
+        fade: [f64; 2],
+        /// Fade curve exponent: higher drops sooner and trails off longer.
+        fade_power: i32,
+        /// Amount of octave partial at the peak of a note.
+        warmth: f64,
+    }
+
+    // Pitches are the ratios 8 : 12 : 15 : 18 : 24 over A4 = 440 Hz.
+    const MUTE: Family = Family {
+        low: 440.0,
+        high: 550.0,
+        gap: 0.074,
+        swell: [0.036, 0.042],
+        fade: [0.150, 0.134],
+        fade_power: 2,
+        warmth: 0.05,
+    };
+    const DEAFEN: Family = Family {
+        low: 440.0 * 2.0 / 3.0,
+        high: 440.0,
+        gap: 0.150,
+        swell: [0.050, 0.064],
+        fade: [0.270, 0.200],
+        fade_power: 2,
+        warmth: 0.10,
+    };
+    const JOIN: Family = Family {
+        low: 660.0,
+        high: 880.0,
+        gap: 0.115,
+        swell: [0.026, 0.026],
+        fade: [0.230, 0.256],
+        fade_power: 3,
+        warmth: 0.03,
+    };
+
+    let (family, rising) = match sound {
+        UiSound::Mute => (&MUTE, false),
+        UiSound::Unmute => (&MUTE, true),
+        UiSound::Deafen => (&DEAFEN, false),
+        UiSound::Undeafen => (&DEAFEN, true),
+        UiSound::JoinChannel => (&JOIN, true),
+        UiSound::LeaveChannel => (&JOIN, false),
+    };
+    let pitches = if rising {
+        [family.low, family.high]
+    } else {
+        [family.high, family.low]
+    };
+    let onsets = [0.0, family.gap];
+    // The ear is less sensitive towards the low end of this range, so lower
+    // notes get slightly more level (3 dB per octave).
+    let levels = [
+        PICKUP * LEVEL * (500.0 / pitches[0]).sqrt(),
+        LEVEL * (500.0 / pitches[1]).sqrt(),
+    ];
+    // The second note always outlasts the first.
+    let length = family.gap + family.swell[1] + family.fade[1];
+
+    let rate = sample_rate as f64;
+    let total = ((LEAD_SILENCE + length + TAIL_SILENCE) * rate).ceil() as usize;
+
+    (0..total)
+        .map(|i| {
+            let t = i as f64 / rate - LEAD_SILENCE;
+            let first = levels[0]
+                * soft_note(
+                    t - onsets[0],
+                    pitches[0],
+                    family.swell[0],
+                    family.fade[0],
+                    family.fade_power,
+                    family.warmth,
+                );
+            let second = levels[1]
+                * soft_note(
+                    t - onsets[1],
+                    pitches[1],
+                    family.swell[1],
+                    family.fade[1],
+                    family.fade_power,
+                    family.warmth,
+                );
+            (first + second) as f32
+        })
+        .collect()
+}
+
+/// One note of a UI cue, `t` seconds after its onset: a sine that swells in
+/// along a raised cosine over `swell` seconds and fades to exactly zero over
+/// `fade` seconds. `warmth` adds an octave partial that follows the square of
+/// the envelope, so it arrives later and dies away sooner than the note itself.
+fn soft_note(t: f64, freq: f64, swell: f64, fade: f64, fade_power: i32, warmth: f64) -> f64 {
+    use std::f64::consts::{PI, TAU};
+
+    if t <= 0.0 || t >= swell + fade {
+        return 0.0;
+    }
+    let envelope = if t < swell {
+        0.5 - 0.5 * (PI * t / swell).cos()
+    } else {
+        (0.5 + 0.5 * (PI * (t - swell) / fade).cos()).powi(fade_power)
+    };
+    let phase = TAU * freq * t;
+    envelope * (phase.sin() + warmth * envelope * (2.0 * phase).sin())
+}
+
+fn play_sound_cpal(pack: UiSoundPack, sound: UiSound) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let host = cpal::default_host();
     let target_dev_name = if let Ok(guard) = crate::gateway::get_selected_output_device_store().lock() {
         guard.clone()
@@ -255,7 +549,7 @@ fn play_sound_cpal(sound: UiSound) -> Result<(), Box<dyn std::error::Error + Sen
     let sample_rate = config.sample_rate().0;
     let channels = config.channels() as usize;
 
-    let samples = generate_sound_samples(sound, sample_rate);
+    let samples = generate_sound_samples(pack, sound, sample_rate);
     let total_samples = samples.len();
     let samples_arc = Arc::new(samples);
 
@@ -342,13 +636,13 @@ fn play_sound_cpal(sound: UiSound) -> Result<(), Box<dyn std::error::Error + Sen
     Ok(())
 }
 
-fn play_sound_fallback(sound: UiSound) {
+fn play_sound_fallback(pack: UiSoundPack, sound: UiSound) {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Media::Audio::{PlaySoundA, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
 
         let sample_rate = 44100u32;
-        let samples = generate_sound_samples(sound, sample_rate);
+        let samples = generate_sound_samples(pack, sound, sample_rate);
         let mut wav = Vec::with_capacity(44 + samples.len() * 2);
 
         let data_size = (samples.len() * 2) as u32;
@@ -387,7 +681,7 @@ fn play_sound_fallback(sound: UiSound) {
     #[cfg(not(windows))]
     {
         let sample_rate = 44100u32;
-        let samples = generate_sound_samples(sound, sample_rate);
+        let samples = generate_sound_samples(pack, sound, sample_rate);
         let mut wav = Vec::with_capacity(44 + samples.len() * 2);
 
         let data_size = (samples.len() * 2) as u32;
@@ -429,6 +723,105 @@ fn play_sound_fallback(sound: UiSound) {
                 let _ = child.wait();
                 break;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SOUNDS: [(UiSound, &str); 6] = [
+        (UiSound::Mute, "mute"),
+        (UiSound::Unmute, "unmute"),
+        (UiSound::Deafen, "deafen"),
+        (UiSound::Undeafen, "undeafen"),
+        (UiSound::JoinChannel, "join"),
+        (UiSound::LeaveChannel, "leave"),
+    ];
+    const PACKS: [UiSoundPack; 3] = [UiSoundPack::SoftMallet, UiSoundPack::GlassBell, UiSoundPack::BreathPad];
+    const RATES: [u32; 3] = [44_100, 48_000, 96_000];
+
+    /// Renders every sound of every pack in memory; no audio device is touched. Run with
+    /// `-- --nocapture` for the measured table. With LITECORD_SOUND_DUMP_DIR set, each
+    /// buffer is also written there as `<pack>/<sound>_<rate>.f32` (raw mono f32), to be
+    /// analysed outside.
+    #[test]
+    fn every_pack_is_quiet_and_starts_and_ends_in_silence() {
+        let dump = std::env::var_os("LITECORD_SOUND_DUMP_DIR").map(std::path::PathBuf::from);
+        println!("pack         sound     rate   seconds  peak    silent start / end (ms)");
+        for pack in PACKS {
+            for (sound, name) in SOUNDS {
+                for rate in RATES {
+                    let samples = generate_sound_samples(pack, sound, rate);
+                    let what = format!("{} {name} at {rate} Hz", pack.id());
+                    let ms = |count: usize| count as f64 * 1000.0 / f64::from(rate);
+                    let seconds = ms(samples.len()) / 1000.0;
+                    let peak = samples.iter().fold(0.0f32, |max, s| max.max(s.abs()));
+                    let silent_start = samples.iter().take_while(|s| **s == 0.0).count();
+                    let silent_end = samples.iter().rev().take_while(|s| **s == 0.0).count();
+                    println!(
+                        "{:<12} {name:<9} {rate}  {seconds:.4}   {peak:.4}  {:.2} / {:.2}",
+                        pack.id(),
+                        ms(silent_start),
+                        ms(silent_end),
+                    );
+
+                    assert!(samples.iter().all(|s| s.is_finite()), "{what}: NaN or infinity");
+                    assert!((0.1..=1.2).contains(&seconds), "{what}: {seconds} s long");
+                    // At most 0.2 of full scale (the upstream set peaked at 0.6-0.75), and audible.
+                    assert!(peak <= 0.2, "{what}: peak {peak}");
+                    assert!(peak >= 0.05, "{what}: peak {peak}, close to silent");
+                    // Exact zeros at both ends, so opening and closing the stream cannot click.
+                    assert!(ms(silent_start) >= 4.0, "{what}: only {silent_start} silent samples at the start");
+                    assert!(ms(silent_end) >= 8.0, "{what}: only {silent_end} silent samples at the end");
+
+                    if let Some(dir) = &dump {
+                        let dir = dir.join(pack.id());
+                        std::fs::create_dir_all(&dir).unwrap();
+                        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+                        std::fs::write(dir.join(format!("{name}_{rate}.f32")), bytes).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    /// The largest difference between two buffers, a missing sample counting as silence.
+    fn difference(a: &[f32], b: &[f32]) -> f32 {
+        (0..a.len().max(b.len()))
+            .map(|i| (a.get(i).copied().unwrap_or(0.0) - b.get(i).copied().unwrap_or(0.0)).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn packs_and_sounds_differ_from_each_other() {
+        for rate in RATES {
+            // The same sound in two packs.
+            for (sound, name) in SOUNDS {
+                for (i, a) in PACKS.iter().enumerate() {
+                    for b in &PACKS[i + 1..] {
+                        let d = difference(&generate_sound_samples(*a, sound, rate), &generate_sound_samples(*b, sound, rate));
+                        assert!(d > 0.05, "{name} at {rate} Hz: {} and {} differ by only {d}", a.id(), b.id());
+                    }
+                }
+            }
+            // Two sounds of the same pack.
+            for pack in PACKS {
+                for (i, (a, a_name)) in SOUNDS.iter().enumerate() {
+                    for (b, b_name) in &SOUNDS[i + 1..] {
+                        let d = difference(&generate_sound_samples(pack, *a, rate), &generate_sound_samples(pack, *b, rate));
+                        assert!(d > 0.05, "{} at {rate} Hz: {a_name} and {b_name} differ by only {d}", pack.id());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn off_renders_nothing() {
+        for (sound, _) in SOUNDS {
+            assert!(generate_sound_samples(UiSoundPack::Off, sound, 48_000).is_empty());
         }
     }
 }
