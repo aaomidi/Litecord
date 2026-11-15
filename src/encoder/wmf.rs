@@ -157,6 +157,9 @@ impl WmfGpuEncoder {
     }
 
     unsafe fn open_on(act: &IMFActivate, device: ID3D11Device, bt709: bool, width: u32, height: u32, target_fps: u32, bitrate_bps: u32) -> Result<Self> {
+        // The range `set_bitrate_bps` keeps to: a stream may ask for more than this encoder
+        // has been run at, and would fall from there to 8 Mbps at its first change.
+        let bitrate_bps = bitrate_bps.clamp(1_500_000, 8_000_000);
         let context = device.GetImmediateContext()?;
         let _ = context.cast::<ID3D11Multithread>()?.SetMultithreadProtected(true);
         let mut token = 0u32;

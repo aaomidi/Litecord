@@ -268,7 +268,10 @@ impl ScreenCaptureManager {
         super::gpu_tx::begin_stream(
             camera_index.is_none() && super::gpu_capture::choice() != super::gpu_capture::Choice::Cpu,
         );
-        REQUESTED_BITRATE_BPS.store(MAX_STREAM_BITRATE, Ordering::Relaxed);
+        // The stream settings as they are now: changing them later is for the next share.
+        let max_bitrate = crate::video_settings::get_stream_max_bitrate_bps();
+        let stream_profile = crate::video_settings::get_stream_profile();
+        REQUESTED_BITRATE_BPS.store(max_bitrate, Ordering::Relaxed);
         force_signaling_broadcast();
 
         let on_local_arc: Arc<dyn Fn(SharedPixelBuffer<Rgba8Pixel>) + Send + Sync + 'static> = Arc::new(on_local_frame);
@@ -812,9 +815,12 @@ impl ScreenCaptureManager {
                 let frame_target_interval = Duration::from_micros(1_000_000 / target_fps.max(1));
                 let mut next_tick = Instant::now();
                 let mut latest_cached_frame: Option<(Vec<u8>, u32, u32, u128, u128)> = None;
-                let mut rate = super::watch::RateControl::new(MAX_STREAM_BITRATE);
+                let mut rate = super::watch::RateControl::new(max_bitrate);
                 let mut last_rate_update = Instant::now();
                 let mut was_watched = false;
+                let mut profile_choice = super::watch::ProfileChoice::new(stream_profile);
+                // The rate last handed to the encoder.
+                let mut asked_bitrate = 0u32;
 
                 while is_running.load(Ordering::Relaxed) {
                     let mut cid = channel_id_atomic.load(Ordering::Relaxed);
@@ -1020,13 +1026,21 @@ impl ScreenCaptureManager {
                         if bps != before {
                             info!("📶 [ABR] Taxa da transmissão: {:.1} -> {:.1} Mbps (pior perda entre espectadores: {:?}‰)", before as f64 / 1e6, bps as f64 / 1e6, super::watch::worst_loss());
                         }
-                        REQUESTED_BITRATE_BPS.store(bps, Ordering::Relaxed);
                     }
 
                     // Nobody watching (natively or in a browser): no encoding, nothing sent.
                     // The first viewer to arrive asks for a keyframe.
-                    let viewer_addrs = super::watch::viewer_addrs();
-                    let watched = !viewer_addrs.is_empty() || super::web_share::viewer_count() > 0;
+                    // Who gets this turn's picture and what they decode are read together and
+                    // before encoding: a viewer that cannot decode Main is on these lists only
+                    // in turns that encode Constrained Baseline.
+                    let (viewer_addrs, viewers_decode_main) = super::watch::viewers_now();
+                    let web_viewers = super::web_share::viewer_count();
+                    let watched = !viewer_addrs.is_empty() || web_viewers > 0;
+                    let efficient = profile_choice.update(watched, viewers_decode_main && web_viewers == 0, Instant::now());
+                    // Browsers report no loss, so nothing would bring a higher rate down for
+                    // them, and a keyframe has to fit their packet buffers.
+                    let rate_cap = if web_viewers > 0 { WEB_VIEWER_MAX_BITRATE } else { u32::MAX };
+                    REQUESTED_BITRATE_BPS.store(rate.current().min(rate_cap), Ordering::Relaxed);
                     if watched != was_watched {
                         was_watched = watched;
                         TX_WATCHED.store(watched, Ordering::Relaxed);
@@ -1062,9 +1076,13 @@ impl ScreenCaptureManager {
                     } else if let Some((bgra_slice, cur_w, cur_h, _, _)) = cpu_frame.filter(|_| encode_now) {
                         let enc = h264_encoder.get_or_insert_with(|| crate::encoder::create_best_encoder(target_fps as u32, camera_index.is_none()));
                         let target_bitrate = REQUESTED_BITRATE_BPS.load(Ordering::Relaxed);
-                        if enc.get_bitrate_bps() != target_bitrate {
+                        // OpenH264 ignores changes for a while and is asked on every frame; a GPU
+                        // encoder with a lower limit of its own is told each new rate once.
+                        if enc.get_bitrate_bps() != target_bitrate && (target_bitrate != asked_bitrate || !enc.is_hardware_accelerated()) {
                             enc.set_bitrate_bps(target_bitrate);
+                            asked_bitrate = target_bitrate;
                         }
+                        enc.set_efficient_profile(efficient);
                         if KEYFRAME_REQUESTED.swap(false, Ordering::Relaxed) || last_idr.elapsed() >= Duration::from_millis(2000) {
                             last_idr = Instant::now();
                             enc.force_intra_frame();
@@ -1077,8 +1095,11 @@ impl ScreenCaptureManager {
                     total_encode_us += enc_dur;
 
                     if let Some(raw_frame_bytes) = frame_bytes_opt {
-                        // Browsers watching over WebRTC get the same encoded frame.
-                        super::web_share::offer_frame(&raw_frame_bytes);
+                        // Browsers watching over WebRTC get the same encoded frame: those counted
+                        // before it was encoded (one that connected since waits for the next).
+                        if web_viewers > 0 {
+                            super::web_share::offer_frame(&raw_frame_bytes);
+                        }
                         let t_crypt_start = Instant::now();
                         let Some(frame_bytes) = super::watch::session_key().and_then(|k| encrypt_signaling_payload(&k, &raw_frame_bytes)) else {
                             continue;
@@ -2225,12 +2246,15 @@ impl ScreenCaptureManager {
                                 OP_WATCH => {
                                     if len >= 65 && is_tx_running.load(Ordering::Relaxed) && u64::from_be_bytes(recv_buf[25..33].try_into().unwrap()) == my_uid {
                                         let viewer_public: [u8; 32] = recv_buf[33..65].try_into().unwrap();
+                                        // One capability byte after the key; clients without it
+                                        // (65 bytes) have none. Unknown bits and more bytes are ignored.
+                                        let caps = if len > 65 { recv_buf[65] } else { 0 };
                                         let in_channel = in_my_voice_channel(pkt_uid, my_current_cid);
-                                        match super::watch::on_watch(pkt_uid, viewer_public, src_addr, in_channel) {
+                                        match super::watch::on_watch(pkt_uid, viewer_public, src_addr, caps, in_channel) {
                                             Some(super::watch::Verdict::Accepted { new }) => {
                                                 if new {
-                                                    info!("👀 [ASSISTIR SOB DEMANDA] UID={} começou a assistir (de {}).", pkt_uid, src_addr);
-                                                    KEYFRAME_REQUESTED.store(true, Ordering::Relaxed);
+                                                    // Its keyframe was asked for by `on_watch`.
+                                                    info!("👀 [ASSISTIR SOB DEMANDA] UID={} começou a assistir (de {}, decodifica H.264 Main: {}).", pkt_uid, src_addr, if caps & super::watch::CAP_H264_MAIN != 0 { "sim" } else { "não" });
                                                     wake_tx();
                                                 }
                                                 let wrapped = super::watch::session_key().zip(pair_key(&viewer_public, my_uid, pkt_uid, my_current_cid))
@@ -2592,8 +2616,9 @@ pub(super) fn capture_pace(frame_interval: Duration) -> Duration {
     if TX_WATCHED.load(Ordering::Relaxed) { frame_interval } else { IDLE_FRAME_INTERVAL.max(frame_interval) }
 }
 
-/// The highest bitrate a stream starts at and climbs back to.
-const MAX_STREAM_BITRATE: u32 = 8_000_000;
+/// The highest bitrate of a stream while a browser watches it (the rate every stream had
+/// before it became a setting).
+const WEB_VIEWER_MAX_BITRATE: u32 = 8_000_000;
 
 /// `uid` is in the voice channel `cid` (gateway voice states).
 fn in_my_voice_channel(uid: u64, cid: u64) -> bool {

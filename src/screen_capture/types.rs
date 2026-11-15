@@ -22,7 +22,8 @@ pub const OP_KEYFRAME_REQ: u8 = 6;
 pub const OP_FEC_PARITY: u8 = 7;
 pub const OP_QOS_FEEDBACK: u8 = 8;
 // Protocol 3 (watching on demand, see docs/WATCH_ON_DEMAND.md).
-/// Viewer -> sender, every second while watching: target uid (8) + viewer X25519 public key (32).
+/// Viewer -> sender, every second while watching: target uid (8) + viewer X25519 public key (32)
+/// + one capability byte (`watch::CAP_H264_MAIN`; absent in older clients, which have none).
 pub const OP_WATCH: u8 = 9;
 /// Viewer -> sender: target uid (8). Stops at once instead of waiting for the lease.
 pub const OP_UNWATCH: u8 = 10;
@@ -98,7 +99,7 @@ pub fn request_intra_keyframe() {
 }
 
 pub fn request_bitrate_adjustment(bitrate_bps: u32) {
-    REQUESTED_BITRATE_BPS.store(bitrate_bps.clamp(1_500_000, 12_000_000), Ordering::Relaxed);
+    REQUESTED_BITRATE_BPS.store(bitrate_bps.clamp(1_500_000, crate::video_settings::STREAM_MAX_BITRATE_MBPS_RANGE.1 * 1_000_000), Ordering::Relaxed);
 }
 
 pub fn get_current_bitrate_bps() -> u32 {

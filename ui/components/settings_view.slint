@@ -6,6 +6,7 @@ import {
     SettingsSection, SettingsRow, SettingsSwitch, SettingsSwitchRow, SettingsButton,
     OptionSelect, DeviceSelect, SettingsInput,
 } from "settings_kit.slint";
+import { StreamQualitySection } from "stream_quality.slint";
 
 export { SettingOptionItem, AudioDeviceItem }
 
@@ -398,6 +399,8 @@ export component SettingsView inherits Rectangle {
                                     wrap: word-wrap;
                                 }
                             }
+
+                            StreamQualitySection { }
 
                             SettingsSection {
                                 title: Tr.settings_advanced;

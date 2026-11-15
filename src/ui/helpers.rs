@@ -495,6 +495,29 @@ pub fn populate_video_interface_settings(ui: &AppWindow) {
     ui.set_video_encoder_options(std::rc::Rc::new(slint::VecModel::from(enc_items)).into());
     ui.set_video_capture_options(std::rc::Rc::new(slint::VecModel::from(vcap_items)).into());
     ui.set_audio_loopback_options(std::rc::Rc::new(slint::VecModel::from(aloop_items)).into());
+
+    // Stream quality (advanced): ui/components/stream_quality.slint.
+    {
+        use slint::ComponentHandle;
+        use video_settings::StreamProfile;
+        let quality = ui.global::<crate::StreamQuality>();
+        // The quality floor and the profile only act on the VA-API encoder.
+        quality.set_has_gpu_encoder(cfg!(all(target_os = "linux", feature = "vaapi")));
+        quality.set_min_qp_lowest(video_settings::STREAM_MIN_QP_RANGE.0 as f32);
+        quality.set_min_qp_highest(video_settings::STREAM_MIN_QP_RANGE.1 as f32);
+        quality.set_min_qp_default(video_settings::STREAM_MIN_QP_DEFAULT as f32);
+        quality.set_min_qp(video_settings::get_stream_min_qp() as f32);
+        quality.set_max_bitrate_lowest(video_settings::STREAM_MAX_BITRATE_MBPS_RANGE.0 as f32);
+        quality.set_max_bitrate_highest(video_settings::STREAM_MAX_BITRATE_MBPS_RANGE.1 as f32);
+        quality.set_max_bitrate_default(video_settings::STREAM_MAX_BITRATE_MBPS_DEFAULT as f32);
+        quality.set_max_bitrate(video_settings::get_stream_max_bitrate_mbps() as f32);
+        let profile = match video_settings::get_stream_profile() {
+            StreamProfile::Auto => "auto",
+            StreamProfile::Compatible => "compatible",
+            StreamProfile::Efficient => "efficient",
+        };
+        quality.set_profile(profile.into());
+    }
 }
 
 #[cfg(target_os = "windows")]

@@ -18,6 +18,9 @@ pub const LEASE: Duration = Duration::from_secs(4);
 pub const RENEW_EVERY: Duration = Duration::from_secs(1);
 /// Loss reports older than this no longer count for the bitrate.
 const LOSS_REPORT_AGE: Duration = Duration::from_secs(3);
+/// OP_WATCH capability bit 0: the viewer decodes the H.264 Main streams of the VA-API
+/// sender (CABAC, pic_order_cnt_type 0) correctly and without added delay.
+pub const CAP_H264_MAIN: u8 = 0x01;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
@@ -33,6 +36,8 @@ struct Viewer {
     addr: SocketAddr,
     last_seen: Instant,
     loss: Option<(u16, Instant)>,
+    /// The capability byte of its latest request (0: an older or upstream client).
+    caps: u8,
 }
 
 /// The viewers of one stream.
@@ -55,9 +60,21 @@ impl Viewers {
             return Verdict::KeyMismatch;
         }
         let new = self.list.get(&uid).map_or(true, |v| now.duration_since(v.last_seen) >= LEASE);
-        let loss = self.list.get(&uid).and_then(|v| v.loss);
-        self.list.insert(uid, Viewer { addr, last_seen: now, loss });
+        let (loss, caps) = self.list.get(&uid).map_or((None, 0), |v| (v.loss, v.caps));
+        self.list.insert(uid, Viewer { addr, last_seen: now, loss, caps });
         Verdict::Accepted { new }
+    }
+
+    /// What `uid`'s request said the viewer can do (the OP_WATCH capability byte).
+    pub fn set_caps(&mut self, uid: u64, caps: u8) {
+        if let Some(v) = self.list.get_mut(&uid) {
+            v.caps = caps;
+        }
+    }
+
+    /// Somebody watches and every viewer decodes H.264 Main.
+    pub fn all_decode_main(&self) -> bool {
+        !self.list.is_empty() && self.list.values().all(|v| v.caps & CAP_H264_MAIN != 0)
     }
 
     /// Whether `uid` was watching.
@@ -99,17 +116,25 @@ pub struct RateControl {
     current: u32,
     clean_since: Option<Instant>,
     last_cut: Option<Instant>,
+    /// Cuts since a report last showed less than heavy loss.
+    cuts_in_a_row: u32,
 }
 
 pub const MIN_BITRATE: u32 = 3_000_000;
+/// The smallest step up; a sixteenth of the rate when that is more, so the step is the same
+/// share of a high rate as it is at 8 Mbps and does not jump far past a viewer's link.
 const STEP_UP: u32 = 500_000;
+/// The default maximum, below which every stream moves as it always did. A rate above it
+/// that still loses after two cuts in a row started far above what a viewer's link carries
+/// (a high maximum): it is halved until the loss ends or it is down here.
+const HALVE_ABOVE: u32 = 8_000_000;
 const CLEAN_FOR: Duration = Duration::from_secs(5);
 const HEAVY_LOSS_PERMILLE: u16 = 80;
 const CLEAN_LOSS_PERMILLE: u16 = 20;
 
 impl RateControl {
     pub fn new(max: u32) -> Self {
-        Self { max, current: max, clean_since: None, last_cut: None }
+        Self { max, current: max, clean_since: None, last_cut: None, cuts_in_a_row: 0 }
     }
 
     pub fn current(&self) -> u32 {
@@ -123,22 +148,71 @@ impl RateControl {
                 self.clean_since = None;
                 // One cut per second: reports from several viewers describe the same congestion.
                 if self.last_cut.map_or(true, |t| now.duration_since(t) >= Duration::from_secs(1)) {
-                    self.current = ((self.current as u64 * 4 / 5) as u32).max(MIN_BITRATE.min(self.max));
+                    self.cuts_in_a_row += 1;
+                    let cut = if self.cuts_in_a_row > 2 && self.current > HALVE_ABOVE { self.current / 2 } else { (self.current as u64 * 4 / 5) as u32 };
+                    self.current = cut.max(MIN_BITRATE.min(self.max));
                     self.last_cut = Some(now);
                 }
             }
             Some(l) if l < CLEAN_LOSS_PERMILLE => {
+                self.cuts_in_a_row = 0;
                 let since = *self.clean_since.get_or_insert(now);
                 if now.duration_since(since) >= CLEAN_FOR && self.current < self.max {
-                    self.current = (self.current + STEP_UP).min(self.max);
+                    self.current = (self.current + STEP_UP.max(self.current / 16)).min(self.max);
                     self.clean_since = Some(now);
                 }
             }
-            Some(_) => self.clean_since = None,
+            Some(_) => {
+                self.cuts_in_a_row = 0;
+                self.clean_since = None;
+            }
             // Nobody reporting (no viewers, or no losses measured yet): hold.
             None => {}
         }
         self.current
+    }
+}
+
+/// Which H.264 profile the stream uses now, for encoders that have the choice
+/// (`VideoEncoder::set_efficient_profile`): Main ("efficient") only while every viewer
+/// decodes it.
+pub struct ProfileChoice {
+    mode: crate::video_settings::StreamProfile,
+    efficient: bool,
+    was_watched: bool,
+    capable_since: Option<Instant>,
+}
+
+/// A stream that fell back to Constrained Baseline goes to Main again only after every
+/// viewer has been able to decode it for this long.
+pub const EFFICIENT_AFTER: Duration = Duration::from_secs(5);
+
+impl ProfileChoice {
+    /// `mode`: the stream profile setting; anything but `Auto` overrides the viewers.
+    pub fn new(mode: crate::video_settings::StreamProfile) -> Self {
+        Self { mode, efficient: false, was_watched: false, capable_since: None }
+    }
+
+    /// Whether the encoder should produce Main now. `watched`: somebody is watching;
+    /// `all_decode_main`: every viewer decodes Main (native viewers that said so in their
+    /// watch request, and no browser).
+    pub fn update(&mut self, watched: bool, all_decode_main: bool, now: Instant) -> bool {
+        use crate::video_settings::StreamProfile;
+        self.efficient = match self.mode {
+            StreamProfile::Compatible => false,
+            StreamProfile::Efficient => true,
+            StreamProfile::Auto if !(watched && all_decode_main) => {
+                self.capable_since = None;
+                false
+            }
+            StreamProfile::Auto => {
+                let since = *self.capable_since.get_or_insert(now);
+                // The first viewers of a stream nobody was watching get a keyframe anyway.
+                self.efficient || !self.was_watched || now.duration_since(since) >= EFFICIENT_AFTER
+            }
+        };
+        self.was_watched = watched;
+        self.efficient
     }
 }
 
@@ -165,10 +239,21 @@ pub fn session_key() -> Option<[u8; 32]> {
     SESSION.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| s.key)
 }
 
-/// A watch request; `None` when not streaming.
-pub fn on_watch(uid: u64, public: [u8; 32], addr: SocketAddr, in_channel: bool) -> Option<Verdict> {
+/// A watch request (`caps`: its capability byte); `None` when not streaming. A new viewer's
+/// keyframe is asked for here, before the list is released: the send loop that finds the
+/// viewer on the list finds the request too, so a change of profile and that keyframe are
+/// the same picture.
+pub fn on_watch(uid: u64, public: [u8; 32], addr: SocketAddr, caps: u8, in_channel: bool) -> Option<Verdict> {
     let mut s = SESSION.lock().unwrap_or_else(|e| e.into_inner());
-    Some(s.as_mut()?.viewers.watch(uid, public, addr, in_channel, Instant::now()))
+    let viewers = &mut s.as_mut()?.viewers;
+    let verdict = viewers.watch(uid, public, addr, in_channel, Instant::now());
+    if let Verdict::Accepted { new } = verdict {
+        viewers.set_caps(uid, caps);
+        if new {
+            super::types::request_intra_keyframe();
+        }
+    }
+    Some(verdict)
 }
 
 /// Whether `uid` was watching (UNWATCH is sent three times).
@@ -191,6 +276,19 @@ pub fn viewer_addrs() -> Vec<SocketAddr> {
             s.viewers.addrs()
         }
         None => Vec::new(),
+    }
+}
+
+/// `viewer_addrs` and, read in the same moment, whether every one of those viewers
+/// decodes H.264 Main.
+pub fn viewers_now() -> (Vec<SocketAddr>, bool) {
+    let mut s = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    match s.as_mut() {
+        Some(s) => {
+            s.viewers.expire(Instant::now());
+            (s.viewers.addrs(), s.viewers.all_decode_main())
+        }
+        None => (Vec::new(), false),
     }
 }
 
