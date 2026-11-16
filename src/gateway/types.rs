@@ -462,29 +462,39 @@ pub fn get_user_audio_settings_store() -> Arc<std::sync::Mutex<std::collections:
     }).clone()
 }
 
+/// Counts changes of the per-member audio settings, so the voice output callback only
+/// reads the map again when something changed.
+static USER_AUDIO_SETTINGS_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn user_audio_settings_generation() -> u64 {
+    USER_AUDIO_SETTINGS_GENERATION.load(Ordering::Relaxed)
+}
+
+/// Changes one member's settings and saves the file. The file is written after the lock
+/// is released: the voice output callback reads this map and must not wait for the disk.
+fn update_user_audio_settings(user_id: &str, change: impl FnOnce(&mut (bool, f32, i32))) {
+    let snapshot = match get_user_audio_settings_store().lock() {
+        Ok(mut map) => {
+            change(map.entry(user_id.to_string()).or_insert((false, 1.0, 0)));
+            map.clone()
+        }
+        Err(_) => return,
+    };
+    USER_AUDIO_SETTINGS_GENERATION.fetch_add(1, Ordering::Relaxed);
+    save_persisted_user_audio_settings(&snapshot);
+}
+
 pub fn set_user_mute(user_id: &str, is_muted: bool) {
-    if let Ok(mut map) = get_user_audio_settings_store().lock() {
-        let entry = map.entry(user_id.to_string()).or_insert((false, 1.0, 0));
-        entry.0 = is_muted;
-        save_persisted_user_audio_settings(&map);
-    }
+    update_user_audio_settings(user_id, |entry| entry.0 = is_muted);
 }
 
 pub fn set_user_volume(user_id: &str, volume: f32) {
-    if let Ok(mut map) = get_user_audio_settings_store().lock() {
-        let entry = map.entry(user_id.to_string()).or_insert((false, 1.0, 0));
-        entry.1 = volume;
-        save_persisted_user_audio_settings(&map);
-    }
+    update_user_audio_settings(user_id, |entry| entry.1 = volume);
 }
 
 pub fn set_user_priority(user_id: &str, priority: i32) {
     let safe_priority = priority.max(0);
-    if let Ok(mut map) = get_user_audio_settings_store().lock() {
-        let entry = map.entry(user_id.to_string()).or_insert((false, 1.0, 0));
-        entry.2 = safe_priority;
-        save_persisted_user_audio_settings(&map);
-    }
+    update_user_audio_settings(user_id, |entry| entry.2 = safe_priority);
 }
 
 pub fn get_user_audio_settings(user_id: &str) -> (bool, f32, i32) {

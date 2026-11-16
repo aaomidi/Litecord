@@ -38,6 +38,10 @@ pub struct VideoSettings {
     /// (screen_capture::web_link); web sharing is turned on for them if needed.
     #[serde(default = "default_true", deserialize_with = "lenient_allow")]
     pub allow_web_link_requests: bool,   // default true
+    /// "Smart Voice Ducking": while a member with a higher priority speaks, the others are
+    /// turned down. On only if written as true.
+    #[serde(default, deserialize_with = "lenient_allow")]
+    pub smart_voice_ducking: bool,       // default false
     /// Stream quality (advanced), read when a share starts. `stream_min_qp`: the VA-API
     /// encoder's QP floor. `stream_max_bitrate_mbps`: where a stream starts and climbs
     /// back to. `stream_profile`: "auto", "compatible" or "efficient" (see `StreamProfile`).
@@ -195,6 +199,7 @@ impl Default for VideoSettings {
             window: None,
             ui_scale_percent: 0,
             allow_web_link_requests: true,
+            smart_voice_ducking: false,
             stream_min_qp: None,
             stream_max_bitrate_mbps: None,
             stream_profile: None,
@@ -294,6 +299,18 @@ pub fn toggle_allow_web_link_requests() -> bool {
     let mut store = get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner());
     store.allow_web_link_requests = !store.allow_web_link_requests;
     let new_val = store.allow_web_link_requests;
+    save_video_settings(&store);
+    new_val
+}
+
+pub fn get_smart_voice_ducking() -> bool {
+    get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner()).smart_voice_ducking
+}
+
+pub fn toggle_smart_voice_ducking() -> bool {
+    let mut store = get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner());
+    store.smart_voice_ducking = !store.smart_voice_ducking;
+    let new_val = store.smart_voice_ducking;
     save_video_settings(&store);
     new_val
 }
@@ -546,5 +563,20 @@ mod tests {
             assert_eq!((s.video_encoder.as_str(), s.use_light_theme, s.noise_suppression.as_str(), s.allow_web_link_requests, s.stream_min_qp), ("openh264", true, "standard", false, Some(24)), "{rest}");
         }
         assert_eq!(pack(&VideoSettings::default()), UiSoundPack::SoftMallet);
+    }
+
+    #[test]
+    fn smart_voice_ducking_is_on_only_when_written_as_true() {
+        assert!(!VideoSettings::default().smart_voice_ducking);
+        let (s, damaged) = load("");
+        assert!(!damaged && !s.smart_voice_ducking, "a file from before the setting existed");
+        let (s, damaged) = load(r#","smart_voice_ducking":true"#);
+        assert!(!damaged && s.smart_voice_ducking);
+        for rest in [r#","smart_voice_ducking":"true""#, r#","smart_voice_ducking":1"#, r#","smart_voice_ducking":null"#, r#","smart_voice_ducking":false"#] {
+            let (s, damaged) = load(rest);
+            assert!(!damaged && !s.smart_voice_ducking && s.use_light_theme && s.allow_web_link_requests, "{rest}");
+        }
+        let written = serde_json::to_string(&VideoSettings { smart_voice_ducking: true, ..VideoSettings::default() }).unwrap();
+        assert!(parse_settings(&written).0.smart_voice_ducking);
     }
 }
