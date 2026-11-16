@@ -41,6 +41,10 @@ aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 opus-rs = "0.1.26"
 davey = "0.1.4"
+# Go Live (screen_capture::golive): the stream connection has its own DAVE session on the
+# newer davey, whose sender switches keys when a transition is executed, as the protocol
+# says. Voice (gateway::voice) stays on 0.1.4.
+davey02 = { package = "davey", version = "=0.2.0" }
 image = "0.25"
 qrcode = "0.14"
 rsa = { version = "0.9", features = ["sha2"] }
@@ -57,6 +61,12 @@ socket2 = "0.5"
 rayon = "1.10"
 x25519-dalek = { version = "3.0", features = ["static_secrets"] }
 nnnoiseless = { version = "0.5", default-features = false }
+
+[dev-dependencies]
+# The scripted voice gateway of the Go Live tests is an MLS external sender, as Discord's is.
+openmls = "=0.8.1"
+openmls_basic_credential = "=0.5.0"
+openmls_rust_crypto = "=0.5.1"
 
 [[bin]]
 name = "litecord"

@@ -93,6 +93,29 @@ pub fn say_goodbye(wait: std::time::Duration) {
     }
 }
 
+/// Sends `payload` on the running gateway connection, behind whatever is already queued
+/// on it. False when there is no connection to send it on right now. Any thread; never waits.
+pub fn send_payload(payload: serde_json::Value) -> bool {
+    let Some((handle, client)) = RUNNING.lock().ok().and_then(|running| running.clone()) else { return false };
+    let Some(client) = client.upgrade() else { return false };
+    let message = Message::Text(payload.to_string().into());
+    // (The lock is held only while a connection is being set up or taken down: then the
+    // payload is queued as soon as that is done, if a connection is there.)
+    let connection = client.ws_tx.try_lock().ok().map(|tx| tx.clone());
+    match connection {
+        Some(Some(tx)) => tx.try_send(message).is_ok(),
+        Some(None) => false,
+        None => {
+            handle.spawn(async move {
+                if let Some(tx) = client.ws_tx.lock().await.as_ref() {
+                    let _ = tx.send(message).await;
+                }
+            });
+            true
+        }
+    }
+}
+
 /// Close codes after which the session cannot be resumed (Discord gateway docs).
 fn close_ends_session(code: u16) -> bool {
     matches!(code, 4004 | 4007 | 4009 | 4010 | 4011 | 4012 | 4013 | 4014)
@@ -115,6 +138,11 @@ const HANDLED_EVENTS: &[&str] = &[
     "CALL_CREATE",
     "CALL_UPDATE",
     "CALL_DELETE",
+    // Go Live (screen_capture::golive): this account's stream on Discord.
+    "STREAM_CREATE",
+    "STREAM_SERVER_UPDATE",
+    "STREAM_UPDATE",
+    "STREAM_DELETE",
 ];
 
 /// Events that change what the user may see in a server. They only drop the server's
@@ -806,6 +834,8 @@ impl GatewayClient {
                         let event_uid_str = event_uid.to_string();
                         if !my_uid.is_empty() && event_uid_str == my_uid {
                             let event_gid = v["d"]["guild_id"].as_str().map(|s| s.to_string());
+                            let gateway_session = self.resume.lock().unwrap().as_ref().map(|r| r.session_id.clone());
+                            crate::screen_capture::golive::note_voice_state(v["d"]["session_id"].as_str(), event_gid.as_deref(), event_chan.as_deref(), gateway_session.as_deref());
                             let my_active_gid = self.voice_guild_id.lock().unwrap().clone();
                             let my_active_cid = self.voice_channel_id.lock().unwrap().clone();
 
@@ -859,6 +889,9 @@ impl GatewayClient {
                         }
                         let _ = self.event_tx.send(GatewayEvent::VoiceStatesUpdated).await;
                     }
+                }
+                "STREAM_CREATE" | "STREAM_SERVER_UPDATE" | "STREAM_UPDATE" | "STREAM_DELETE" => {
+                    crate::screen_capture::golive::on_gateway_event(t, &v["d"]);
                 }
                 "VOICE_SERVER_UPDATE" => {
                     info!("VOICE_SERVER_UPDATE bruto recebido: {:?}", v["d"]);
