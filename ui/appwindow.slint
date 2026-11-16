@@ -4,6 +4,8 @@ import { StreamQuality } from "components/stream_quality.slint";
 export { StreamQuality }
 import { InterfaceSounds } from "components/interface_sounds.slint";
 export { InterfaceSounds }
+import { LiveStream, LiveStreamButton, LiveStreamPanel } from "components/live_stream_controls.slint";
+export { LiveStream }
 import { Button, VerticalBox, HorizontalBox, LineEdit, ScrollView, ListView, TextEdit, CheckBox, Slider } from "std-widgets.slint";
 import { AppTheme, ChatTypography, ThemeMode , TypeScale } from "theme.slint";
 import "../assets/fonts/Inter-Variable.ttf";
@@ -2106,6 +2108,18 @@ export component AppWindow inherits Window {
                                                             clicked => {
                                                                 root.open_stream_in_browser(p.user_id);
                                                             }
+                                                        }
+                                                    }
+
+                                                    // Stream controls (the own share's maximum bitrate and quality floor, for this
+                                                    // share only: the panel is drawn over the window, see the end of AppWindow -
+                                                    // hidden when width < 140px)
+                                                    if (p.is_self && root.is_screen_sharing && LiveStream.sharing && stream_top_bar.width >= 140px): LiveStreamButton {
+                                                        active: LiveStream.open;
+                                                        clicked => {
+                                                            LiveStream.anchor-x = self.absolute-position.x + self.width;
+                                                            LiveStream.anchor-y = self.absolute-position.y + self.height + 6px;
+                                                            LiveStream.open = !LiveStream.open;
                                                         }
                                                     }
 
@@ -5380,6 +5394,18 @@ export component AppWindow inherits Window {
             }
         }
     }
+    // Stream controls of the own share (the button on the own stream's top bar): over
+    // everything, under the button; a click anywhere else closes it.
+    if LiveStream.open && LiveStream.sharing: TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { LiveStream.open = false; }
+    }
+    if LiveStream.open && LiveStream.sharing: LiveStreamPanel {
+        x: Math.max(8px, Math.min(root.width - self.width - 8px, LiveStream.anchor-x - self.width));
+        y: Math.max(8px, Math.min(root.height - self.height - 8px, LiveStream.anchor-y));
+        close => { LiveStream.open = false; }
+    }
 }
 
 // Popout Detached Video Window Component
@@ -5418,6 +5444,14 @@ export component PopoutStreamWindow inherits Window {
     in-out property <bool> is_linux: false;
     in-out property <bool> is_self: false;
     in-out property <bool> show_self_preview_notice: false;
+    // The stream controls' button is shown (the own stream, in a window large enough for the
+    // panel). When it goes away its panel closes with it, and does not come back by itself.
+    property <bool> live_controls_fit: root.is_self && root.width >= 320px && root.height >= 300px;
+    changed live_controls_fit => {
+        if (!root.live_controls_fit) {
+            LiveStream.open = false;
+        }
+    }
 
     callback toggle_pin();
     callback toggle_intangible();
@@ -5632,6 +5666,34 @@ export component PopoutStreamWindow inherits Window {
             HorizontalLayout {
                 spacing: 4px;
                 alignment: end;
+
+                // Stream controls of the own share (left of the window buttons): maximum
+                // bitrate and quality floor of this share. Not on a window too small for
+                // the panel.
+                if (root.is_self && LiveStream.sharing && root.width >= 320px && root.height >= 300px): VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 26px;
+                        height: 26px;
+                        border-radius: 4px;
+                        background: LiveStream.open ? AppTheme.accent : (pop_live_ta.has-hover ? AppTheme.interactive-hover : transparent);
+                        accessible-role: button;
+                        accessible-label: Tr.live_button_tip;
+
+                        Image {
+                            source: @image-url("../assets/sliders.svg");
+                            width: 13px;
+                            height: 13px;
+                            colorize: LiveStream.open ? AppTheme.text-on-accent : (pop_live_ta.has-hover ? AppTheme.text-strong : AppTheme.text-primary);
+                            image-fit: contain;
+                        }
+
+                        pop_live_ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { LiveStream.open = !LiveStream.open; }
+                        }
+                    }
+                }
 
                 // Intangible / Click-Through Ghost Mode Toggle (Left of Pin)
                 VerticalLayout {
@@ -5907,5 +5969,18 @@ export component PopoutStreamWindow inherits Window {
                 root.drag_resize("bottom-right");
             }
         }
+    }
+
+    // Stream controls panel of the own share, under the controls bar; a click anywhere
+    // else closes it.
+    if (root.is_self && LiveStream.open && LiveStream.sharing && root.width >= 320px && root.height >= 300px): TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { LiveStream.open = false; }
+    }
+    if (root.is_self && LiveStream.open && LiveStream.sharing && root.width >= 320px && root.height >= 300px): LiveStreamPanel {
+        x: Math.max(4px, root.width - self.width - 8px);
+        y: Math.max(4px, Math.min(50px, root.height - self.height - 4px));
+        close => { LiveStream.open = false; }
     }
 }

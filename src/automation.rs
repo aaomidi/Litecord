@@ -35,6 +35,21 @@
 //!                                            (in one, the buttons tell Discord as well)
 //! {"cmd":"stream_quality","min_qp":30,"max_bitrate":8}  the settings sliders' callbacks (either
 //!                                            or both); replies with the values now in force
+//! {"cmd":"live_stream","max_bitrate":20,"min_qp":24}  the stream controls of the running share
+//!                                            (the panel's callbacks; either, both or none):
+//!                                            replies with what is in effect ("target_mbps",
+//!                                            "web_capped", "profile", "encoder",
+//!                                            "encoder_min_qp"), the share's values and the
+//!                                            saved defaults. "released":false is a slider
+//!                                            still held (applies when still for 400 ms),
+//!                                            "save_default":true the panel's button,
+//!                                            "open":true/false shows the panel at "x","y"
+//!                                            (its upper right corner; where the button is),
+//!                                            "popout_open":true/false the detached window's,
+//!                                            "pretend":true/false starts and ends a share's
+//!                                            values without a share and shows the own tile
+//!                                            of demo_voice_stage as one (to look at the
+//!                                            button and the panel without an account)
 //! {"cmd":"quit"}                             same as the title bar's close button
 //! {"cmd":"start_screen_share","res":"1080p","fps":60,"screen":0,"audio":false}
 //! {"cmd":"stop_screen_share"}
@@ -569,6 +584,72 @@ fn execute(ui: &AppWindow, cmd: &Value) -> Result<Value, String> {
                 "profile": format!("{:?}", crate::video_settings::get_stream_profile()),
                 "ui_min_qp": quality.get_min_qp(),
                 "ui_max_bitrate": quality.get_max_bitrate(),
+            }))
+        }
+        "live_stream" => {
+            use crate::screen_capture::live_controls;
+            // (The own tile of `demo_voice_stage` then shows as a share, with the button.)
+            match cmd["pretend"].as_bool() {
+                Some(true) => {
+                    live_controls::begin_share();
+                    ui.set_is_screen_sharing(true);
+                }
+                Some(false) => {
+                    live_controls::end_share();
+                    ui.set_is_screen_sharing(false);
+                }
+                None => {}
+            }
+            let live = ui.global::<crate::LiveStream>();
+            let released = cmd["released"].as_bool().unwrap_or(true);
+            let sharing = live_controls::status().sharing;
+            if !sharing && (cmd["max_bitrate"].is_number() || cmd["min_qp"].is_number() || cmd["save_default"].as_bool() == Some(true)) {
+                return Err("no share is running".into());
+            }
+            if let Some(mbps) = cmd["max_bitrate"].as_i64() {
+                live.invoke_set_max_bitrate(mbps as i32, released);
+            }
+            if let Some(qp) = cmd["min_qp"].as_i64() {
+                live.invoke_set_min_qp(qp as i32, released);
+            }
+            if cmd["save_default"].as_bool() == Some(true) {
+                live.invoke_save_default();
+            }
+            crate::ui::live_stream::refresh_now(ui, popout().ok().as_ref());
+            if let Some(open) = cmd["open"].as_bool() {
+                if let (Some(x), Some(y)) = (cmd["x"].as_f64(), cmd["y"].as_f64()) {
+                    live.set_anchor_x(x as f32);
+                    live.set_anchor_y(y as f32);
+                }
+                live.set_open(open);
+            }
+            // (The detached window's own panel, when the own stream is shown there.)
+            if let (Some(open), Ok(popout)) = (cmd["popout_open"].as_bool(), popout()) {
+                popout.global::<crate::LiveStream>().set_open(open);
+            }
+            let s = live_controls::status();
+            Ok(json!({
+                "ok": true,
+                "sharing": s.sharing,
+                "max_bitrate": s.max_bitrate_mbps,
+                "min_qp": s.min_qp,
+                "settling": s.moving,
+                "target_mbps": s.target_bps as f64 / 1e6,
+                "web_capped": s.web_capped,
+                "watched": s.watched,
+                "floor_note": live.get_floor_note().to_string(),
+                "profile": if s.main { "main" } else { "constrained-baseline" },
+                "encoder": s.encoder.name(),
+                "encoder_min_qp": s.encoder_min_qp,
+                "default_max_bitrate": crate::video_settings::get_stream_max_bitrate_mbps(),
+                "default_min_qp": crate::video_settings::get_stream_min_qp(),
+                "ui_max_bitrate": live.get_max_bitrate(),
+                "ui_min_qp": live.get_min_qp(),
+                "ui_status": live.get_status().to_string(),
+                "ui_capped": live.get_capped().to_string(),
+                "ui_is_default": live.get_is_default(),
+                "ui_open": live.get_open(),
+                "ui_popout_open": popout().ok().map(|p| p.global::<crate::LiveStream>().get_open()),
             }))
         }
         "quit" => {

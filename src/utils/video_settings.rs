@@ -437,7 +437,7 @@ pub fn set_stream_min_qp(qp: u32) {
     if store.stream_min_qp != Some(qp) {
         store.stream_min_qp = Some(qp);
         save_video_settings(&store);
-        info!("🎚️ Qualidade da transmissão: QP mínimo agora {} (vale para o próximo compartilhamento; um em andamento segue como começou)", qp);
+        info!("🎚️ Qualidade da transmissão: QP mínimo agora {} (padrão dos próximos compartilhamentos; um em andamento só muda pelos controles na própria transmissão)", qp);
     }
 }
 
@@ -456,7 +456,7 @@ pub fn set_stream_max_bitrate_mbps(mbps: u32) {
     if store.stream_max_bitrate_mbps != Some(mbps) {
         store.stream_max_bitrate_mbps = Some(mbps);
         save_video_settings(&store);
-        info!("🎚️ Qualidade da transmissão: bitrate máximo agora {} Mbps (vale para o próximo compartilhamento; um em andamento segue como começou)", mbps);
+        info!("🎚️ Qualidade da transmissão: bitrate máximo agora {} Mbps (padrão dos próximos compartilhamentos; um em andamento só muda pelos controles na própria transmissão)", mbps);
     }
 }
 

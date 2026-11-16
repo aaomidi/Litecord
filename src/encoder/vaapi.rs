@@ -21,6 +21,7 @@
 
 use super::{OpenH264Encoder, VideoEncoder};
 use crate::screen_capture::hw_decode::h264_state::nal_ranges;
+use crate::screen_capture::live_controls::EncoderFloor;
 use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_app as gst_app;
@@ -63,7 +64,8 @@ const PROBE_SIZE: (u32, u32) = (640, 360);
 /// Test hook: `LITECORD_VAAPI_TEST_FAIL=init` fails construction, `after:N` makes every GPU
 /// frame from the Nth on fail at once, `stall:N` makes them time out for real. Two more
 /// numbers (`stall:N:COUNT:EVERY`) limit it to COUNT frames, one in EVERY: GPU hiccups.
-/// `main` makes every Main pipeline fail to start (a GPU without that profile).
+/// `main` makes every Main pipeline fail to start (a GPU without that profile), `floor` every
+/// pipeline made for a new quality floor (the stream goes on with the floor before it).
 #[derive(Clone, Copy, PartialEq)]
 enum TestFail {
     None,
@@ -71,6 +73,7 @@ enum TestFail {
     After,
     Stall,
     Main,
+    Floor,
 }
 
 struct TestHook {
@@ -90,6 +93,7 @@ impl TestHook {
             Some("after") => TestFail::After,
             Some("stall") => TestFail::Stall,
             Some("main") => TestFail::Main,
+            Some("floor") => TestFail::Floor,
             _ => TestFail::None,
         };
         let mut number = |default: u64| parts.next().and_then(|s| s.parse().ok()).unwrap_or(default);
@@ -98,7 +102,7 @@ impl TestHook {
 
     /// The failure to simulate for the next GPU frame, if any.
     fn next(&mut self, gpu_frames: u64) -> TestFail {
-        if matches!(self.fail, TestFail::None | TestFail::Main) || gpu_frames < self.from || self.left == 0 {
+        if matches!(self.fail, TestFail::None | TestFail::Main | TestFail::Floor) || gpu_frames < self.from || self.left == 0 {
             return TestFail::None;
         }
         self.calls += 1;
@@ -597,8 +601,16 @@ pub struct VaapiEncoder {
     software: Option<OpenH264Encoder>,
     software_since: Instant,
     gpu_retry_after: Duration,
-    /// QP floor of this stream (the "quality floor" setting when the encoder was created).
+    /// QP floor of the pipeline (the "quality floor": the share's when the encoder was
+    /// created, then whatever `set_quality_floor` asked for and a pipeline proved).
     min_qp: u32,
+    /// What `set_quality_floor` asked for last, and the one change of floor on its way.
+    want_min_qp: u32,
+    floor: EncoderFloor,
+    /// The floor being tried replaced a running pipeline (viewers went without pictures).
+    floor_replaced: bool,
+    /// The one late first picture its pipeline is forgiven has happened.
+    floor_was_late: bool,
     /// What `set_efficient_profile` asked for last.
     want_main: bool,
     /// Main is not available on this machine: Constrained Baseline only (`main_unavailable`).
@@ -624,7 +636,7 @@ impl VaapiEncoder {
         if gst::ElementFactory::find("vapostproc").is_none() {
             return Err("plugin VA-API do GStreamer ausente (gst-plugin-va)".into());
         }
-        let min_qp = crate::video_settings::get_stream_min_qp();
+        let min_qp = crate::screen_capture::live_controls::min_qp_for_new_encoder();
         let mut last_error = String::from("nenhum codificador H.264 VA-API registrado");
         for element in ENCODER_ELEMENTS {
             if gst::ElementFactory::find(element).is_none() {
@@ -652,6 +664,10 @@ impl VaapiEncoder {
                         software_since: Instant::now(),
                         gpu_retry_after: GPU_RETRY_AFTER,
                         min_qp,
+                        want_min_qp: min_qp,
+                        floor: EncoderFloor::new(min_qp),
+                        floor_replaced: false,
+                        floor_was_late: false,
                         want_main: false,
                         main_failed: false,
                         main_proven: false,
@@ -688,7 +704,38 @@ impl VaapiEncoder {
         gst::ClockTime::from_nseconds(ns)
     }
 
+    /// `gpu_frame`, and what its outcome says about a quality floor that is being tried: the
+    /// first picture of its pipeline (a keyframe, or `gpu_frame` fails) proves it; a failure
+    /// puts the floor before it back, with a pipeline of its own on the next picture. A first
+    /// picture that is only late (the pipeline is still there, its keyframe is asked again)
+    /// is forgiven once, as for a Main pipeline: a busy GPU does that to any new pipeline.
     fn encode_on_gpu(&mut self, bgra: &[u8], w: u32, h: u32, stride: usize) -> Result<Vec<u8>, String> {
+        use crate::screen_capture::live_controls::{self, Path};
+        let result = self.gpu_frame(bgra, w, h, stride);
+        match &result {
+            Ok(_) => {
+                if let Some((old, new, since)) = self.floor.proven() {
+                    live_controls::floor_applied(Path::Memory, old, new, self.floor_replaced.then(|| since.elapsed()));
+                }
+                if let Some(session) = self.session.as_ref().filter(|s| s.frames == 1) {
+                    live_controls::encoder_in_effect(Path::Memory, session.main, self.min_qp);
+                }
+            }
+            Err(why) => {
+                let forgiven = self.floor.in_flight().is_some() && self.session.is_some() && !std::mem::replace(&mut self.floor_was_late, true);
+                if forgiven {
+                    warn!("⚠️ [VAAPI] First picture of the pipeline for the new quality floor did not come ({}); one more try", why);
+                } else if let Some((refused, back)) = self.floor.failed() {
+                    self.session = None;
+                    self.min_qp = back;
+                    live_controls::floor_refused(Path::Memory, refused, back, why);
+                }
+            }
+        }
+        result
+    }
+
+    fn gpu_frame(&mut self, bgra: &[u8], w: u32, h: u32, stride: usize) -> Result<Vec<u8>, String> {
         let stall = match self.test.next(self.gpu_frames) {
             TestFail::After => return Err("falha simulada (LITECORD_VAAPI_TEST_FAIL=after)".into()),
             fail => fail == TestFail::Stall,
@@ -703,18 +750,32 @@ impl VaapiEncoder {
         if switch_profile {
             info!("🔀 [VAAPI] Perfil H.264 da transmissão muda para {}", profile_name(main));
         }
-        if switch_profile || self.session.as_ref().map(|s| (s.width, s.height) != (w, h)).unwrap_or(true) {
+        // The quality floor is not a property vah264enc takes while it runs either
+        // (gst-inspect: `min-qp` is not "changeable in PLAYING state"): a new one replaces
+        // the pipeline too, one change at a time and not before the last one proved itself.
+        // Not in the turn of a change of profile, nor in an attempt to come back from OpenH264:
+        // a pipeline that fails there has not failed for its floor.
+        let new_floor = if switch_profile || self.software.is_some() { None } else { self.floor.next(self.want_min_qp, Instant::now()) };
+        if let Some(qp) = new_floor {
+            self.floor_replaced = self.session.is_some();
+            self.floor_was_late = false;
+            self.min_qp = qp;
+        }
+        if switch_profile || new_floor.is_some() || self.session.as_ref().map(|s| (s.width, s.height) != (w, h)).unwrap_or(true) {
             // The old pipeline is stopped before the new one starts.
             self.session = None;
             let started = if main && self.test.fail == TestFail::Main {
                 Err("falha simulada (LITECORD_VAAPI_TEST_FAIL=main)".to_string())
+            } else if new_floor.is_some() && self.test.fail == TestFail::Floor {
+                Err("simulated failure (LITECORD_VAAPI_TEST_FAIL=floor)".to_string())
             } else {
                 Session::start(self.element, w, h, self.target_fps, self.bitrate_bps, self.min_qp, main)
             };
             let session = match started {
                 Ok(session) => session,
                 Err(e) => {
-                    self.main_unavailable(main, false);
+                    // (A pipeline that only differs in its floor says nothing about Main.)
+                    self.main_unavailable(main && new_floor.is_none(), false);
                     return Err(e);
                 }
             };
@@ -837,6 +898,11 @@ impl VaapiEncoder {
             self.gpu_retry_after.as_secs()
         );
         self.abandon_session();
+        if let Some((refused, back)) = self.floor.failed() {
+            // Its pipeline never showed a picture: the GPU is tried again with the floor before it.
+            self.min_qp = back;
+            crate::screen_capture::live_controls::floor_refused(crate::screen_capture::live_controls::Path::Memory, refused, back, reason);
+        }
         self.failing_since = None;
         self.losses = 0;
         match OpenH264Encoder::new(self.target_fps, self.is_screen_content) {
@@ -845,6 +911,8 @@ impl VaapiEncoder {
                 enc.force_intra_frame();
                 self.software = Some(enc);
                 self.software_since = Instant::now();
+                // (The stream controls say so: OpenH264 has no quality floor.)
+                crate::screen_capture::live_controls::encoder_in_effect(crate::screen_capture::live_controls::Path::Unknown, false, 0);
             }
             Err(e) => warn!("⚠️ [VAAPI] OpenH264 também falhou ({}); tentando a GPU de novo", e),
         }
@@ -967,6 +1035,13 @@ impl VideoEncoder for VaapiEncoder {
 
     fn set_efficient_profile(&mut self, on: bool) {
         self.want_main = on;
+    }
+
+    fn set_quality_floor(&mut self, min_qp: u32) {
+        // (0: no share is running any more, nothing is asked.)
+        if min_qp != 0 {
+            self.want_min_qp = min_qp;
+        }
     }
 
     fn name(&self) -> &'static str {

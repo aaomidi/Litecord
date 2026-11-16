@@ -23,9 +23,10 @@ mod harness {
     use litecord::encoder::{create_best_encoder, VideoEncoder};
     use litecord::screen_capture::hw_decode::h264_state::nal_ranges;
     use litecord::screen_capture::linux_gpu_tx as gpu;
+    use litecord::screen_capture::live_controls;
     use litecord::screen_capture::sources::linux_portal::{gst_launch_capture_args, WindowCapture, PORTAL_LOCAL_CB};
     use litecord::screen_capture::video_pipeline::{decode_video_frame, Decoded, StreamDecoders};
-    use litecord::screen_capture::watch::{ProfileChoice, Verdict as WatchVerdict, Viewers, CAP_H264_MAIN};
+    use litecord::screen_capture::watch::{ProfileChoice, RateControl, Verdict as WatchVerdict, Viewers, CAP_H264_MAIN};
     use litecord::utils::video_settings::StreamProfile;
     use openh264::formats::YUVSource;
     use slint::{Rgba8Pixel, SharedPixelBuffer};
@@ -68,6 +69,31 @@ test_vaapi_capture [options]
                    byte. With --profile auto, 0:-,1:m,4:m+c,7:m goes Main -> Constrained Baseline
                    -> Main (the last step 5 s after the viewer that cannot decode Main left).
                    Without it, the viewers of --watch are one native viewer that decodes Main.
+  --live SPEC      SEC:CHANGE,SEC:CHANGE,...: the stream controls of the running share
+                   (live_controls, the button on the streamer's own stream), by the send loop's
+                   own rules. CHANGE: bitrate=MBPS (the share's maximum bitrate, slider released),
+                   floor=QP (the quality floor, released), floor~A..B (the floor slider dragged
+                   from A to B, a step every 50 ms, never released: it applies once it has been
+                   still for 400 ms). The stream's rate is then watch::RateControl's under the
+                   share's maximum and the browser viewer's 8 Mbit/s (--bitrate is ignored).
+                   Checked: a released change is in effect within 1.5 s (the target rate; for the
+                   floor, an encoder that showed a keyframe with it), the first access unit of
+                   a new floor is a keyframe, no slice has a QP below the floor in effect, and a
+                   drag replaces the encoder once. Checked in the bitstream, so that the exit
+                   status does not rest on what the app believes: slice QPs can be read with
+                   every floor; after a floor went DOWN the lowest slice QP is below the floor
+                   before it (the default synthetic pattern drives the QP to the floor; a
+                   source that does not fails this); as many floors took effect as the engine
+                   was asked for, and the encoder ends on the script's last one; the measured
+                   rate 0.5 to 2.5 s after the target moved is under 1.3 times a lowered
+                   target, and above 1.15 times the old one after a raise when the source was
+                   using its rate (--src-props pattern=snow). Printed: when each change took
+                   effect, the gap between access units around it, the slice QPs seen with each
+                   floor and the measured rates.
+                   LITECORD_VAAPI_TEST_FAIL=floor in the environment (with --legacy) makes the
+                   memory-fed encoder's pipeline for a new floor fail: the floor before it must
+                   stay, on VA-API.
+  --live-start M:Q the saved settings the share starts from, in memory only (default 8:30)
   --pli SECS       extra keyframe requests at these times, e.g. 3.3,5.1 (besides one every 2 s)
   --memory M       auto (default) | dmabuf | system
   --max-fps N      ask the compositor for at most N pictures a second (experiment)
@@ -86,6 +112,10 @@ test_vaapi_capture [options]
                    that goes to Main and back: the share goes on over gst-launch)
                    nobars: the bars around a picture of another shape cannot be painted: no
                    such picture may be sent, and the share goes on over gst-launch
+                   floorrefuse | floormute | floorbreak (with --live): the encoder made for a
+                   new quality floor refuses the pictures' format, puts out nothing, or fails
+                   on its first picture: the share must stay on the GPU capture with the floor
+                   it had, and the controls show that floor
   --freeze-source S  synthetic: the provider is stopped (SIGSTOP) before the capture connects
                    and continued after S seconds: the capture's start must stay bounded
   --end-source S   end the source S seconds into the share (Mutter: Session.Stop, as GNOME's
@@ -779,6 +809,12 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         main_late: bool,
         /// (second, bps).
         bitrates: Vec<(f64, u32)>,
+        /// --live: (second, the floor rather than the bitrate, value, released), and how many
+        /// times the floor comes to rest in it (released values and drags).
+        live: Option<Vec<(f64, bool, u32, bool)>>,
+        live_floor_rests: usize,
+        /// --fail floorrefuse | floormute: no new floor may take effect.
+        floor_must_fail: bool,
         pli: Vec<f64>,
         verify: bool,
         colours: bool,
@@ -807,7 +843,29 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         secs: f64,
     }
 
+    /// --live: what the slice QPs seen with one quality floor prove. `before`: the floor in
+    /// effect before it (0: none); `aus`: access units a VA-API encoder sent with it.
+    fn live_floor_proof(fails: &mut Failures, floor: u32, before: u32, qps: &[i32], aus: usize) {
+        if floor == 0 || aus < 30 {
+            return;
+        }
+        let Some(lo) = qps.iter().min().copied() else {
+            fails.add(format!("no slice QP could be read from the {aus} access units sent with quality floor QP {floor}: nothing in the bitstream proves that floor"));
+            return;
+        };
+        if before > floor && lo >= before as i32 {
+            fails.add(format!(
+                "the quality floor went down from QP {before} to QP {floor}, and the lowest slice QP of the {} pictures after it is {lo}: the encoder still has the floor before it (or this source does not drive the QP to the floor: the default synthetic pattern does)",
+                qps.len()
+            ));
+        }
+    }
+
     fn run_share(setup: &Setup, cycle: usize, fails: &mut Failures) -> Totals {
+        // --live: this share's values start from the settings, as in the app; the capture's
+        // encoder is made with them.
+        let live_start = setup.live.as_ref().map(|_| live_controls::begin_share());
+        let live_start_qp = live_controls::status().min_qp;
         let running = Arc::new(AtomicBool::new(true));
         let legacy = Arc::new(LegacyShared { frame: Mutex::new(None), frames_read: AtomicU64::new(0), first_frame_at: Mutex::new(None), child_pid: AtomicU32::new(0), previews: AtomicU64::new(0) });
         let preview_count = Arc::new(AtomicU64::new(0));
@@ -989,6 +1047,33 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         let mut starved = false;
         let mut dump = setup.dump_aus.as_ref().and_then(|path| Some((std::fs::File::create(path).ok()?, std::fs::File::create(format!("{path}.idr")).ok()?)));
 
+        // --live: the send loop's rate controller, the script, and what was seen of it.
+        let mut live_rate = RateControl::new(live_start.unwrap_or(8_000_000));
+        let mut live_script: std::collections::VecDeque<(f64, bool, u32, bool)> = setup.live.clone().unwrap_or_default().into();
+        let mut live_target = live_start.unwrap_or(0);
+        let mut live_floor = 0u32;
+        let mut live_floor_changes = 0usize;
+        let mut live_switches = 0u64;
+        let mut live_qps: Vec<i32> = Vec::new();
+        let mut live_qp_parser = litecord::screen_capture::hw_decode::h264_state::H264State::new();
+        let mut live_low_qp_reported = false;
+        // Released changes still to be found in effect: (asked at, deadline, floor, value,
+        // the floor in effect before it).
+        let mut live_expected: Vec<(Instant, Instant, bool, u32, u32)> = Vec::new();
+        let mut live_last_ask: Option<Instant> = None;
+        // For the exit status: the floor before the one in effect and the access units sent
+        // with the one in effect; the floor the engine was asked for last and how many
+        // changes it was asked for; the moves of the target still to be measured (when, from,
+        // to, kbit/s in the 1.5 s before) and the access units of the last seconds.
+        let mut live_floor_before = 0u32;
+        let mut live_floor_aus = 0usize;
+        let mut live_asked_qp = 0u32;
+        let mut live_floors_asked = 0usize;
+        let mut live_asked_counts = false;
+        let mut live_rate_steps: Vec<(Instant, u32, u32, f64)> = Vec::new();
+        let mut live_sent: std::collections::VecDeque<(Instant, usize)> = std::collections::VecDeque::new();
+        let mut live_unwatched_at: Option<Instant> = None;
+
         let share_start = Instant::now();
         let total_secs = setup.total_secs;
         let shell_pid = find_pid("gnome-shell");
@@ -1105,7 +1190,147 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 starved = true;
                 fails.add(format!("t={t:.2}s: the viewers have been without pictures for 2.5 s"));
             }
-            let bitrate = setup.bitrates.iter().rev().find(|(s, _)| *s <= t).map(|b| b.1).unwrap_or(8_000_000);
+            let mut bitrate = setup.bitrates.iter().rev().find(|(s, _)| *s <= t).map(|b| b.1).unwrap_or(8_000_000);
+            let mut live_min_qp = None;
+            if setup.live.is_some() {
+                while live_script.front().is_some_and(|step| t >= step.0) {
+                    let Some((_, floor, value, released)) = live_script.pop_front() else { break };
+                    if floor {
+                        live_controls::set_min_qp(value, released);
+                    } else {
+                        live_controls::set_max_bitrate_mbps(value, released);
+                    }
+                    live_last_ask = Some(Instant::now());
+                    if released {
+                        println!("  t={t:.3}s LIVE: asked for {} {value}{}", if floor { "quality floor QP" } else { "maximum bitrate" }, if floor { "" } else { " Mbit/s" });
+                        // A value asked for before this one and not in effect yet is superseded:
+                        // the engine replaces one encoder at a time and may go straight to the
+                        // newest value, so only that one has to take effect.
+                        live_expected.retain(|expected| expected.2 != floor);
+                        live_expected.push((Instant::now(), Instant::now() + Duration::from_millis(1500), floor, value, live_controls::status().encoder_min_qp));
+                    } else if setup.verbose {
+                        println!("  t={t:.3}s LIVE: the floor slider is at QP {value} (held)");
+                    }
+                }
+                let cap = if web_viewers > 0 { 8_000_000 } else { u32::MAX };
+                let qp = live_controls::turn(&mut live_rate, cap, efficient, now);
+                live_controls::set_watched(watched);
+                if qp != live_asked_qp {
+                    // What has to take effect: not a value that was replaced by another before
+                    // any encoder showed it (one replacement at a time: the engine may skip
+                    // it), and not a return to the floor that is in effect.
+                    let in_effect = live_controls::status().encoder_min_qp;
+                    if live_asked_counts && in_effect != live_asked_qp {
+                        live_floors_asked = live_floors_asked.saturating_sub(1);
+                    }
+                    live_asked_counts = live_asked_qp != 0 && qp != in_effect;
+                    live_floors_asked += usize::from(live_asked_counts);
+                    live_asked_qp = qp;
+                }
+                bitrate = live_rate.current().min(cap);
+                // (`turn` asks for a keyframe when the target moved: vah264enc takes the rate with it.)
+                if litecord::screen_capture::types::KEYFRAME_REQUESTED.swap(false, Ordering::Relaxed) {
+                    keyframe_requested = true;
+                }
+                if bitrate != live_target {
+                    println!(
+                        "  t={t:.3}s LIVE: target bitrate {:.1} -> {:.1} Mbit/s (the share's maximum is {} Mbit/s{}){}",
+                        live_target as f64 / 1e6,
+                        bitrate as f64 / 1e6,
+                        live_rate.max() / 1_000_000,
+                        if live_rate.current() > cap { ", a browser viewer holds it at 8" } else { "" },
+                        live_last_ask.map(|at| format!(", {:.0} ms after the last change was asked", at.elapsed().as_secs_f64() * 1000.0)).unwrap_or_default()
+                    );
+                    if watched {
+                        let from = now.checked_sub(Duration::from_millis(1500)).unwrap_or(now);
+                        let before = live_sent.iter().filter(|(at, _)| *at >= from).map(|sent| sent.1).sum::<usize>() as f64 * 8.0 / 1.5 / 1000.0;
+                        live_rate_steps.push((now, live_target, bitrate, before));
+                    }
+                    live_target = bitrate;
+                }
+                // The rate the encoder really makes, 0.5 to 2.5 s after the target moved.
+                if !watched {
+                    live_unwatched_at = Some(now);
+                }
+                while let Some(&(at, from, to, before)) = live_rate_steps.first() {
+                    let end = at + Duration::from_millis(2500);
+                    let disturbed = live_rate_steps.get(1).is_some_and(|next| next.0 < end) || live_unwatched_at.is_some_and(|gone| gone >= at);
+                    if now < end && !disturbed {
+                        break;
+                    }
+                    live_rate_steps.remove(0);
+                    let (from_k, to_k) = (from as f64 / 1000.0, to as f64 / 1000.0);
+                    if disturbed {
+                        println!("  t={t:.3}s LIVE: the rate after the target went {from_k:.0} -> {to_k:.0} kbit/s is not measured (another change, or no viewer, within 2.5 s of it)");
+                        continue;
+                    }
+                    let begin = at + Duration::from_millis(500);
+                    let measured = live_sent.iter().filter(|(when, _)| *when >= begin && *when < end).map(|sent| sent.1).sum::<usize>() as f64 * 8.0 / 2.0 / 1000.0;
+                    println!("  t={t:.3}s LIVE: measured {measured:.0} kbit/s from 0.5 to 2.5 s after the target went {from_k:.0} -> {to_k:.0} kbit/s ({before:.0} kbit/s in the 1.5 s before it)");
+                    // (OpenH264 after a failure has its own ceiling.)
+                    if !(gpu::active() || h264_encoder.as_ref().is_some_and(|e| e.is_hardware_accelerated())) {
+                        continue;
+                    }
+                    if to < from && measured > to_k * 1.3 {
+                        fails.add(format!("t={t:.2}s: the target went down to {to_k:.0} kbit/s and the stream still measured {measured:.0} kbit/s 0.5 to 2.5 s later: the encoder did not take the new rate in time"));
+                    }
+                    // Up: only a source that was using its rate can show it.
+                    if to > from && before >= from_k * 0.7 {
+                        if measured < from_k * 1.15 {
+                            fails.add(format!("t={t:.2}s: the target went up from {from_k:.0} to {to_k:.0} kbit/s and the stream measured {measured:.0} kbit/s 0.5 to 2.5 s later: the encoder did not take the new rate in time"));
+                        } else if measured < from_k + (to_k - from_k) * 0.5 {
+                            println!("  t={t:.3}s LIVE: NOTE less than half way to the new target: see whether the quality floor is what holds the rate (slice QPs at the floor)");
+                        }
+                    } else if to > from {
+                        println!("  t={t:.3}s LIVE: (the source was not using its rate before the raise: nothing to prove; --src-props pattern=snow does)");
+                    }
+                }
+                gpu::set_min_qp(qp);
+                live_min_qp = Some(qp);
+                // Released changes whose time is up (the time only runs while somebody watches).
+                let st = live_controls::status();
+                let mut i = 0;
+                while i < live_expected.len() {
+                    let (asked, deadline, floor, value, floor_before) = live_expected[i];
+                    if !watched && floor {
+                        live_expected[i].1 = Instant::now() + Duration::from_millis(1500);
+                    }
+                    let met = if !floor {
+                        bitrate == (value * 1_000_000).min(cap)
+                    } else if setup.floor_must_fail {
+                        false
+                    } else {
+                        st.encoder_min_qp == value
+                    };
+                    if met {
+                        live_expected.remove(i);
+                        continue;
+                    }
+                    if now >= deadline && (watched || !floor) {
+                        if floor && setup.floor_must_fail {
+                            // (--legacy: the memory-fed encoder, still on VA-API and not on OpenH264.)
+                            let (in_service, path) = if setup.legacy_only { (h264_encoder.as_ref().is_some_and(|e| e.is_hardware_accelerated()), "memory-fed VA-API encoder") } else { (gpu::active(), "GPU capture") };
+                            let stayed = st.encoder_min_qp == floor_before && st.min_qp == floor_before && in_service;
+                            println!(
+                                "  t={t:.3}s LIVE: the encoder for QP {value} was made to fail: the floor in effect is QP {}, the controls show QP {}, {path} {}",
+                                st.encoder_min_qp,
+                                st.min_qp,
+                                if in_service { "still in service" } else { "given up" }
+                            );
+                            if !stayed {
+                                fails.add(format!("t={t:.2}s: after the encoder for floor QP {value} failed, the share is not back on QP {floor_before} on the {path}"));
+                            }
+                        } else if floor {
+                            fails.add(format!("t={t:.2}s: quality floor QP {value} was asked {:.0} ms ago and no encoder has shown a keyframe with it (in effect: QP {})", asked.elapsed().as_secs_f64() * 1000.0, st.encoder_min_qp));
+                        } else {
+                            fails.add(format!("t={t:.2}s: maximum bitrate {value} Mbit/s was asked {:.0} ms ago and the target is {:.1} Mbit/s", asked.elapsed().as_secs_f64() * 1000.0, bitrate as f64 / 1e6));
+                        }
+                        live_expected.remove(i);
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
             if pli_left.first().is_some_and(|p| *p <= t) {
                 pli_left.remove(0);
                 keyframe_requested = true;
@@ -1221,6 +1446,9 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                     enc.set_bitrate_bps(bitrate);
                 }
                 enc.set_efficient_profile(efficient);
+                if let Some(qp) = live_min_qp {
+                    enc.set_quality_floor(qp);
+                }
                 if std::mem::take(&mut keyframe_requested) || last_idr.elapsed() >= Duration::from_millis(2000) {
                     last_idr = Instant::now();
                     enc.force_intra_frame();
@@ -1314,6 +1542,11 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 if idr && gpu_path && idr_pending.is_some() && idr_asked_efficient && efficient && sps_main == Some(false) && setup.main_must_fail.is_none() {
                     fails.add(format!("t={t:.2}s: a keyframe was asked for while every viewer decodes Main, and it is not Main"));
                 }
+                // --live: the access unit before this one, and whether this is the first one of
+                // an encoder the stream controls had replaced (for a new quality floor, or to
+                // put the floor before it back): its keyframe comes unasked, like a profile's.
+                let live_prev_au = last_au_at.filter(|_| !first_after_watch);
+                let live_replaced = setup.live.is_some() && gpu_path && gpu::stats().is_some_and(|g| std::mem::replace(&mut live_switches, g.profile_switches) != g.profile_switches);
                 if let Some(prev) = last_au_at {
                     all_gap.push(now.duration_since(prev).as_secs_f64() * 1000.0);
                 }
@@ -1332,10 +1565,10 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 }
                 if idr {
                     if gpu_path {
-                        if profile_changed { &mut new_encoder_idrs } else { &mut other_idrs }.push(au.len());
+                        if profile_changed || live_replaced { &mut new_encoder_idrs } else { &mut other_idrs }.push(au.len());
                         // (A change to Constrained Baseline brings its keyframe unasked.)
                         // (Two requests a few milliseconds apart may each get theirs.)
-                        if idr_pending.is_none() && !profile_changed && !viewer_first && last_idr_request.is_none_or(|at| at.elapsed() > Duration::from_millis(150)) {
+                        if idr_pending.is_none() && !profile_changed && !live_replaced && !viewer_first && last_idr_request.is_none_or(|at| at.elapsed() > Duration::from_millis(150)) {
                             unasked_idrs.push(format!("{t:.2}s"));
                         }
                     }
@@ -1350,6 +1583,69 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                     totals.repeats += 1;
                     if !gpu_path {
                         s_dup += 1;
+                    }
+                }
+                if setup.live.is_some() {
+                    // The picture's QP, from its first slice header; the floor of the encoder
+                    // it came from (reported by that encoder with its first keyframe).
+                    let slice_qp = live_qp_parser.parse(&au).ok().flatten().map(|p| 26 + p.pps.pic_init_qp_minus26 + p.header.slice_qp_delta);
+                    let st = live_controls::status();
+                    live_sent.push_back((now, au.len()));
+                    while live_sent.front().is_some_and(|(at, _)| now.duration_since(*at) > Duration::from_secs(6)) {
+                        live_sent.pop_front();
+                    }
+                    if st.encoder_min_qp != live_floor {
+                        let seen = |qps: &[i32]| match (qps.iter().min(), qps.iter().max()) {
+                            (Some(lo), Some(hi)) => format!("{lo}..{hi} over {} pictures", qps.len()),
+                            _ => "none".to_string(),
+                        };
+                        if live_floor == 0 {
+                            println!("  t={t:.3}s LIVE: the {} starts with quality floor QP {}", st.encoder.name(), st.encoder_min_qp);
+                            if st.encoder_min_qp != 0 && st.encoder_min_qp != live_start_qp {
+                                // Asked for while nobody watched: the first encoder to send a picture has it.
+                                println!("  t={t:.3}s LIVE: (the share started at QP {live_start_qp}: a floor asked for before anybody watched took effect with the first picture)");
+                                live_floor_changes += 1;
+                                if !idr {
+                                    fails.add(format!("t={t:.2}s: the first access unit with quality floor QP {} is not a keyframe (NAL types {types:?})", st.encoder_min_qp));
+                                }
+                            }
+                        } else {
+                            let gap = live_prev_au.map(|prev| now.duration_since(prev).as_secs_f64() * 1000.0);
+                            let replaced = gpu::stats().filter(|_| gpu_path).map(|g| format!("; encoder replacement {} kept the send loop {:.1} ms", g.profile_switches, g.last_switch_us as f64 / 1000.0)).unwrap_or_default();
+                            println!(
+                                "  t={t:.3}s LIVE: quality floor QP {live_floor} -> {} in effect on the {} ({path_now} path): {} without pictures{}{replaced}; {} bytes, NAL types {types:?}, slice QP {slice_qp:?}; slice QPs with floor {live_floor}: {}",
+                                st.encoder_min_qp,
+                                st.encoder.name(),
+                                gap.map(|g| format!("{g:.0} ms")).unwrap_or_else(|| "the first picture for these viewers,".into()),
+                                live_last_ask.map(|at| format!(", {:.0} ms after the last change was asked", at.elapsed().as_secs_f64() * 1000.0)).unwrap_or_default(),
+                                au.len(),
+                                seen(&live_qps)
+                            );
+                            live_floor_changes += 1;
+                            if !idr {
+                                fails.add(format!("t={t:.2}s: the first access unit with quality floor QP {} is not a keyframe (NAL types {types:?})", st.encoder_min_qp));
+                            }
+                            if gap.is_some_and(|g| g > 1000.0) {
+                                fails.add(format!("t={t:.2}s: the change of quality floor left the viewers {:.0} ms without pictures", gap.unwrap_or_default()));
+                            }
+                            if setup.floor_must_fail {
+                                fails.add(format!("t={t:.2}s: a new quality floor took effect although its encoder was made to fail"));
+                            }
+                        }
+                        live_floor_proof(fails, live_floor, live_floor_before, &live_qps, live_floor_aus);
+                        live_floor_before = live_floor;
+                        live_floor_aus = 0;
+                        live_floor = st.encoder_min_qp;
+                        live_qps.clear();
+                    }
+                    // (Only the VA-API encoders have the floor; OpenH264 after a failure does not.)
+                    let strict = gpu_path || h264_encoder.as_ref().is_some_and(|e| e.is_hardware_accelerated());
+                    live_floor_aus += usize::from(strict);
+                    if let Some(qp) = slice_qp {
+                        live_qps.push(qp);
+                        if strict && live_floor != 0 && qp < live_floor as i32 && !std::mem::replace(&mut live_low_qp_reported, true) {
+                            fails.add(format!("t={t:.2}s: access unit {au_index} has slice QP {qp}, below the quality floor in effect (QP {live_floor})"));
+                        }
                     }
                 }
                 if setup.verbose {
@@ -1368,7 +1664,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                     use std::io::Write;
                     let _ = stream.write_all(&au);
                     if idr {
-                        let _ = writeln!(index, "{au_index} {path_now}{}", if profile_changed && gpu_path { " new-encoder" } else { "" });
+                        let _ = writeln!(index, "{au_index} {path_now}{}", if (profile_changed || live_replaced) && gpu_path { " new-encoder" } else { "" });
                     }
                 }
                 let strict = gpu_path || h264_encoder.as_ref().is_some_and(|e| e.is_hardware_accelerated());
@@ -1490,6 +1786,43 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
             totals.bytes as f64 * 8.0 / 1000.0 / totals.watched_secs.max(1.0)
         );
         println!("delivered: {:.1} access units per watched second", totals.aus as f64 / totals.watched_secs.max(1.0));
+        if setup.live.is_some() {
+            let st = live_controls::status();
+            println!(
+                "stream controls: {} change(s) of quality floor took effect ({} asked for: released values and drags); at the end the share's values are {} Mbit/s and QP {}, in effect {:.1} Mbit/s and floor QP {} ({}); slice QPs with the last floor: {}; encoder replacements on the GPU capture: {}",
+                live_floor_changes,
+                setup.live_floor_rests,
+                st.max_bitrate_mbps,
+                st.min_qp,
+                st.target_bps as f64 / 1e6,
+                st.encoder_min_qp,
+                st.encoder.name(),
+                match (live_qps.iter().min(), live_qps.iter().max()) {
+                    (Some(lo), Some(hi)) => format!("{lo}..{hi} over {} pictures", live_qps.len()),
+                    _ => "none".to_string(),
+                },
+                last_gpu_stats.as_ref().map(|g| g.profile_switches.to_string()).unwrap_or_else(|| "-".into())
+            );
+            if live_floor_changes > setup.live_floor_rests {
+                fails.add(format!("the quality floor changed {} times for {} values asked for (a dragged slider must replace the encoder once, when it rests)", live_floor_changes, setup.live_floor_rests));
+            }
+            live_floor_proof(fails, live_floor, live_floor_before, &live_qps, live_floor_aus);
+            if !setup.floor_must_fail {
+                println!("stream controls: the engine was asked for {live_floors_asked} change(s) of quality floor (values that were released or came to rest)");
+                if live_floor_changes < live_floors_asked {
+                    fails.add(format!("the engine was asked for {live_floors_asked} changes of quality floor and {live_floor_changes} took effect"));
+                }
+                // The script's last floor, when somebody watches at the end (an encoder is only made for viewers).
+                let last = setup.live.as_ref().and_then(|steps| steps.iter().rev().find(|step| step.1).map(|step| step.2));
+                if let Some(last) = last.filter(|last| st.watched && st.encoder_min_qp != *last) {
+                    fails.add(format!("the script's last quality floor is QP {last} and the encoder in use at the end has QP {} ({})", st.encoder_min_qp, st.encoder.name()));
+                }
+            }
+            if !live_rate_steps.is_empty() {
+                println!("stream controls: {} move(s) of the target came too close to the end to be measured", live_rate_steps.len());
+            }
+            live_controls::end_share();
+        }
         if let Some(st) = &last_gpu_stats {
             if st.stamped_pictures > 0 {
                 println!(
@@ -1541,7 +1874,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                     n => format!("n={n} {}..{} bytes (median {})", bytes[0], bytes[n - 1], bytes[n / 2]),
                 }
             };
-            println!("GPU keyframes: first of a new encoder at a profile change: {}; all others: {}", show(&mut new_encoder_idrs), show(&mut other_idrs));
+            println!("GPU keyframes: first of a new encoder (a change of profile, or of quality floor with --live): {}; all others: {}", show(&mut new_encoder_idrs), show(&mut other_idrs));
             if !unasked_idrs.is_empty() {
                 fails.add(format!("{} keyframes of the GPU capture that nobody asked for (at {})", unasked_idrs.len(), unasked_idrs.join(", ")));
             }
@@ -1771,6 +2104,42 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
             "system" => gpu::Memory::System,
             other => return Err(format!("bad --memory {other}")),
         };
+        // --live: the script of the stream controls, and the settings the share starts from.
+        let mut live_floor_rests = 0;
+        let live = match args.0.get("live") {
+            None => None,
+            Some(spec) => {
+                let mut steps: Vec<(f64, bool, u32, bool)> = Vec::new();
+                let bad = |part: &str| format!("bad --live part {part} (SEC:bitrate=MBPS, SEC:floor=QP or SEC:floor~A..B)");
+                for part in spec.split(',') {
+                    let (at, change) = part.split_once(':').ok_or_else(|| bad(part))?;
+                    let at = at.parse::<f64>().map_err(|_| bad(part))?;
+                    if let Some(v) = change.strip_prefix("bitrate=") {
+                        steps.push((at, false, v.parse().map_err(|_| bad(part))?, true));
+                    } else if let Some(v) = change.strip_prefix("floor=") {
+                        steps.push((at, true, v.parse().map_err(|_| bad(part))?, true));
+                        live_floor_rests += 1;
+                    } else if let Some((a, b)) = change.strip_prefix("floor~").and_then(|v| v.split_once("..")) {
+                        let (a, b) = (a.parse::<i64>().map_err(|_| bad(part))?, b.parse::<i64>().map_err(|_| bad(part))?);
+                        let n = (b - a).abs();
+                        for i in 0..=n {
+                            steps.push((at + i as f64 * 0.05, true, (a + (b - a).signum() * i) as u32, false));
+                        }
+                        live_floor_rests += 1;
+                    } else {
+                        return Err(bad(part));
+                    }
+                }
+                steps.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let start = args.str("live-start", "8:30");
+                let (mbps, qp) = start.split_once(':').and_then(|(m, q)| Some((m.parse::<u32>().ok()?, q.parse::<u32>().ok()?))).ok_or(format!("bad --live-start {start} (MBPS:QP)"))?;
+                // In memory only: the settings file is not written.
+                let mut store = litecord::utils::video_settings::get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner());
+                store.stream_max_bitrate_mbps = Some(mbps);
+                store.stream_min_qp = Some(qp);
+                Some(steps)
+            }
+        };
         let max_fps = args.0.get("max-fps").map(|v| v.parse::<u32>().map_err(|_| format!("bad --max-fps {v}"))).transpose()?;
         let cycles = args.num("cycles", 1.0)? as usize;
         let cycle_gap = Duration::from_millis(args.num("cycle-gap", 200.0)? as u64);
@@ -1880,6 +2249,9 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
             main_must_fail,
             main_late: fail_mode.starts_with("mainlate"),
             bitrates,
+            live,
+            live_floor_rests,
+            floor_must_fail: matches!(args.0.get("fail").map(|f| f.as_str()), Some("floorrefuse" | "floormute" | "floorbreak")) || std::env::var("LITECORD_VAAPI_TEST_FAIL").as_deref() == Ok("floor"),
             pli,
             verify: !args.has("no-verify"),
             colours: args.has("colours"),

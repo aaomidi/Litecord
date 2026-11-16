@@ -151,6 +151,25 @@ impl RateControl {
         self.current
     }
 
+    pub fn max(&self) -> u32 {
+        self.max
+    }
+
+    /// A new ceiling while the stream runs (`live_controls`). Down: a rate above it comes
+    /// down to it at once. Up: a rate that was at its ceiling goes to the new one at once,
+    /// like a share that starts there (nothing was holding it down, and loss cuts it as
+    /// usual, by halves above 8 Mbit/s); a rate that loss had brought below its ceiling
+    /// stays where it is and climbs at its usual pace.
+    pub fn set_max(&mut self, max: u32) -> u32 {
+        let at_ceiling = self.current >= self.max;
+        self.max = max;
+        if at_ceiling || self.current > max {
+            self.current = max;
+            self.clean_since = None;
+        }
+        self.current
+    }
+
     /// `worst_loss`: the worst recent report among viewers, if any.
     pub fn update(&mut self, worst_loss: Option<u16>, now: Instant) -> u32 {
         match worst_loss {
