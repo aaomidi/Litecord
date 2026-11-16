@@ -3,9 +3,10 @@ import { Tr } from "tr.slint";
 import { SettingsSection, OptionSelect } from "settings_kit.slint";
 
 // The "interface sounds" setting (ui_sound_pack in src/utils/video_settings.rs): which pack
-// of src/audio/sound_effects.rs plays for mute, deafen, join and leave. Rust sets the
-// current pack (populate_voice_processing_settings) and, when one is picked, saves it and
-// plays its "join" sound once.
+// of src/audio/sound_effects.rs plays for mute, deafen, join and leave, and for what happens
+// in a call (others joining, streams, viewers, a lost connection). Rust sets the current
+// pack (populate_voice_processing_settings) and, when one is picked, saves it and plays its
+// "join" sound; picking the same pack again plays the next of its other sounds.
 export global InterfaceSounds {
     // "soft-mallet", "glass-bell", "breath-pad" or "off".
     in-out property <string> pack: "soft-mallet";

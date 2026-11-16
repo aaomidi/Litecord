@@ -373,7 +373,10 @@ async fn run_rtc(
             stats_since = Instant::now();
         }
         let before = state.viewers.swap(count, Ordering::Relaxed);
-        if before != count { status_changed(); }
+        if before != count {
+            status_changed();
+            crate::audio::call_sounds::on_viewer(count > before, "a browser viewer");
+        }
         // Asked for again now that the send loop can count the new viewer: it encodes for
         // browsers (profile, bitrate) and offers them pictures only in turns that counted one.
         if count > before { super::request_intra_keyframe(); }

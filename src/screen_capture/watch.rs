@@ -92,9 +92,11 @@ impl Viewers {
         self.list.remove(&uid).is_some()
     }
 
-    /// Drops the viewers whose request expired.
-    pub fn expire(&mut self, now: Instant) {
+    /// Drops the viewers whose request expired; how many there were.
+    pub fn expire(&mut self, now: Instant) -> usize {
+        let before = self.list.len();
         self.list.retain(|_, v| now.duration_since(v.last_seen) < LEASE);
+        before - self.list.len()
     }
 
     pub fn addrs(&self) -> Vec<SocketAddr> {
@@ -238,10 +240,15 @@ static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 /// A new stream: new key, nobody watching.
 pub fn start_session() {
     *SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(Session { key: rand::random(), viewers: Viewers::new() });
+    crate::audio::call_sounds::on_own_stream(true);
 }
 
+/// The stream is over. Its viewers go with it, without a sound each.
 pub fn end_session() {
-    *SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let was_streaming = SESSION.lock().unwrap_or_else(|e| e.into_inner()).take().is_some();
+    if was_streaming {
+        crate::audio::call_sounds::on_own_stream(false);
+    }
 }
 
 /// The key this stream's media is encrypted with.
@@ -261,6 +268,7 @@ pub fn on_watch(uid: u64, public: [u8; 32], addr: SocketAddr, caps: u8, in_chann
         viewers.set_caps(uid, caps);
         if new {
             super::types::request_intra_keyframe();
+            crate::audio::call_sounds::on_viewer(true, &format!("user {uid}"));
         }
     }
     Some(verdict)
@@ -275,7 +283,11 @@ pub fn admit(uid: u64, public: [u8; 32], in_channel: bool) -> Option<Verdict> {
 
 /// Whether `uid` was watching (UNWATCH is sent three times).
 pub fn on_unwatch(uid: u64) -> bool {
-    SESSION.lock().unwrap_or_else(|e| e.into_inner()).as_mut().is_some_and(|s| s.viewers.unwatch(uid))
+    let was_watching = SESSION.lock().unwrap_or_else(|e| e.into_inner()).as_mut().is_some_and(|s| s.viewers.unwatch(uid));
+    if was_watching {
+        crate::audio::call_sounds::on_viewer(false, &format!("user {uid}"));
+    }
+    was_watching
 }
 
 pub fn on_loss_report(uid: u64, permille: u16) {
@@ -284,12 +296,19 @@ pub fn on_loss_report(uid: u64, permille: u16) {
     }
 }
 
+/// Viewers that stopped asking (closed, crashed, out of reach) stopped watching too.
+fn viewers_gone(count: usize) {
+    if count > 0 {
+        crate::audio::call_sounds::on_viewer(false, &format!("{count} viewer(s) whose request expired"));
+    }
+}
+
 /// Where to send the stream now (expired viewers dropped).
 pub fn viewer_addrs() -> Vec<SocketAddr> {
     let mut s = SESSION.lock().unwrap_or_else(|e| e.into_inner());
     match s.as_mut() {
         Some(s) => {
-            s.viewers.expire(Instant::now());
+            viewers_gone(s.viewers.expire(Instant::now()));
             s.viewers.addrs()
         }
         None => Vec::new(),
@@ -302,7 +321,7 @@ pub fn viewers_now() -> (Vec<SocketAddr>, bool) {
     let mut s = SESSION.lock().unwrap_or_else(|e| e.into_inner());
     match s.as_mut() {
         Some(s) => {
-            s.viewers.expire(Instant::now());
+            viewers_gone(s.viewers.expire(Instant::now()));
             (s.viewers.addrs(), s.viewers.all_decode_main())
         }
         None => (Vec::new(), false),

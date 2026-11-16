@@ -1746,6 +1746,7 @@ pub async fn connect_voice_gateway(
                 break;
             }
             warn!("⚠️ [VOICE GATEWAY] Conexão com Voice Gateway temporariamente perdida. Reconectando em 1.5s...");
+            crate::audio::call_sounds::on_voice_connection_lost();
         }
         Err(e) => {
             if CURRENT_VOICE_SESSION_ID.load(Ordering::SeqCst) != my_session_id {

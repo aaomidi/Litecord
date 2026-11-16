@@ -2614,13 +2614,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Interface sounds: save the pack, then let it be heard once. The pack is read again for
-    // every sound, so this already plays the new one (and nothing at all for "off").
+    // Interface sounds: save the pack, then let it be heard: its join sound, and one more of
+    // its sounds each time the same pack is picked again. The pack is read again for every
+    // sound, so this already plays the new one (and nothing at all for "off").
     {
         use slint::ComponentHandle;
         app.global::<InterfaceSounds>().on_select_pack(|id: SharedString| {
+            let changed = video_settings::get_ui_sound_pack().id() != id.as_str();
             video_settings::set_ui_sound_pack(id.as_str());
-            sound_effects::play_ui_sound(sound_effects::UiSound::JoinChannel);
+            sound_effects::preview_ui_sound_pack(changed);
         });
     }
 
@@ -4785,7 +4787,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match event {
                 GatewayEvent::VoiceDisconnected => {
-                    sound_effects::play_ui_sound(sound_effects::UiSound::LeaveChannel);
+                    call_sounds::on_disconnected("taken out of the voice channel by the server or another client");
                     let app_w = app_weak.clone();
                     let sm_disc = Arc::clone(&sm_gw_inner);
                     *active_mic_disc.lock().unwrap() = None;

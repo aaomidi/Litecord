@@ -2036,6 +2036,7 @@ impl ScreenCaptureManager {
                                         if prev_state != Some(is_streaming) {
                                             if is_streaming {
                                                 PEER_STREAMING_STATES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(pkt_uid, true);
+                                                crate::audio::call_sounds::on_peer_stream(pkt_uid, true);
                                             }
                                             info!("📡 Usuário {} alterou estado de stream: {}", pkt_uid, is_streaming);
                                             // Senders announce only while streaming: an announce saying
