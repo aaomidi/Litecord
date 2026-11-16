@@ -27,7 +27,11 @@
 //!   reads as 30) and square pixels (pipewiresrc otherwise fixates 1/2147483647).
 //! - A `max-framerate` asked of Mutter is quantised to whole refreshes after the minimum
 //!   interval: 60 on a 144 Hz monitor gives ~45 pictures a second, and a range breaks the
-//!   DMABuf negotiation. So nothing is asked and the pace is kept here, in a pad probe.
+//!   DMABuf negotiation. So nothing is asked and the pace is kept here, in a pad probe
+//!   (`add_gate`; which pictures pass is `cadence::Cadence`: evenly spaced, a whole number
+//!   of refreshes apart and, for a source that holds its rate, not faster than the stream,
+//!   so that monitor gives a stream of 60 its 48 pictures a second, each three refreshes
+//!   after the one before).
 //! - PipeWire only delivers pictures on damage. `keepalive-time` makes pipewiresrc push
 //!   its last buffer again when nothing new came; the probe lets one of those through
 //!   every 100 ms (what the send loop does on the CPU path), or at once when a keyframe is
@@ -148,6 +152,7 @@ use log::{info, warn};
 use slint::{Rgba8Pixel, SharedPixelBuffer};
 use std::collections::VecDeque;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use super::cadence::{self, Cadence};
 use super::live_controls::EncoderFloor;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
@@ -309,6 +314,9 @@ pub struct Stats {
     pub encoded_repeats: u64,
     /// New pictures left out to keep the target frame rate.
     pub skipped_pace: u64,
+    /// What the gate has settled on and the spacing of the pictures it passed lately
+    /// (made once a second; `None` before two pictures have passed).
+    pub cadence: Option<cadence::Report>,
     pub previews: u64,
     /// Microseconds the preview pictures took in all: reading back from the GPU, allocating
     /// the UI's pixel buffer, converting to RGBA and the UI's callback; and the preview
@@ -386,6 +394,7 @@ struct Shared {
     encoded_new: AtomicU64,
     encoded_repeats: AtomicU64,
     skipped_pace: AtomicU64,
+    cadence: Mutex<Option<cadence::Report>>,
     previews: AtomicU64,
     preview_us: [AtomicU64; 4],
     stamped_pictures: AtomicU64,
@@ -694,6 +703,7 @@ impl Stream {
             encoded_new: AtomicU64::new(0),
             encoded_repeats: AtomicU64::new(0),
             skipped_pace: AtomicU64::new(0),
+            cadence: Mutex::new(None),
             previews: AtomicU64::new(0),
             preview_us: Default::default(),
             stamped_pictures: AtomicU64::new(0),
@@ -1357,6 +1367,7 @@ impl Stream {
             encoded_new: load(&self.shared.encoded_new),
             encoded_repeats: load(&self.shared.encoded_repeats),
             skipped_pace: load(&self.shared.skipped_pace),
+            cadence: lock(&self.shared.cadence).clone(),
             previews: load(&self.shared.previews),
             preview_us: [0, 1, 2, 3].map(|i| load(&self.shared.preview_us[i])),
             stamped_pictures: load(&self.shared.stamped_pictures),
@@ -1577,15 +1588,15 @@ fn even_fit(picture: (u32, u32), frame: (u32, u32)) -> (u32, u32) {
 }
 
 /// What goes into vapostproc, and what for. To the encoder: nothing while nobody watches;
-/// new pictures at most `fps` times a second (the monitor may refresh faster); the last
-/// picture again every 100 ms while the screen is still, and at once when a keyframe waits
-/// for a picture to ride on. To the preview: one picture every 150 ms, and only one a
-/// second while nothing changes.
+/// new pictures evenly spaced and about `fps` times a second at most (the monitor may
+/// refresh faster: `Cadence` picks them, a whole number of refreshes apart, so a 144 Hz
+/// monitor gives a stream of 60 its 48 pictures a second; a source that wanders a little
+/// above `fps` passes whole, see there); the last picture again every 100 ms
+/// while the screen is still, and at once when a keyframe waits for a picture to ride on.
+/// To the preview: one picture every 150 ms, and only one a second while nothing changes.
 fn add_gate(queue: &gst::Element, shared: &Arc<Shared>, fps: u32, postproc: gst::Element) -> Result<(), String> {
     struct Gate {
-        last_picture: u64,
-        last_pass: Instant,
-        due: Instant,
+        pace: Cadence,
         preview_picture: u64,
         last_preview: Instant,
         /// The size of the part of the last buffer that was its picture, and whether that
@@ -1596,7 +1607,10 @@ fn add_gate(queue: &gst::Element, shared: &Arc<Shared>, fps: u32, postproc: gst:
     let shared = shared.clone();
     let interval = Duration::from_nanos(1_000_000_000 / fps as u64);
     let start = Instant::now();
-    let gate = Mutex::new(Gate { last_picture: 0, last_pass: start, due: start, preview_picture: 0, last_preview: start.checked_sub(PREVIEW_STILL_EVERY).unwrap_or(start), crop: None, withheld: false });
+    // (LITECORD_VAAPI_CAPTURE_PACE=average: the schedule before, 60 on average with late
+    // pictures made up for, to compare the two in a live stream.)
+    let policy = if std::env::var("LITECORD_VAAPI_CAPTURE_PACE").is_ok_and(|v| v == "average") { cadence::Policy::Average } else { cadence::Policy::Even };
+    let gate = Mutex::new(Gate { pace: Cadence::new(policy, interval, STILL_REPEAT_EVERY), preview_picture: 0, last_preview: start.checked_sub(PREVIEW_STILL_EVERY).unwrap_or(start), crop: None, withheld: false });
     let pad = queue.static_pad("src").ok_or("pad src ausente")?;
     // While a new encoder is linked in, its request to negotiate again ends here: passed
     // on, pipewiresrc would reconnect its stream (see the module's notes). vapostproc has
@@ -1685,30 +1699,22 @@ fn add_gate(queue: &gst::Element, shared: &Arc<Shared>, fps: u32, postproc: gst:
         let picture = buffer.offset();
 
         let forced = shared.pass_next.load(Ordering::Relaxed);
-        let repeat = picture == gate.last_picture;
-        let encode = if !forced && !shared.watched.load(Ordering::Relaxed) {
-            false
-        } else if forced {
-            true
-        } else if repeat {
-            now.duration_since(gate.last_pass) + Duration::from_millis(2) >= STILL_REPEAT_EVERY
-        } else if now + interval / 8 < gate.due {
-            // Too early for the target rate. Should the screen stop changing right now,
-            // the keepalive brings this picture again and it passes then.
+        // Which pictures pass, and how far apart, is `Cadence`'s business: evenly spaced,
+        // never a short step to make up for a late picture.
+        let since_start = now.duration_since(start);
+        let cadence::Verdict { encode, repeat, too_early } = gate.pace.arrived(since_start, picture, forced, shared.watched.load(Ordering::Relaxed));
+        if too_early {
             shared.skipped_pace.fetch_add(1, Ordering::Relaxed);
-            false
-        } else {
-            true
-        };
+        }
         if encode {
-            // The schedule keeps the average at `fps` whatever the monitor's rhythm (at
-            // 144 Hz pictures pass 2, 2 and 3 refreshes apart). A picture that came late
-            // may be followed sooner; after a pause the schedule starts over.
-            gate.due = (gate.due + interval).max(now + interval / 4);
-            gate.last_picture = picture;
-            gate.last_pass = now;
             shared.pass_next.store(false, Ordering::Relaxed);
             if repeat { &shared.encoded_repeats } else { &shared.encoded_new }.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some((report, announce)) = gate.pace.take_report(since_start) {
+            if announce {
+                info!("🎞️ [VAAPI] Capture cadence: {report}");
+            }
+            *lock(&shared.cadence) = Some(report);
         }
 
         let since_preview = now.duration_since(gate.last_preview);

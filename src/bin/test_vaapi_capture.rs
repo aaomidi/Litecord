@@ -1704,14 +1704,19 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 s_enc.sort_by(|a, b| a.total_cmp(b));
                 let detail = if gpu::active() {
                     format!(
-                        "pictures {:3} (buffers {:3}) encoded new {:3} repeat {:2} over-rate {:3} | capture->AU ms p50 {:4.1} max {:4.1}",
+                        "pictures {:3} (buffers {:3}) encoded new {:3} repeat {:2} over-rate {:3} | capture->AU ms p50 {:4.1} max {:4.1} | gate {}",
                         st.pictures.saturating_sub(last_stats.pictures),
                         st.buffers.saturating_sub(last_stats.buffers),
                         st.encoded_new.saturating_sub(last_stats.encoded_new),
                         st.encoded_repeats.saturating_sub(last_stats.encoded_repeats),
                         st.skipped_pace.saturating_sub(last_stats.skipped_pace),
                         percentile(&s_lat, 0.5),
-                        s_lat.last().copied().unwrap_or(0.0)
+                        s_lat.last().copied().unwrap_or(0.0),
+                        // (The spacing of the pictures the gate passed, over its last 300.)
+                        st.cadence.as_ref().map_or("-".to_string(), |c| format!(
+                            "{:4.1}/s step p5 {:4.1} p50 {:4.1} p95 {:4.1} ms, short {} long {} of {}",
+                            c.passed_per_s, c.p5_ms, c.p50_ms, c.p95_ms, c.short, c.long, c.steps
+                        ))
                     )
                 } else {
                     format!("frames from the pipe {:3} distinct encoded {:3} duplicate encodes {:3} | encode() ms p50 {:4.1} max {:4.1}", frames_read - last_frames_read, distinct, s_dup, percentile(&s_enc, 0.5), s_enc.last().copied().unwrap_or(0.0))
@@ -1841,6 +1846,9 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 "GPU capture: {} buffers, {} distinct pictures; encoded {} new + {} repeats; {} new pictures left out for the frame rate; {} thrown away while a keyframe was awaited; {} previews; {} renegotiations by the source before its first picture",
                 st.buffers, st.pictures, st.encoded_new, st.encoded_repeats, st.skipped_pace, st.dropped_before_keyframe, st.previews, st.early_renegotiations
             );
+            if let Some(cadence) = &st.cadence {
+                println!("GPU capture cadence at the end: {cadence}");
+            }
         }
         if let Some(st) = last_gpu_stats.as_ref().filter(|st| (st.picture_rect.2, st.picture_rect.3) != setup.size || st.bars_painted + st.bars_failed > 0) {
             println!(
