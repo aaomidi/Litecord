@@ -48,6 +48,46 @@ pub(crate) fn linux_voice_stream_config(
     }
 }
 
+/// The output format for voice: the device's default one, but at 48 kHz (the rate Opus
+/// decodes to) when the device offers that rate with the same channels and sample type.
+pub(crate) fn voice_output_config_at_48k(
+    default: cpal::SupportedStreamConfig,
+    ranges: impl IntoIterator<Item = cpal::SupportedStreamConfigRange>,
+) -> cpal::SupportedStreamConfig {
+    const RATE: cpal::SampleRate = cpal::SampleRate(48000);
+    if default.sample_rate() == RATE {
+        return default;
+    }
+    ranges.into_iter()
+        .find(|r| r.channels() == default.channels() && r.sample_format() == default.sample_format()
+            && r.min_sample_rate() <= RATE && r.max_sample_rate() >= RATE)
+        .map(|r| r.with_sample_rate(RATE))
+        .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod voice_rx_output_rate_tests {
+    use cpal::{SampleFormat, SampleRate, SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange};
+
+    fn range(channels: u16, min: u32, max: u32, format: SampleFormat) -> SupportedStreamConfigRange {
+        SupportedStreamConfigRange::new(channels, SampleRate(min), SampleRate(max), SupportedBufferSize::Unknown, format)
+    }
+
+    #[test]
+    fn voice_rx_output_asks_for_48_khz_when_the_device_offers_it() {
+        let default = SupportedStreamConfig::new(2, SampleRate(44100), SupportedBufferSize::Unknown, SampleFormat::F32);
+        // What cpal reports for the PipeWire/PulseAudio ALSA device: any rate.
+        let chosen = super::voice_output_config_at_48k(default.clone(), [range(1, 1, 384000, SampleFormat::F32), range(2, 1, 384000, SampleFormat::F32)]);
+        assert_eq!((chosen.sample_rate().0, chosen.channels(), chosen.sample_format()), (48000, 2, SampleFormat::F32));
+        // Only other rates, other channel counts or other sample types: the default stays.
+        for ranges in [vec![], vec![range(2, 44100, 44100, SampleFormat::F32)], vec![range(6, 48000, 48000, SampleFormat::F32)], vec![range(2, 48000, 48000, SampleFormat::I16)]] {
+            assert_eq!(super::voice_output_config_at_48k(default.clone(), ranges).sample_rate().0, 44100);
+        }
+        let already = SupportedStreamConfig::new(2, SampleRate(48000), SupportedBufferSize::Unknown, SampleFormat::I16);
+        assert_eq!(super::voice_output_config_at_48k(already.clone(), []), already);
+    }
+}
+
 #[cfg(test)]
 mod voice_buffer_tests {
     use super::*;

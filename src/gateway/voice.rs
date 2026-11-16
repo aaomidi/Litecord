@@ -15,15 +15,12 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce
 };
-use opus_rs::{OpusEncoder, OpusDecoder, Application};
+use opus_rs::{OpusEncoder, Application};
 use davey::{DaveSession, ProposalsOperationType, MediaType};
 
 use super::types::*;
 
-// 48 kHz stereo pairs. Cap after admission, including concealed Opus frames.
-const VOICE_QUEUE_LIMIT: usize = 28800;
-const VOICE_PREBUFFER_SAMPLES: usize = 1920;
-const VOICE_RESET_INACTIVE_CALLBACKS: u32 = 3;
+use super::voice_rx::{VoiceMixer, VoiceRxDecoder, push_voice_frame, smart_ducking, VOICE_QUEUE_LIMIT, VOICE_UNDERRUNS};
 
 pub async fn connect_voice_gateway(
     raw_endpoint: &str,
@@ -288,11 +285,9 @@ pub async fn connect_voice_gateway(
                                                 let my_ssrc = ssrc;
                                                 let rx_session_id = my_session_id;
                                                 tokio::spawn(async move {
-                                                    let mut opus_decoders: HashMap<(u32, usize), OpusDecoder> = HashMap::new();
-                                                    let mut ssrc_last_pkt_time: HashMap<u32, std::time::Instant> = HashMap::new();
-                                                    let mut ssrc_expected_seq: HashMap<u32, u16> = HashMap::new();
+                                                    let mut rx_decoders: HashMap<u32, VoiceRxDecoder> = HashMap::new();
+                                                    let rx_clock = std::time::Instant::now();
                                                     let mut recv_buf = vec![0u8; 4096];
-                                                    let mut pcm_out_buf = vec![0.0f32; 11520];
                                                     let mut detected_ssrcs = std::collections::HashSet::new();
                                                     let mut decrypt_err_cnt = 0u64;
                                                     let mut opus_err_cnt = 0u64;
@@ -378,17 +373,24 @@ pub async fn connect_voice_gateway(
 
                                                                         let mut decrypted_opt: Option<(Vec<u8>, usize)> = None;
 
-                                                                        'try_decrypt: for &(test_aad_len, test_ext_len) in candidates {
-                                                                            if test_aad_len >= ciphertext_end { continue; }
-                                                                            let header = &pkt[..test_aad_len];
-                                                                            let ciphertext = &pkt[test_aad_len..ciphertext_end];
+                                                                        // With the padding bit set, the byte before the nonce is first read as a
+                                                                        // padding length. If the padding is encrypted with the payload that byte
+                                                                        // is part of the GCM tag instead, so the whole ciphertext is tried too.
+                                                                        let ciphertext_ends = [ciphertext_end, len - 4];
+                                                                        let ciphertext_ends = if ciphertext_end == len - 4 { &ciphertext_ends[..1] } else { &ciphertext_ends[..] };
+                                                                        'try_decrypt: for &ct_end in ciphertext_ends {
+                                                                            for &(test_aad_len, test_ext_len) in candidates {
+                                                                                if test_aad_len >= ct_end { continue; }
+                                                                                let header = &pkt[..test_aad_len];
+                                                                                let ciphertext = &pkt[test_aad_len..ct_end];
 
-                                                                            for &nonce_cand in &nonce_candidates {
-                                                                                let payload = aes_gcm::aead::Payload { msg: ciphertext, aad: header };
-                                                                                if let Ok(dec) = cipher.decrypt(Nonce::from_slice(nonce_cand), payload) {
-                                                                                    if dec.len() >= test_ext_len {
-                                                                                        decrypted_opt = Some((dec, test_ext_len));
-                                                                                        break 'try_decrypt;
+                                                                                for &nonce_cand in &nonce_candidates {
+                                                                                    let payload = aes_gcm::aead::Payload { msg: ciphertext, aad: header };
+                                                                                    if let Ok(dec) = cipher.decrypt(Nonce::from_slice(nonce_cand), payload) {
+                                                                                        if dec.len() >= test_ext_len {
+                                                                                            decrypted_opt = Some((dec, test_ext_len));
+                                                                                            break 'try_decrypt;
+                                                                                        }
                                                                                     }
                                                                                 }
                                                                             }
@@ -405,8 +407,8 @@ pub async fn connect_voice_gateway(
                                                                             None => {
                                                                                 decrypt_err_cnt += 1;
                                                                                 if decrypt_err_cnt % 50 == 1 {
-                                                                                    warn!("Descriptografia AES-GCM falhou para SSRC {}: len={} has_ext={} cc={} base_len={} ext_words={} header={:02X?} nonce={:02X?}",
-                                                                                        ssrc_recv, len, has_ext, cc, base_header_len, ext_len_words, &pkt[..16.min(len)], nonce_bytes_rx);
+                                                                                    warn!("Descriptografia AES-GCM falhou para SSRC {}: len={} has_ext={} cc={} base_len={} ext_words={} padding={} pad_len={} header={:02X?} nonce={:02X?}",
+                                                                                        ssrc_recv, len, has_ext, cc, base_header_len, ext_len_words, has_padding, padding_len, &pkt[..16.min(len)], nonce_bytes_rx);
                                                                                 }
                                                                                 continue;
                                                                             }
@@ -508,10 +510,6 @@ pub async fn connect_voice_gateway(
                                                                             ));
                                                                         }
 
-                                                                        let mut decode_success = false;
-                                                                        let mut decoded_count = 0;
-                                                                        let mut plc_pairs: Vec<(f32, f32)> = Vec::new();
-                                                                        let mut pkt_channels = 2usize;
                                                                         if can_decode && !opus_data.is_empty() {
                                                                             let mut raw_opus = opus_data.as_slice();
 
@@ -536,86 +534,43 @@ pub async fn connect_voice_gateway(
 
                                                                             if raw_opus.is_empty() { continue; }
 
-                                                                            pkt_channels = if (raw_opus[0] & 0x04) != 0 { 2 } else { 1 };
-                                                                            let dec = opus_decoders.entry((ssrc_recv, pkt_channels)).or_insert_with(|| {
-                                                                                OpusDecoder::new(48000, pkt_channels).expect("Falha ao inicializar OpusDecoder 48kHz")
-                                                                            });
-
-                                                                            let now = std::time::Instant::now();
                                                                             let rtp_seq = u16::from_be_bytes([pkt[2], pkt[3]]);
+                                                                            let rtp_timestamp = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
                                                                             #[cfg(feature = "automation")]
                                                                             crate::utils::test_hooks::voice_received(rtp_seq);
-                                                                            let last_time_opt = ssrc_last_pkt_time.get(&ssrc_recv).copied();
-                                                                            let is_new_talkspurt = match last_time_opt {
-                                                                                Some(t) => now.duration_since(t) > Duration::from_millis(100),
-                                                                                None => true,
-                                                                            };
 
-                                                                            if is_new_talkspurt {
-                                                                                // New burst of speech after silence/VAD gap: sync sequence and skip false PLC to avoid pops
-                                                                                ssrc_expected_seq.insert(ssrc_recv, rtp_seq.wrapping_add(1));
-                                                                            } else {
-                                                                                if let Some(last_seq) = ssrc_expected_seq.get(&ssrc_recv).copied() {
-                                                                                    let missed = rtp_seq.wrapping_sub(last_seq);
-                                                                                    if missed > 0 && missed <= 4 {
-                                                                                        let mut plc_buf = [0.0f32; 1920];
-                                                                                        for _ in 0..missed {
-                                                                                            if let Ok(samples) = dec.decode(&[], 960, &mut plc_buf[..]) {
-                                                                                                for i in 0..samples {
-                                                                                                    if pkt_channels == 2 {
-                                                                                                        plc_pairs.push((plc_buf[i * 2].clamp(-1.0, 1.0), plc_buf[i * 2 + 1].clamp(-1.0, 1.0)));
-                                                                                                    } else {
-                                                                                                        let m = plc_buf[i].clamp(-1.0, 1.0);
-                                                                                                        plc_pairs.push((m, m));
-                                                                                                    }
-                                                                                                }
-                                                                                            }
-                                                                                        }
-                                                                                    }
+                                                                            // Decode, with concealment of the packets lost before this one
+                                                                            // (a new talkspurt after a pause conceals nothing).
+                                                                            let rx = rx_decoders.entry(ssrc_recv).or_insert_with(VoiceRxDecoder::new);
+                                                                            let frame = rx.packet(rtp_seq, rtp_timestamp, raw_opus, rx_clock.elapsed().as_millis() as u64);
+                                                                            if let Some(e) = frame.error {
+                                                                                warn!("📊 [OPUS DIAG] Decode FALHOU: {:?}", e);
+                                                                                opus_err_cnt += 1;
+                                                                                if opus_err_cnt % 50 == 1 {
+                                                                                    warn!("📊 [MÉTRICA DE ERRO] Opus decode falhou para SSRC {} (Erros={})", ssrc_recv, opus_err_cnt);
                                                                                 }
-                                                                                ssrc_expected_seq.insert(ssrc_recv, rtp_seq.wrapping_add(1));
                                                                             }
-                                                                            ssrc_last_pkt_time.insert(ssrc_recv, now);
-
-                                                                            let is_dtx_silence = raw_opus.len() <= 3 && raw_opus == [0xF8, 0xFF, 0xFE];
-                                                                            if is_dtx_silence {
-                                                                                decode_success = true;
-                                                                                decoded_count = 960;
-                                                                                for s in pcm_out_buf[..1920].iter_mut() { *s = 0.0; }
-                                                                            } else {
-                                                                                match dec.decode(raw_opus, 5760, &mut pcm_out_buf[..]) {
-                                                                                    Ok(samples) => {
-                                                                                        decode_success = true;
-                                                                                        decoded_count = samples;
+                                                                            if !frame.decoded.is_empty() || !frame.concealed.is_empty() {
+                                                                                register_voice_participant(ssrc_recv, sender_user_id);
+                                                                                if let Ok(mut queues) = speaker_queues_rx.lock() {
+                                                                                    let q = queues.entry(ssrc_recv).or_insert_with(|| VecDeque::with_capacity(VOICE_QUEUE_LIMIT));
+                                                                                    #[cfg(feature = "automation")]
+                                                                                    {
+                                                                                        crate::utils::test_hooks::voice_decoded(&frame.concealed);
+                                                                                        crate::utils::test_hooks::voice_decoded(&frame.decoded);
                                                                                     }
-                                                                                    Err(e) => {
-                                                                                        warn!("📊 [OPUS DIAG] Decode FALHOU: {:?}", e);
-                                                                                    }
+                                                                                    push_voice_frame(q, &frame.concealed, &frame.decoded);
                                                                                 }
+                                                                            }
+                                                                            // What the sender's packets are and how the path treats them, for
+                                                                            // comparing calls: after 5 s of speech, then every 30 s of it.
+                                                                            let s = &rx.stats;
+                                                                            if s.packets == 250 || s.packets % 1500 == 0 {
+                                                                                info!("Voice RX stats SSRC={}: packets={} SILK={} hybrid={} CELT={} stereo={} with_fec={} silence_frames={} concealed={} conceal_failed={} late_or_duplicate={} decode_errors={} | all members: transport_decrypt_failures={} dave_decrypt_failures={} playout_underruns={}",
+                                                                                    ssrc_recv, s.packets, s.silk, s.hybrid, s.celt, s.stereo, s.with_fec, s.silence_frames, s.concealed, s.conceal_failed, s.late_dropped, s.decode_errors,
+                                                                                    decrypt_err_cnt, dave_decrypt_fail_cnt, VOICE_UNDERRUNS.load(Ordering::Relaxed));
                                                                             }
                                                                         }
-
-                                                                        if decode_success && decoded_count > 0 {
-                                                                            register_voice_participant(ssrc_recv, sender_user_id);
-                                                                            let total_samples = decoded_count * pkt_channels;
-                                                                            let dump_vec = decoded_voice_pairs(&pcm_out_buf[..total_samples], pkt_channels);
-                                                                                    ssrc_last_pkt_time.insert(ssrc_recv, std::time::Instant::now());
-
-                                                                                    if let Ok(mut queues) = speaker_queues_rx.lock() {
-                                                                                        let q = queues.entry(ssrc_recv).or_insert_with(|| VecDeque::with_capacity(VOICE_QUEUE_LIMIT));
-                                                                                        #[cfg(feature = "automation")]
-                                                                                        {
-                                                                                            crate::utils::test_hooks::voice_decoded(&plc_pairs);
-                                                                                            crate::utils::test_hooks::voice_decoded(&dump_vec);
-                                                                                        }
-                                                                                        push_voice_frame(q, &plc_pairs, &dump_vec);
-                                                                                    }
-                                                                                } else if !opus_data.is_empty() {
-                                                                                    opus_err_cnt += 1;
-                                                                                    if opus_err_cnt % 50 == 1 {
-                                                                                        warn!("📊 [MÉTRICA DE ERRO] Opus decode falhou para SSRC {} (Erros={})", ssrc_recv, opus_err_cnt);
-                                                                                    }
-                                                                                }
                                                                             }
                                                                         }
                                                             }
@@ -636,6 +591,7 @@ pub async fn connect_voice_gateway(
                                                     let mut current_target_dev = get_selected_output_device_store().lock().unwrap().clone();
                                                     let mut no_device_wait: Option<Duration> = None;
                                                     let mut output_retry_wait: Option<Duration> = None;
+                                                    let mut try_48k = true;
 
                                                     while CURRENT_VOICE_SESSION_ID.load(Ordering::SeqCst) == out_session_id {
                                                         let host = cpal::default_host();
@@ -675,7 +631,7 @@ pub async fn connect_voice_gateway(
                                                             info!("🔊 Dispositivo de saída de áudio disponível novamente.");
                                                         }
 
-                                                        let config = match device.default_output_config() {
+                                                        let default_config = match device.default_output_config() {
                                                             Ok(c) => c,
                                                             Err(e) => {
                                                                 warn!("Falha ao obter config de saída: {:?}", e);
@@ -683,19 +639,29 @@ pub async fn connect_voice_gateway(
                                                                 continue;
                                                             }
                                                         };
+                                                        // Opus decodes at 48 kHz. A device that offers that rate (PipeWire and
+                                                        // PulseAudio do, whatever default cpal picks) plays the decoded samples
+                                                        // as they are; any other rate goes through the resampler of VoiceMixer.
+                                                        let config = if try_48k {
+                                                            let ranges = device.supported_output_configs().map(|r| r.collect::<Vec<_>>()).unwrap_or_default();
+                                                            crate::audio::engine::voice_output_config_at_48k(default_config.clone(), ranges)
+                                                        } else {
+                                                            default_config.clone()
+                                                        };
+                                                        let asked_48k = config.sample_rate() != default_config.sample_rate();
                                                         let out_sample_rate = config.sample_rate().0;
                                                         let out_channels = config.channels() as usize;
                                                         info!("Saída de Áudio (Speaker): {}Hz, {} canal(is), formato={:?} (Dispositivo: {})",
                                                             out_sample_rate, out_channels, config.sample_format(), target_dev_name);
+                                                        if asked_48k {
+                                                            info!("Voice output: asked the device for 48000 Hz instead of its default {} Hz, so decoded voice is not resampled.", default_config.sample_rate().0);
+                                                        } else if out_sample_rate != 48000 {
+                                                            info!("Voice output: the device does not offer 48000 Hz; decoded voice is resampled to {} Hz.", out_sample_rate);
+                                                        }
 
                                                     let sq = Arc::clone(&speaker_queues_out);
                                                     let ssrc_to_userid_spk = Arc::clone(&ssrc_to_userid_speaker);
-                                                    let mut started_ssrcs = std::collections::HashSet::new();
-                                                    let mut inactive_ticks = std::collections::HashMap::new();
-                                                    // Fractional phase counters per SSRC for smooth Hermite cubic sample rate conversion (48kHz -> out_sample_rate)
-                                                    let mut ssrc_phases: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
-                                                    let mut ssrc_histories: std::collections::HashMap<u32, [(f32, f32); 4]> = std::collections::HashMap::new();
-                                                    let _step = 48000.0f64 / out_sample_rate.max(1) as f64;
+
 
                                                     #[cfg(not(target_os = "linux"))]
                                                     let stream_config: cpal::StreamConfig = config.clone().into();
@@ -712,6 +678,7 @@ pub async fn connect_voice_gateway(
                                                             let broken_f32 = Arc::clone(&output_broken);
                                                             let sq_f32 = Arc::clone(&sq);
                                                             let ssrc_to_userid_f32 = Arc::clone(&ssrc_to_userid_spk);
+                                                            let mut mixer = VoiceMixer::new(out_sample_rate);
                                                             device.build_output_stream(
                                                                 &stream_config,
                                                                 move |output: &mut [f32], _| {
@@ -722,159 +689,10 @@ pub async fn connect_voice_gateway(
                                                                         return;
                                                                     }
                                                                     if CURRENT_VOICE_SESSION_ID.load(Ordering::SeqCst) != out_session_id || is_self_deaf() {
-                                                                        for s in output.iter_mut() { *s = 0.0; }
+                                                                        output.fill(0.0);
                                                                         return;
                                                                     }
-                                                                    for s in output.iter_mut() { *s = 0.0; }
-
-                                                                    if let Ok(mut queues) = sq_f32.lock() {
-                                                                        let frames = output.len() / out_channels.max(1);
-                                                                        let mut ready_ssrcs = Vec::new();
-                                                                        let mut to_remove = Vec::new();
-
-                                                                        for (&ssrc, q) in queues.iter() {
-                                                                            if q.is_empty() {
-                                                                                let ticks = inactive_ticks.entry(ssrc).or_insert(0);
-                                                                                *ticks += 1;
-                                                                                if *ticks > VOICE_RESET_INACTIVE_CALLBACKS {
-                                                                                    started_ssrcs.remove(&ssrc);
-                                                                                    ssrc_histories.remove(&ssrc);
-                                                                                    ssrc_phases.remove(&ssrc);
-                                                                                }
-                                                                                if *ticks > 150 {
-                                                                                    to_remove.push(ssrc);
-                                                                                }
-                                                                            } else {
-                                                                                inactive_ticks.insert(ssrc, 0);
-                                                                            }
-
-                                                                            if ssrc >= 0x8000_0000 {
-                                                                                if !q.is_empty() {
-                                                                                    started_ssrcs.insert(ssrc);
-                                                                                    ready_ssrcs.push(ssrc);
-                                                                                }
-                                                                            } else if started_ssrcs.contains(&ssrc) {
-                                                                                if !q.is_empty() {
-                                                                                    ready_ssrcs.push(ssrc);
-                                                                                }
-                                                                            } else if q.len() >= VOICE_PREBUFFER_SAMPLES { // 40ms Jitter Pre-buffer
-                                                                                started_ssrcs.insert(ssrc);
-                                                                                ready_ssrcs.push(ssrc);
-                                                                            }
-                                                                        }
-
-                                                                        for ssrc in to_remove {
-                                                                            queues.remove(&ssrc);
-                                                                            started_ssrcs.remove(&ssrc);
-                                                                            inactive_ticks.remove(&ssrc);
-                                                                            ssrc_phases.remove(&ssrc);
-                                                                            ssrc_histories.remove(&ssrc);
-                                                                        }
-
-                                                                        if ready_ssrcs.is_empty() { return; }
-
-                                                                        let mut ssrc_vol_map = std::collections::HashMap::new();
-                                                                        let mut max_active_priority = 0i32;
-                                                                        let active_spk_store = get_active_voice_participants_store();
-                                                                        let active_spk_map = active_spk_store.lock().ok();
-                                                                        if let Ok(spk_map) = ssrc_to_userid_f32.lock() {
-                                                                            for &ssrc in &ready_ssrcs {
-                                                                                let (is_muted, user_vol, user_prio) = if ssrc >= 0x8000_0000 {
-                                                                                    (false, 1.0f32, 0i32)
-                                                                                } else {
-                                                                                    let uid_num = spk_map.get(&ssrc)
-                                                                                        .or_else(|| active_spk_map.as_ref().and_then(|m| m.get(&ssrc)))
-                                                                                        .copied()
-                                                                                        .unwrap_or(ssrc as u64);
-
-                                                                                    let (is_muted_uid, vol_uid, prio_uid) = get_user_audio_settings(&uid_num.to_string());
-                                                                                    let (is_muted_ssrc, vol_ssrc, prio_ssrc) = get_user_audio_settings(&ssrc.to_string());
-                                                                                    let is_muted = is_muted_uid || is_muted_ssrc;
-                                                                                    let user_vol = if vol_uid != 1.0 { vol_uid } else { vol_ssrc };
-                                                                                    let user_prio = prio_uid.max(prio_ssrc);
-                                                                                    (is_muted, user_vol, user_prio)
-                                                                                };
-
-                                                                                if !is_muted {
-                                                                                    if user_prio > max_active_priority {
-                                                                                        max_active_priority = user_prio;
-                                                                                    }
-                                                                                }
-                                                                                ssrc_vol_map.insert(ssrc, (is_muted, user_vol, user_prio));
-                                                                            }
-                                                                        }
-
-                                                                        let mut aec_ref = Vec::with_capacity(frames);
-                                                                        for f in 0..frames {
-                                                                            let mut mixed_l = 0.0f32;
-                                                                            let mut mixed_r = 0.0f32;
-                                                                            for &ssrc in &ready_ssrcs {
-                                                                                let (is_muted, user_vol, user_prio) = ssrc_vol_map.get(&ssrc).copied().unwrap_or((false, 1.0, 0));
-                                                                                if is_muted { continue; }
-
-                                                                                let priority_multiplier = if max_active_priority > 0 && user_prio < max_active_priority {
-                                                                                    let diff = max_active_priority - user_prio;
-                                                                                    let mult = 0.5f32 - (diff as f32 - 1.0f32) * 0.1f32;
-                                                                                    mult.max(0.05f32)
-                                                                                } else {
-                                                                                    1.0f32
-                                                                                };
-                                                                                let effective_vol = user_vol * priority_multiplier;
-
-                                                                                if let Some(q) = queues.get_mut(&ssrc) {
-                                                                                    let phase = ssrc_phases.entry(ssrc).or_insert(0.0);
-                                                                                    let hist = ssrc_histories.entry(ssrc).or_insert([((0.0, 0.0)), ((0.0, 0.0)), ((0.0, 0.0)), ((0.0, 0.0))]);
-
-                                                                                    let step = 48000.0f64 / out_sample_rate.max(1) as f64;
-
-                                                                                    *phase += step;
-                                                                                    let pops = *phase as usize;
-                                                                                    if pops > 0 {
-                                                                                        *phase -= pops as f64;
-                                                                                        for _ in 0..pops {
-                                                                                            hist[0] = hist[1];
-                                                                                            hist[1] = hist[2];
-                                                                                            hist[2] = hist[3];
-                                                                                            if let Some(next_p) = q.pop_front() {
-                                                                                                if hist[0] == (0.0, 0.0) && hist[1] == (0.0, 0.0) && hist[2] == (0.0, 0.0) {
-                                                                                                    hist[0] = next_p;
-                                                                                                    hist[1] = next_p;
-                                                                                                    hist[2] = next_p;
-                                                                                                    hist[3] = next_p;
-                                                                                                } else {
-                                                                                                    hist[3] = next_p;
-                                                                                                }
-                                                                                            } else {
-                                                                                                let decay_l = if hist[2].0.abs() < 0.0001 { 0.0 } else { hist[2].0 * 0.999 };
-                                                                                                let decay_r = if hist[2].1.abs() < 0.0001 { 0.0 } else { hist[2].1 * 0.999 };
-                                                                                                hist[3] = (decay_l, decay_r);
-                                                                                            }
-                                                                                        }
-                                                                                    }
-                                                                                    let t = (*phase as f32).clamp(0.0, 1.0);
-                                                                                    let src_l = cubic_hermite(hist[0].0, hist[1].0, hist[2].0, hist[3].0, t);
-                                                                                    let src_r = cubic_hermite(hist[0].1, hist[1].1, hist[2].1, hist[3].1, t);
-
-                                                                                    mixed_l += src_l * effective_vol;
-                                                                                    mixed_r += src_r * effective_vol;
-                                                                                }
-                                                                            }
-
-                                                                            let limited_l = soft_limit(mixed_l);
-                                                                            let limited_r = soft_limit(mixed_r);
-                                                                            aec_ref.push((limited_l + limited_r) * 0.5);
-                                                                            if out_channels >= 2 {
-                                                                                output[f * out_channels + 0] = limited_l;
-                                                                                output[f * out_channels + 1] = limited_r;
-                                                                                for ch in 2..out_channels {
-                                                                                    output[f * out_channels + ch] = 0.0;
-                                                                                }
-                                                                            } else {
-                                                                                output[f] = soft_limit((mixed_l + mixed_r) * 0.5);
-                                                                            }
-                                                                        }
-                                                                        crate::audio::dsp::push_speaker_reference(&aec_ref);
-                                                                    }
+                                                                    fill_voice_output(output, out_channels, &mut mixer, &sq_f32, &ssrc_to_userid_f32, |s| s);
                                                                     #[cfg(feature = "automation")]
                                                                     crate::utils::test_hooks::voice_played_f32(output);
                                                                 },
@@ -890,6 +708,7 @@ pub async fn connect_voice_gateway(
                                                             let broken_i16 = Arc::clone(&output_broken);
                                                             let sq_i16 = Arc::clone(&sq);
                                                             let ssrc_to_userid_i16 = Arc::clone(&ssrc_to_userid_spk);
+                                                            let mut mixer = VoiceMixer::new(out_sample_rate);
                                                             device.build_output_stream(
                                                                 &stream_config,
                                                                 move |output: &mut [i16], _| {
@@ -900,153 +719,10 @@ pub async fn connect_voice_gateway(
                                                                         return;
                                                                     }
                                                                     if CURRENT_VOICE_SESSION_ID.load(Ordering::SeqCst) != out_session_id || is_self_deaf() {
-                                                                        for s in output.iter_mut() { *s = 0; }
+                                                                        output.fill(0);
                                                                         return;
                                                                     }
-                                                                    for s in output.iter_mut() { *s = 0; }
-
-                                                                    if let Ok(mut queues) = sq_i16.lock() {
-                                                                        let frames = output.len() / out_channels.max(1);
-                                                                        let mut ready_ssrcs = Vec::new();
-                                                                        let mut to_remove = Vec::new();
-
-                                                                        for (&ssrc, q) in queues.iter() {
-                                                                            if q.is_empty() {
-                                                                                let ticks = inactive_ticks.entry(ssrc).or_insert(0);
-                                                                                *ticks += 1;
-                                                                                if *ticks > VOICE_RESET_INACTIVE_CALLBACKS {
-                                                                                    started_ssrcs.remove(&ssrc);
-                                                                                    ssrc_histories.remove(&ssrc);
-                                                                                    ssrc_phases.remove(&ssrc);
-                                                                                }
-                                                                                if *ticks > 150 {
-                                                                                    to_remove.push(ssrc);
-                                                                                }
-                                                                            } else {
-                                                                                inactive_ticks.insert(ssrc, 0);
-                                                                            }
-
-                                                                            if ssrc >= 0x8000_0000 {
-                                                                                if !q.is_empty() {
-                                                                                    started_ssrcs.insert(ssrc);
-                                                                                    ready_ssrcs.push(ssrc);
-                                                                                }
-                                                                            } else if started_ssrcs.contains(&ssrc) {
-                                                                                if !q.is_empty() {
-                                                                                    ready_ssrcs.push(ssrc);
-                                                                                }
-                                                                            } else if q.len() >= VOICE_PREBUFFER_SAMPLES { // 40ms Jitter Pre-buffer
-                                                                                started_ssrcs.insert(ssrc);
-                                                                                ready_ssrcs.push(ssrc);
-                                                                            }
-                                                                        }
-
-                                                                        for ssrc in to_remove {
-                                                                            queues.remove(&ssrc);
-                                                                            started_ssrcs.remove(&ssrc);
-                                                                            inactive_ticks.remove(&ssrc);
-                                                                            ssrc_phases.remove(&ssrc);
-                                                                            ssrc_histories.remove(&ssrc);
-                                                                        }
-
-                                                                        if ready_ssrcs.is_empty() { return; }
-
-                                                                        let mut ssrc_vol_map_i16 = std::collections::HashMap::new();
-                                                                        let mut max_active_priority_i16 = 0i32;
-                                                                        let active_spk_store_i16 = get_active_voice_participants_store();
-                                                                        let active_spk_map_i16 = active_spk_store_i16.lock().ok();
-                                                                        if let Ok(spk_map) = ssrc_to_userid_i16.lock() {
-                                                                            for &ssrc in &ready_ssrcs {
-                                                                                let (is_muted, user_vol, user_prio) = if ssrc >= 0x8000_0000 {
-                                                                                    (false, 1.0f32, 0i32)
-                                                                                } else {
-                                                                                    let uid_num = spk_map.get(&ssrc)
-                                                                                        .or_else(|| active_spk_map_i16.as_ref().and_then(|m| m.get(&ssrc)))
-                                                                                        .copied()
-                                                                                        .unwrap_or(ssrc as u64);
-
-                                                                                    let (is_muted_uid, vol_uid, prio_uid) = get_user_audio_settings(&uid_num.to_string());
-                                                                                    let (is_muted_ssrc, vol_ssrc, prio_ssrc) = get_user_audio_settings(&ssrc.to_string());
-                                                                                    let is_muted = is_muted_uid || is_muted_ssrc;
-                                                                                    let user_vol = if vol_uid != 1.0 { vol_uid } else { vol_ssrc };
-                                                                                    let user_prio = prio_uid.max(prio_ssrc);
-                                                                                    (is_muted, user_vol, user_prio)
-                                                                                };
-
-                                                                                if !is_muted {
-                                                                                    if user_prio > max_active_priority_i16 {
-                                                                                        max_active_priority_i16 = user_prio;
-                                                                                    }
-                                                                                }
-                                                                                ssrc_vol_map_i16.insert(ssrc, (is_muted, user_vol, user_prio));
-                                                                            }
-                                                                        }
-
-                                                                        let mut aec_ref = Vec::with_capacity(frames);
-                                                                        for f in 0..frames {
-                                                                            let mut mixed_l = 0.0f32;
-                                                                            let mut mixed_r = 0.0f32;
-                                                                            for &ssrc in &ready_ssrcs {
-                                                                                let (is_muted, user_vol, user_prio) = ssrc_vol_map_i16.get(&ssrc).copied().unwrap_or((false, 1.0, 0));
-                                                                                if is_muted { continue; }
-
-                                                                                let priority_multiplier = if max_active_priority_i16 > 0 && user_prio < max_active_priority_i16 {
-                                                                                    let diff = max_active_priority_i16 - user_prio;
-                                                                                    let mult = 0.5f32 - (diff as f32 - 1.0f32) * 0.1f32;
-                                                                                    mult.max(0.05f32)
-                                                                                } else {
-                                                                                    1.0f32
-                                                                                };
-                                                                                let effective_vol = user_vol * priority_multiplier;
-
-                                                                                if let Some(q) = queues.get_mut(&ssrc) {
-                                                                                    let phase = ssrc_phases.entry(ssrc).or_insert(0.0);
-                                                                                    let hist = ssrc_histories.entry(ssrc).or_insert([((0.0, 0.0)), ((0.0, 0.0)), ((0.0, 0.0)), ((0.0, 0.0))]);
-
-                                                                                    let step = 48000.0f64 / out_sample_rate.max(1) as f64;
-
-                                                                                    *phase += step;
-                                                                                    let pops = *phase as usize;
-                                                                                    if pops > 0 {
-                                                                                        *phase -= pops as f64;
-                                                                                        for _ in 0..pops {
-                                                                                            hist[0] = hist[1];
-                                                                                            hist[1] = hist[2];
-                                                                                            hist[2] = hist[3];
-                                                                                            if let Some(next_p) = q.pop_front() {
-                                                                                                hist[3] = next_p;
-                                                                                            } else {
-                                                                                                hist[3] = (hist[2].0 * 0.995, hist[2].1 * 0.995);
-                                                                                            }
-                                                                                        }
-                                                                                    }
-                                                                                    let t = (*phase as f32).clamp(0.0, 1.0);
-                                                                                    let src_l = cubic_hermite(hist[0].0, hist[1].0, hist[2].0, hist[3].0, t);
-                                                                                    let src_r = cubic_hermite(hist[0].1, hist[1].1, hist[2].1, hist[3].1, t);
-
-                                                                                    mixed_l += src_l * effective_vol;
-                                                                                    mixed_r += src_r * effective_vol;
-                                                                                }
-                                                                            }
-
-                                                                            let limited_l = soft_limit(mixed_l);
-                                                                            let limited_r = soft_limit(mixed_r);
-                                                                            aec_ref.push((limited_l + limited_r) * 0.5);
-
-                                                                            let clamped_l = (limited_l * 32767.0) as i16;
-                                                                            let clamped_r = (limited_r * 32767.0) as i16;
-                                                                            if out_channels >= 2 {
-                                                                                output[f * out_channels + 0] = clamped_l;
-                                                                                output[f * out_channels + 1] = clamped_r;
-                                                                                for ch in 2..out_channels {
-                                                                                    output[f * out_channels + ch] = 0;
-                                                                                }
-                                                                            } else {
-                                                                                output[f] = (soft_limit((mixed_l + mixed_r) * 0.5) * 32767.0) as i16;
-                                                                            }
-                                                                        }
-                                                                        crate::audio::dsp::push_speaker_reference(&aec_ref);
-                                                                    }
+                                                                    fill_voice_output(output, out_channels, &mut mixer, &sq_i16, &ssrc_to_userid_i16, |s| (s * 32767.0) as i16);
                                                                     #[cfg(feature = "automation")]
                                                                     crate::utils::test_hooks::voice_played_i16(output);
                                                                 },
@@ -1120,6 +796,10 @@ pub async fn connect_voice_gateway(
                                                         }
                                                         Err(e) => {
                                                             warn!("Falha ao criar stream de saída: {:?}", e);
+                                                            if asked_48k {
+                                                                info!("Voice output: the device refused 48000 Hz; going back to its default rate.");
+                                                                try_48k = false;
+                                                            }
                                                             std::thread::sleep(std::time::Duration::from_millis(500));
                                                         }
                                                     }
@@ -1924,6 +1604,45 @@ async fn dave_start_over(
 /// An output stream whose callback has not run for this long is rebuilt.
 const OUTPUT_STALL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// One output callback: mixes the queued voices (`VoiceMixer`) and writes them in the
+/// device's channel layout and sample type. Used by the f32 and the i16 stream alike.
+fn fill_voice_output<T: Copy + Default>(
+    output: &mut [T],
+    out_channels: usize,
+    mixer: &mut VoiceMixer,
+    queues: &std::sync::Mutex<HashMap<u32, VecDeque<(f32, f32)>>>,
+    ssrc_to_userid: &std::sync::Mutex<HashMap<u32, u64>>,
+    convert: impl Fn(f32) -> T,
+) {
+    output.fill(T::default());
+    let out_channels = out_channels.max(1);
+    let frames = output.len() / out_channels;
+    let Ok(mut queues) = queues.lock() else { return };
+    let active_store = get_active_voice_participants_store();
+    let mixed = mixer.mix(&mut queues, frames, smart_ducking(), |ssrc| {
+        let uid = ssrc_to_userid.lock().ok().and_then(|m| m.get(&ssrc).copied())
+            .or_else(|| active_store.lock().ok().and_then(|m| m.get(&ssrc).copied()))
+            .unwrap_or(ssrc as u64);
+        let (muted_uid, vol_uid, prio_uid) = get_user_audio_settings(&uid.to_string());
+        let (muted_ssrc, vol_ssrc, prio_ssrc) = get_user_audio_settings(&ssrc.to_string());
+        (muted_uid || muted_ssrc, if vol_uid != 1.0 { vol_uid } else { vol_ssrc }, prio_uid.max(prio_ssrc))
+    });
+    if mixed.is_empty() {
+        return;
+    }
+    let mut aec_ref = Vec::with_capacity(frames);
+    for (f, &(l, r)) in mixed.iter().enumerate() {
+        aec_ref.push((l + r) * 0.5);
+        if out_channels >= 2 {
+            output[f * out_channels] = convert(l);
+            output[f * out_channels + 1] = convert(r);
+        } else {
+            output[f] = convert((l + r) * 0.5);
+        }
+    }
+    crate::audio::dsp::push_speaker_reference(&aec_ref);
+}
+
 /// Wait before looking for an output device again: 0.5 s, doubling up to 5 s.
 fn next_no_device_wait(previous: Option<Duration>) -> Duration {
     previous.map_or(Duration::from_millis(500), |d| (d * 2).min(Duration::from_secs(5)))
@@ -2004,24 +1723,11 @@ mod output_device_wait_tests {
     }
 }
 
-fn decoded_voice_pairs(pcm: &[f32], channels: usize) -> Vec<(f32, f32)> {
-    if channels == 2 {
-        pcm.chunks_exact(2).map(|s| (s[0].clamp(-1.0, 1.0), s[1].clamp(-1.0, 1.0))).collect()
-    } else {
-        pcm.iter().map(|s| { let mono = s.clamp(-1.0, 1.0); (mono, mono) }).collect()
-    }
-}
-
-fn push_voice_frame(q: &mut VecDeque<(f32, f32)>, plc: &[(f32, f32)], decoded: &[(f32, f32)]) {
-    let incoming = plc.len().saturating_add(decoded.len());
-    let discard = q.len().saturating_add(incoming).saturating_sub(VOICE_QUEUE_LIMIT);
-    q.drain(..discard.min(q.len()));
-    q.extend(plc.iter().chain(decoded).skip(incoming.saturating_sub(VOICE_QUEUE_LIMIT)).copied());
-}
 
 #[cfg(test)]
 mod voice_playout_tests {
     use super::*;
+    use crate::gateway::voice_rx::decoded_voice_pairs;
 
     #[test]
     fn quiet_speech_keeps_its_samples_in_mono_and_stereo() {

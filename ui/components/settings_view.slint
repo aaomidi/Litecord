@@ -65,6 +65,7 @@ export component SettingsView inherits Rectangle {
     in property <[SettingOptionItem]> audio_loopback_options;
     in property <bool> enable_self_preview_notice;
     in property <bool> allow_web_link_requests;
+    in property <bool> smart_voice_ducking;
     in property <bool> show_hardware_monitor;
     in property <bool> use_gpu_renderer;
     in property <string> selected_ui_scale: "0";   // percent, "0" for the system's own
@@ -105,6 +106,7 @@ export component SettingsView inherits Rectangle {
     callback select_audio_loopback_backend(string);
     callback toggle_enable_self_preview_notice();
     callback toggle_allow_web_link_requests();
+    callback toggle_smart_voice_ducking();
     callback toggle_hardware_monitor();
     callback toggle_gpu_renderer();
     callback select_ui_scale(string);
@@ -376,10 +378,11 @@ export component SettingsView inherits Rectangle {
 
                             SettingsSection {
                                 last: true;
-                                SettingsRow {
+                                SettingsSwitchRow {
                                     title: Tr.ducking;
                                     desc: Tr.ducking_desc;
-                                    Text { text: Tr.ducking_active; color: AppTheme.success; font-size: TypeScale.caption; font-weight: 700; }
+                                    checked: root.smart_voice_ducking;
+                                    toggled => { root.toggle_smart_voice_ducking(); }
                                 }
                             }
                         }

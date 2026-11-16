@@ -342,6 +342,7 @@ export component AppWindow inherits Window {
     in-out property <string> selected_audio_loopback_backend: "auto";
     in-out property <bool> enable_self_preview_notice: true;
     in-out property <bool> allow_web_link_requests: true;
+    in-out property <bool> smart_voice_ducking: false;
     in-out property <bool> show_hardware_monitor: true;
     in-out property <bool> use_gpu_renderer: false;
     in-out property <string> selected_ui_scale: "0";
@@ -369,6 +370,7 @@ export component AppWindow inherits Window {
     callback select_audio_loopback_backend(string);
     callback toggle_enable_self_preview_notice();
     callback toggle_allow_web_link_requests();
+    callback toggle_smart_voice_ducking();
     callback toggle_hardware_monitor();
     callback toggle_gpu_renderer();
     callback select_ui_scale(string);
@@ -3384,6 +3386,7 @@ export component AppWindow inherits Window {
         audio_loopback_options: root.audio_loopback_options;
         enable_self_preview_notice: root.enable_self_preview_notice;
         allow_web_link_requests: root.allow_web_link_requests;
+        smart_voice_ducking: root.smart_voice_ducking;
         show_hardware_monitor: root.show_hardware_monitor;
         use_gpu_renderer: root.use_gpu_renderer;
         selected_ui_scale: root.selected_ui_scale;
@@ -3423,6 +3426,7 @@ export component AppWindow inherits Window {
         select_audio_loopback_backend(arg0) => { root.select_audio_loopback_backend(arg0); }
         toggle_enable_self_preview_notice => { root.toggle_enable_self_preview_notice(); }
         toggle_allow_web_link_requests => { root.toggle_allow_web_link_requests(); }
+        toggle_smart_voice_ducking => { root.toggle_smart_voice_ducking(); }
         toggle_hardware_monitor => { root.toggle_hardware_monitor(); }
         toggle_gpu_renderer => { root.toggle_gpu_renderer(); }
         select_ui_scale(arg0) => { root.select_ui_scale(arg0); }

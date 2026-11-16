@@ -2541,6 +2541,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let app_weak_ducking = app_weak.clone();
+    app.on_toggle_smart_voice_ducking(move || {
+        let new_val = video_settings::toggle_smart_voice_ducking();
+        gateway::voice_rx::set_smart_ducking(new_val);
+        if let Some(ui) = app_weak_ducking.upgrade() {
+            ui.set_smart_voice_ducking(new_val);
+        }
+    });
+
     let app_weak_hw = app_weak.clone();
     app.on_toggle_hardware_monitor(move || {
         let new_val = video_settings::toggle_show_hardware_monitor();
