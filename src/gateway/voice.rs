@@ -11,16 +11,15 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use log::{info, error, warn};
-use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
-    Aes256Gcm, Nonce
-};
 use opus_rs::{OpusEncoder, Application};
 use davey::{DaveSession, ProposalsOperationType, MediaType};
 
 use super::types::*;
 
-use super::voice_rx::{VoiceMixer, VoiceRxDecoder, push_voice_frame, smart_ducking, VOICE_QUEUE_LIMIT, VOICE_UNDERRUNS};
+use super::voice_rx::{
+    VoiceCipher, VoiceMixer, VoiceRxDecoder, RtpOpenError, push_voice_frame, select_voice_mode, smart_ducking,
+    VOICE_MODE_AES256_GCM, VOICE_MODE_XCHACHA20, VOICE_QUEUE_LIMIT, VOICE_UNDERRUNS,
+};
 
 pub async fn connect_voice_gateway(
     raw_endpoint: &str,
@@ -161,13 +160,18 @@ pub async fn connect_voice_gateway(
                                     let voice_ip = val["d"]["ip"].as_str().unwrap_or("").to_string();
                                     let voice_port = val["d"]["port"].as_u64().unwrap_or(0) as u16;
 
-                                    let selected_mode = if let Some(modes) = val["d"]["modes"].as_array() {
-                                        modes.iter()
-                                            .find_map(|m| m.as_str())
-                                            .unwrap_or("aead_aes256_gcm_rtpsize")
-                                            .to_string()
-                                    } else {
-                                        "aead_aes256_gcm_rtpsize".to_string()
+                                    // AES-256-GCM when the server offers it, otherwise XChaCha20-Poly1305
+                                    // (always offered). Not simply the first of the list: the packets are
+                                    // encrypted with the mode named here, whatever the list starts with.
+                                    let offered_modes: Vec<&str> = val["d"]["modes"].as_array()
+                                        .map(|modes| modes.iter().filter_map(|m| m.as_str()).collect())
+                                        .unwrap_or_default();
+                                    let selected_mode = match select_voice_mode(offered_modes.iter().copied()) {
+                                        Some(mode) => mode.to_string(),
+                                        None => {
+                                            warn!("Voice: the server offers none of the supported encryption modes ({:?}); asking for {} anyway.", offered_modes, VOICE_MODE_AES256_GCM);
+                                            VOICE_MODE_AES256_GCM.to_string()
+                                        }
                                     };
 
                                     info!("🎉 VOICE GATEWAY PRONTA (Opcode 2 READY)! SSRC={}, IP={}:{}, Encryption Mode={}", ssrc, voice_ip, voice_port, selected_mode);
@@ -275,6 +279,8 @@ pub async fn connect_voice_gateway(
 
                                                 // 4. Spawn incoming UDP voice receive loop
                                                 let socket_rx = Arc::clone(&socket);
+                                                let rx_mode = selected_mode.clone();
+                                                let tx_mode = selected_mode.clone();
                                                 let secret_key_rx = Arc::clone(&secret_key_udp);
                                                 let dave_session_rx = Arc::clone(&dave_session_audio);
                                                 let dave_flow_rx = Arc::clone(&dave_flow_audio);
@@ -290,6 +296,11 @@ pub async fn connect_voice_gateway(
                                                     let mut recv_buf = vec![0u8; 4096];
                                                     let mut detected_ssrcs = std::collections::HashSet::new();
                                                     let mut decrypt_err_cnt = 0u64;
+                                                    let mut malformed_cnt = 0u64;
+                                                    let mut padded_ok_cnt = 0u64;
+                                                    let mut probe_cnt = 0u64;
+                                                    let mut rx_cipher: Option<(Vec<u8>, VoiceCipher)> = None;
+                                                    let mut last_prune_ms = 0u64;
                                                     let mut opus_err_cnt = 0u64;
                                                     let mut dave_decrypt_fail_cnt = 0u64;
                                                     let mut dave_plaintext_cnt = 0u64;
@@ -313,109 +324,55 @@ pub async fn connect_voice_gateway(
                                                                 let ssrc_recv = u32::from_be_bytes([pkt[8], pkt[9], pkt[10], pkt[11]]);
                                                                 if ssrc_recv == my_ssrc { continue; }
 
-                                                                if detected_ssrcs.insert(ssrc_recv) {
-                                                                    info!("🎙️ NOVO SSRC DE VOZ REMOTO RECEBIDO! SSRC={} de {}", ssrc_recv, addr);
-                                                                }
-
-                                                                 let cc = (pkt[0] & 0x0F) as usize;
-                                                                let has_ext = (pkt[0] & 0x10) != 0;
-                                                                let base_header_len = 12 + 4 * cc;
-
-                                                                let ext_len_words = if has_ext && len >= base_header_len + 4 {
-                                                                    u16::from_be_bytes([pkt[base_header_len + 2], pkt[base_header_len + 3]]) as usize
-                                                                } else {
-                                                                    0
-                                                                };
-                                                                let ext_bytes_len = ext_len_words * 4;
-
-                                                                // rtpsize nonce: last 4 bytes of packet, padding byte before nonce if P bit set
-                                                                let has_padding = (pkt[0] & 0x20) != 0;
-                                                                let padding_len = if has_padding && len > 5 {
-                                                                    pkt[len - 5] as usize
-                                                                } else {
-                                                                    0
-                                                                };
-
-                                                                let ciphertext_end = if len >= 4 + padding_len && len - 4 - padding_len > base_header_len {
-                                                                    len - 4 - padding_len
-                                                                } else {
-                                                                    len - 4
-                                                                };
-
-                                                                if ciphertext_end <= base_header_len { continue; }
-
-                                                                let nonce_bytes_rx: [u8; 4] = [pkt[len-4], pkt[len-3], pkt[len-2], pkt[len-1]];
-                                                                let nonce_u32_le = u32::from_le_bytes(nonce_bytes_rx);
-                                                                let nonce_u32_be = u32::from_be_bytes(nonce_bytes_rx);
-
-                                                                let mut n1 = [0u8; 12]; n1[0..4].copy_from_slice(&nonce_bytes_rx);
-                                                                let mut n2 = [0u8; 12]; n2[8..12].copy_from_slice(&nonce_bytes_rx);
-                                                                let mut n3 = [0u8; 12]; n3[0..4].copy_from_slice(&nonce_u32_le.to_be_bytes());
-                                                                let mut n4 = [0u8; 12]; n4[8..12].copy_from_slice(&nonce_u32_le.to_be_bytes());
-                                                                let mut n5 = [0u8; 12]; n5[0..4].copy_from_slice(&nonce_u32_be.to_le_bytes());
-                                                                let mut n6 = [0u8; 12]; n6[8..12].copy_from_slice(&nonce_u32_be.to_le_bytes());
-
-                                                                let nonce_candidates = [&n1, &n2, &n3, &n4, &n5, &n6];
-
                                                                 let key_opt = secret_key_rx.lock().unwrap().clone();
                                                                 if let Some(key_bytes) = key_opt {
-                                                                    if let Ok(cipher) = Aes256Gcm::new_from_slice(&key_bytes) {
-                                                                        let candidates: &[(usize, usize)] = if has_ext {
-                                                                            &[
-                                                                                (base_header_len + 4, ext_bytes_len),
-                                                                                (base_header_len + 4 + ext_bytes_len, 0),
-                                                                                (base_header_len, ext_bytes_len + 4),
-                                                                                (base_header_len, 0),
-                                                                            ]
-                                                                        } else {
-                                                                            &[(base_header_len, 0)]
-                                                                        };
-
-                                                                        let mut decrypted_opt: Option<(Vec<u8>, usize)> = None;
-
-                                                                        // With the padding bit set, the byte before the nonce is first read as a
-                                                                        // padding length. If the padding is encrypted with the payload that byte
-                                                                        // is part of the GCM tag instead, so the whole ciphertext is tried too.
-                                                                        let ciphertext_ends = [ciphertext_end, len - 4];
-                                                                        let ciphertext_ends = if ciphertext_end == len - 4 { &ciphertext_ends[..1] } else { &ciphertext_ends[..] };
-                                                                        'try_decrypt: for &ct_end in ciphertext_ends {
-                                                                            for &(test_aad_len, test_ext_len) in candidates {
-                                                                                if test_aad_len >= ct_end { continue; }
-                                                                                let header = &pkt[..test_aad_len];
-                                                                                let ciphertext = &pkt[test_aad_len..ct_end];
-
-                                                                                for &nonce_cand in &nonce_candidates {
-                                                                                    let payload = aes_gcm::aead::Payload { msg: ciphertext, aad: header };
-                                                                                    if let Ok(dec) = cipher.decrypt(Nonce::from_slice(nonce_cand), payload) {
-                                                                                        if dec.len() >= test_ext_len {
-                                                                                            decrypted_opt = Some((dec, test_ext_len));
-                                                                                            break 'try_decrypt;
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                            }
+                                                                    if rx_cipher.as_ref().map_or(true, |(k, _)| *k != key_bytes) {
+                                                                        rx_cipher = VoiceCipher::new(&rx_mode, &key_bytes).map(|c| (key_bytes.clone(), c));
+                                                                        if rx_cipher.is_none() {
+                                                                            warn!("Voice RX: no cipher for mode '{}' with a {}-byte key: incoming voice cannot be decrypted.", rx_mode, key_bytes.len());
                                                                         }
-
-                                                                        let (decrypted_raw, ext_skip) = match decrypted_opt {
-                                                                            Some(res) => {
-                                                                                static LOGGED_SUCCESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                                                                                if !LOGGED_SUCCESS.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                                                                                    info!("🎉 Descriptografia AES-GCM BEM-SUCEDIDA para SSRC {}! ext_skip={} bytes", ssrc_recv, res.1);
-                                                                                }
-                                                                                res
-                                                                            },
-                                                                            None => {
+                                                                    }
+                                                                    if let Some((_, cipher)) = rx_cipher.as_ref() {
+                                                                        // One layout for both modes (see VoiceCipher): header, CSRCs and the
+                                                                        // extension preamble in the clear; extension body, payload and RTP
+                                                                        // padding encrypted. The padding is removed here, before DAVE, which
+                                                                        // looks for its marker at the very end of the frame.
+                                                                        let has_padding = (pkt[0] & 0x20) != 0;
+                                                                        let decrypted = match cipher.open(pkt) {
+                                                                            Ok(payload) => payload,
+                                                                            Err(RtpOpenError::Auth) => {
                                                                                 decrypt_err_cnt += 1;
                                                                                 if decrypt_err_cnt % 50 == 1 {
-                                                                                    warn!("Descriptografia AES-GCM falhou para SSRC {}: len={} has_ext={} cc={} base_len={} ext_words={} padding={} pad_len={} header={:02X?} nonce={:02X?}",
-                                                                                        ssrc_recv, len, has_ext, cc, base_header_len, ext_len_words, has_padding, padding_len, &pkt[..16.min(len)], nonce_bytes_rx);
+                                                                                    warn!("Voice transport decryption failed ({}) for SSRC {}: len={} padding={} header={:02X?} nonce={:02X?} ({} failures so far)",
+                                                                                        cipher.mode(), ssrc_recv, len, has_padding, &pkt[..16.min(len)], &pkt[len - 4..], decrypt_err_cnt);
+                                                                                }
+                                                                                continue;
+                                                                            }
+                                                                            Err(e) => {
+                                                                                malformed_cnt += 1;
+                                                                                if malformed_cnt % 50 == 1 {
+                                                                                    warn!("Voice RX: dropped a malformed packet ({:?}) from SSRC {}: len={} header={:02X?} ({} so far)",
+                                                                                        e, ssrc_recv, len, &pkt[..16.min(len)], malformed_cnt);
                                                                                 }
                                                                                 continue;
                                                                             }
                                                                         };
-
-                                                                        if decrypted_raw.len() < ext_skip { continue; }
-                                                                        let transport_payload = &decrypted_raw[ext_skip..];
+                                                                        // Only now is the packet known to come from the voice server.
+                                                                        if detected_ssrcs.insert(ssrc_recv) {
+                                                                            info!("Voice RX: first packet from SSRC {} ({}), transport decryption OK ({}).", ssrc_recv, addr, cipher.mode());
+                                                                        }
+                                                                        if has_padding {
+                                                                            padded_ok_cnt += 1;
+                                                                            if padded_ok_cnt == 1 {
+                                                                                info!("Voice RX: first packet with RTP padding decrypted (SSRC {}, len={}, payload {} bytes). These used to be dropped.", ssrc_recv, len, decrypted.len());
+                                                                            }
+                                                                        }
+                                                                        if decrypted.is_empty() {
+                                                                            // Padding only (a bandwidth probe): no audio in it.
+                                                                            probe_cnt += 1;
+                                                                            continue;
+                                                                        }
+                                                                        let transport_payload = &decrypted[..];
 
                                                                         let user_id_opt = ssrc_to_userid_rx.lock().unwrap().get(&ssrc_recv).copied();
                                                                         let sender_user_id = user_id_opt.unwrap_or(ssrc_recv as u64);
@@ -525,13 +482,6 @@ pub async fn connect_voice_gateway(
                                                                                 raw_opus = &raw_opus[1..];
                                                                             }
 
-                                                                            if (pkt[0] & 0x20) != 0 && !raw_opus.is_empty() {
-                                                                                let pad_len = raw_opus[raw_opus.len() - 1] as usize;
-                                                                                if pad_len > 0 && pad_len <= raw_opus.len() {
-                                                                                    raw_opus = &raw_opus[..raw_opus.len() - pad_len];
-                                                                                }
-                                                                            }
-
                                                                             if raw_opus.is_empty() { continue; }
 
                                                                             let rtp_seq = u16::from_be_bytes([pkt[2], pkt[3]]);
@@ -541,13 +491,22 @@ pub async fn connect_voice_gateway(
 
                                                                             // Decode, with concealment of the packets lost before this one
                                                                             // (a new talkspurt after a pause conceals nothing).
+                                                                            let now_ms = rx_clock.elapsed().as_millis() as u64;
+                                                                            if now_ms.saturating_sub(last_prune_ms) > 60_000 {
+                                                                                // Decoder state of members who left (about 0.5 MB each).
+                                                                                last_prune_ms = now_ms;
+                                                                                rx_decoders.retain(|ssrc, d| *ssrc == ssrc_recv || d.idle_ms(now_ms) < 300_000);
+                                                                            }
+                                                                            // How much of this member is still waiting to be played: decides
+                                                                            // how many lost frames are worth concealing.
+                                                                            let queued = speaker_queues_rx.lock().ok().map(|queues| queues.get(&ssrc_recv).map_or(0, |q| q.len()));
                                                                             let rx = rx_decoders.entry(ssrc_recv).or_insert_with(VoiceRxDecoder::new);
-                                                                            let frame = rx.packet(rtp_seq, rtp_timestamp, raw_opus, rx_clock.elapsed().as_millis() as u64);
+                                                                            let frame = rx.packet_for_playout(rtp_seq, rtp_timestamp, raw_opus, now_ms, queued);
                                                                             if let Some(e) = frame.error {
-                                                                                warn!("📊 [OPUS DIAG] Decode FALHOU: {:?}", e);
                                                                                 opus_err_cnt += 1;
                                                                                 if opus_err_cnt % 50 == 1 {
-                                                                                    warn!("📊 [MÉTRICA DE ERRO] Opus decode falhou para SSRC {} (Erros={})", ssrc_recv, opus_err_cnt);
+                                                                                    warn!("Voice RX: Opus decode failed for SSRC {} ({} bytes, first byte {:02X}): {} ({} failures so far)",
+                                                                                        ssrc_recv, raw_opus.len(), raw_opus[0], e, opus_err_cnt);
                                                                                 }
                                                                             }
                                                                             if !frame.decoded.is_empty() || !frame.concealed.is_empty() {
@@ -566,9 +525,9 @@ pub async fn connect_voice_gateway(
                                                                             // comparing calls: after 5 s of speech, then every 30 s of it.
                                                                             let s = &rx.stats;
                                                                             if s.packets == 250 || s.packets % 1500 == 0 {
-                                                                                info!("Voice RX stats SSRC={}: packets={} SILK={} hybrid={} CELT={} stereo={} with_fec={} silence_frames={} concealed={} conceal_failed={} late_or_duplicate={} decode_errors={} | all members: transport_decrypt_failures={} dave_decrypt_failures={} playout_underruns={}",
-                                                                                    ssrc_recv, s.packets, s.silk, s.hybrid, s.celt, s.stereo, s.with_fec, s.silence_frames, s.concealed, s.conceal_failed, s.late_dropped, s.decode_errors,
-                                                                                    decrypt_err_cnt, dave_decrypt_fail_cnt, VOICE_UNDERRUNS.load(Ordering::Relaxed));
+                                                                                info!("Voice RX stats SSRC={}: packets={} SILK={} hybrid={} CELT={} stereo={} with_fec={} silence_frames={} concealed={} concealed_as_silence={} conceal_failed={} conceal_skipped={} late_or_duplicate={} seq_jumps={} decode_errors={} decoder_panics={} | all members: padded_packets_ok={} transport_decrypt_failures={} malformed={} padding_only={} dave_decrypt_failures={} playout_underruns={}",
+                                                                                    ssrc_recv, s.packets, s.silk, s.hybrid, s.celt, s.stereo, s.with_fec, s.silence_frames, s.concealed, s.concealed_as_silence, s.conceal_failed, s.conceal_skipped, s.late_dropped, s.seq_jumps, s.decode_errors, s.decoder_panics,
+                                                                                    padded_ok_cnt, decrypt_err_cnt, malformed_cnt, probe_cnt, dave_decrypt_fail_cnt, VOICE_UNDERRUNS.load(Ordering::Relaxed));
                                                                             }
                                                                         }
                                                                             }
@@ -592,6 +551,8 @@ pub async fn connect_voice_gateway(
                                                     let mut no_device_wait: Option<Duration> = None;
                                                     let mut output_retry_wait: Option<Duration> = None;
                                                     let mut try_48k = true;
+                                                    // Loads the per-member volume file now, not in the first callback.
+                                                    let _ = get_user_audio_settings_store();
 
                                                     while CURRENT_VOICE_SESSION_ID.load(Ordering::SeqCst) == out_session_id {
                                                         let host = cpal::default_host();
@@ -642,7 +603,9 @@ pub async fn connect_voice_gateway(
                                                         // Opus decodes at 48 kHz. A device that offers that rate (PipeWire and
                                                         // PulseAudio do, whatever default cpal picks) plays the decoded samples
                                                         // as they are; any other rate goes through the resampler of VoiceMixer.
-                                                        let config = if try_48k {
+                                                        // Not on macOS: there the request changes the device's rate for every
+                                                        // application (not tried on a Mac).
+                                                        let config = if try_48k && !cfg!(target_os = "macos") {
                                                             let ranges = device.supported_output_configs().map(|r| r.collect::<Vec<_>>()).unwrap_or_default();
                                                             crate::audio::engine::voice_output_config_at_48k(default_config.clone(), ranges)
                                                         } else {
@@ -678,7 +641,7 @@ pub async fn connect_voice_gateway(
                                                             let broken_f32 = Arc::clone(&output_broken);
                                                             let sq_f32 = Arc::clone(&sq);
                                                             let ssrc_to_userid_f32 = Arc::clone(&ssrc_to_userid_spk);
-                                                            let mut mixer = VoiceMixer::new(out_sample_rate);
+                                                            let mut voice_out = VoiceOutput::new(out_sample_rate);
                                                             device.build_output_stream(
                                                                 &stream_config,
                                                                 move |output: &mut [f32], _| {
@@ -688,13 +651,18 @@ pub async fn connect_voice_gateway(
                                                                         output.fill(0.0);
                                                                         return;
                                                                     }
-                                                                    if CURRENT_VOICE_SESSION_ID.load(Ordering::SeqCst) != out_session_id || is_self_deaf() {
+                                                                    if CURRENT_VOICE_SESSION_ID.load(Ordering::SeqCst) != out_session_id {
                                                                         output.fill(0.0);
                                                                         return;
                                                                     }
-                                                                    fill_voice_output(output, out_channels, &mut mixer, &sq_f32, &ssrc_to_userid_f32, |s| s);
+                                                                    // Deafened: the voices are still played out, into nothing. Left
+                                                                    // waiting they would be heard, 0.6 s old, when the output returns.
+                                                                    let audible = !is_self_deaf();
+                                                                    fill_voice_output(output, out_channels, &mut voice_out, &sq_f32, &ssrc_to_userid_f32, audible, |s| s);
                                                                     #[cfg(feature = "automation")]
-                                                                    crate::utils::test_hooks::voice_played_f32(output);
+                                                                    if audible {
+                                                                        crate::utils::test_hooks::voice_played_f32(output);
+                                                                    }
                                                                 },
                                                                 move |err| {
                                                                     warn!("Erro no stream de saída F32: {:?}", err);
@@ -708,7 +676,7 @@ pub async fn connect_voice_gateway(
                                                             let broken_i16 = Arc::clone(&output_broken);
                                                             let sq_i16 = Arc::clone(&sq);
                                                             let ssrc_to_userid_i16 = Arc::clone(&ssrc_to_userid_spk);
-                                                            let mut mixer = VoiceMixer::new(out_sample_rate);
+                                                            let mut voice_out = VoiceOutput::new(out_sample_rate);
                                                             device.build_output_stream(
                                                                 &stream_config,
                                                                 move |output: &mut [i16], _| {
@@ -718,13 +686,18 @@ pub async fn connect_voice_gateway(
                                                                         output.fill(0);
                                                                         return;
                                                                     }
-                                                                    if CURRENT_VOICE_SESSION_ID.load(Ordering::SeqCst) != out_session_id || is_self_deaf() {
+                                                                    if CURRENT_VOICE_SESSION_ID.load(Ordering::SeqCst) != out_session_id {
                                                                         output.fill(0);
                                                                         return;
                                                                     }
-                                                                    fill_voice_output(output, out_channels, &mut mixer, &sq_i16, &ssrc_to_userid_i16, |s| (s * 32767.0) as i16);
+                                                                    // Deafened: the voices are still played out, into nothing. Left
+                                                                    // waiting they would be heard, 0.6 s old, when the output returns.
+                                                                    let audible = !is_self_deaf();
+                                                                    fill_voice_output(output, out_channels, &mut voice_out, &sq_i16, &ssrc_to_userid_i16, audible, |s| (s * 32767.0) as i16);
                                                                     #[cfg(feature = "automation")]
-                                                                    crate::utils::test_hooks::voice_played_i16(output);
+                                                                    if audible {
+                                                                        crate::utils::test_hooks::voice_played_i16(output);
+                                                                    }
                                                                 },
                                                                 move |err| {
                                                                     warn!("Erro no stream de saída I16: {:?}", err);
@@ -744,6 +717,10 @@ pub async fn connect_voice_gateway(
                                                         Ok(stream) => {
                                                             if let Err(e) = stream.play() {
                                                                 warn!("Falha ao iniciar stream de saída: {:?}", e);
+                                                                if asked_48k {
+                                                                    info!("Voice output: the stream at 48000 Hz did not start; going back to the device's default rate.");
+                                                                    try_48k = false;
+                                                                }
                                                                 std::thread::sleep(std::time::Duration::from_millis(500));
                                                                 continue;
                                                             }
@@ -766,6 +743,12 @@ pub async fn connect_voice_gateway(
                                                                 if broken || quiet_since.elapsed() >= OUTPUT_STALL {
                                                                     warn!("🔊 Saída de áudio {}: recriando o stream.",
                                                                         if broken { "com erro" } else { "parada" });
+                                                                    if asked_48k && ticks <= 500 {
+                                                                        // It took 48000 Hz and then failed before playing for long:
+                                                                        // the next stream uses the rate the device itself prefers.
+                                                                        info!("Voice output: the stream at 48000 Hz failed early; going back to the device's default rate.");
+                                                                        try_48k = false;
+                                                                    }
                                                                     let wait = next_no_device_wait(output_retry_wait);
                                                                     output_retry_wait = Some(wait);
                                                                     drop(stream);
@@ -790,6 +773,7 @@ pub async fn connect_voice_gateway(
                                                                 if new_target != current_target_dev {
                                                                     info!("🔄 Dispositivo de saída alterado de '{}' para '{}' durante a chamada! Reconfigurando alto-falante...", current_target_dev, new_target);
                                                                     current_target_dev = new_target;
+                                                                    try_48k = true; // another device: what the old one refused says nothing about it
                                                                     break; // Sai do loop interno, dropa o stream atual e o while externo reconstrói no novo dispositivo!
                                                                 }
                                                             }
@@ -813,6 +797,7 @@ pub async fn connect_voice_gateway(
                                                 let mut seq: u16 = 0;
                                                 let mut timestamp: u32 = 0;
                                                 let mut nonce_cnt: u32 = 0;
+                                                let mut tx_cipher: Option<(Vec<u8>, VoiceCipher)> = None;
                                                 let mut opus_out = vec![0u8; 1000];
                                                 let mut speaking_loop_counter: u32 = 0;
 
@@ -1010,26 +995,16 @@ pub async fn connect_voice_gateway(
                                                     let opus_payload: &[u8] = if let Some(ref v) = dave_encrypted { v } else { opus_bytes };
 
                                                     if let Some(key_bytes) = key_opt {
-                                                        if let Ok(cipher) = Aes256Gcm::new_from_slice(&key_bytes) {
-                                                            // 12-byte AES-GCM Nonce for aead_aes256_gcm_rtpsize:
-                                                            let mut nonce_bytes = [0u8; 12];
-                                                            nonce_bytes[0..4].copy_from_slice(&nonce_cnt.to_be_bytes());
-
-                                                            let nonce = Nonce::from_slice(&nonce_bytes);
-
-                                                            // Encrypt the (DAVE-encrypted) Opus payload with transport AES-256-GCM
-                                                            let payload = Payload {
-                                                                msg: opus_payload,
-                                                                aad: &audio_header,
-                                                            };
-
-                                                            if let Ok(ciphertext) = cipher.encrypt(nonce, payload) {
-                                                                let mut rtp_pkt = Vec::with_capacity(12 + ciphertext.len() + 4);
-                                                                rtp_pkt.extend_from_slice(&audio_header);
-                                                                rtp_pkt.extend_from_slice(&ciphertext);
-                                                                // Append 4-byte nonce counter as suffix (rtpsize format)
-                                                                rtp_pkt.extend_from_slice(&nonce_cnt.to_be_bytes());
-
+                                                        if tx_cipher.as_ref().map_or(true, |(k, _)| *k != key_bytes) {
+                                                            tx_cipher = VoiceCipher::new(&tx_mode, &key_bytes).map(|c| (key_bytes.clone(), c));
+                                                            if tx_cipher.is_none() {
+                                                                warn!("Voice TX: no cipher for mode '{}' with a {}-byte key: nothing can be sent.", tx_mode, key_bytes.len());
+                                                            }
+                                                        }
+                                                        if let Some((_, cipher)) = tx_cipher.as_ref() {
+                                                            // Transport encryption of the (DAVE-encrypted) Opus payload: the
+                                                            // header is authenticated, the 4-byte nonce counter is appended.
+                                                            if let Some(rtp_pkt) = cipher.seal(&audio_header, opus_payload, nonce_cnt) {
                                                                 if let Err(_) = socket.send_to(&rtp_pkt, &target_addr).await {
                                                                     break;
                                                                 }
@@ -1063,6 +1038,11 @@ pub async fn connect_voice_gateway(
                                     let ssrc = *active_ssrc.lock().unwrap();
                                     info!("ðŸŽ‰ VOICE GATEWAY OPCODE 4 SESSION DESCRIPTION RECEBIDO! SessÃ£o de Voz Ativada com Sucesso!");
 
+                                    match val["d"]["mode"].as_str() {
+                                        Some(mode) if mode == VOICE_MODE_AES256_GCM || mode == VOICE_MODE_XCHACHA20 =>
+                                            info!("Voice: the server confirmed transport encryption mode {}.", mode),
+                                        other => warn!("Voice: the server's session description names encryption mode {:?}, which is not supported; expect decryption failures.", other),
+                                    }
                                     if let Some(key_arr) = val["d"]["secret_key"].as_array() {
                                         let key_bytes: Vec<u8> = key_arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect();
                                         if key_bytes.len() == 32 {
@@ -1606,12 +1586,15 @@ const OUTPUT_STALL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// One output callback: mixes the queued voices (`VoiceMixer`) and writes them in the
 /// device's channel layout and sample type. Used by the f32 and the i16 stream alike.
+/// With `audible` false the voices are mixed (so the queues keep moving) and silence is
+/// written.
 fn fill_voice_output<T: Copy + Default>(
     output: &mut [T],
     out_channels: usize,
-    mixer: &mut VoiceMixer,
+    out: &mut VoiceOutput,
     queues: &std::sync::Mutex<HashMap<u32, VecDeque<(f32, f32)>>>,
     ssrc_to_userid: &std::sync::Mutex<HashMap<u32, u64>>,
+    audible: bool,
     convert: impl Fn(f32) -> T,
 ) {
     output.fill(T::default());
@@ -1619,18 +1602,35 @@ fn fill_voice_output<T: Copy + Default>(
     let frames = output.len() / out_channels;
     let Ok(mut queues) = queues.lock() else { return };
     let active_store = get_active_voice_participants_store();
+    let generation = user_audio_settings_generation();
+    let VoiceOutput { mixer, settings, aec_ref, first_callback } = out;
+    if std::mem::take(first_callback) {
+        VoiceMixer::drop_backlog(&mut queues);
+    }
+    if settings.len() > 512 {
+        settings.clear();
+    }
     let mixed = mixer.mix(&mut queues, frames, smart_ducking(), |ssrc| {
         let uid = ssrc_to_userid.lock().ok().and_then(|m| m.get(&ssrc).copied())
             .or_else(|| active_store.lock().ok().and_then(|m| m.get(&ssrc).copied()))
             .unwrap_or(ssrc as u64);
+        // The settings map is keyed by strings and shared with the UI: it is read again
+        // only when a setting changed or the SSRC turned out to be another member.
+        if let Some((seen_generation, seen_uid, found)) = settings.get(&ssrc) {
+            if *seen_generation == generation && *seen_uid == uid {
+                return *found;
+            }
+        }
         let (muted_uid, vol_uid, prio_uid) = get_user_audio_settings(&uid.to_string());
         let (muted_ssrc, vol_ssrc, prio_ssrc) = get_user_audio_settings(&ssrc.to_string());
-        (muted_uid || muted_ssrc, if vol_uid != 1.0 { vol_uid } else { vol_ssrc }, prio_uid.max(prio_ssrc))
+        let found = (muted_uid || muted_ssrc, if vol_uid != 1.0 { vol_uid } else { vol_ssrc }, prio_uid.max(prio_ssrc));
+        settings.insert(ssrc, (generation, uid, found));
+        found
     });
-    if mixed.is_empty() {
+    if mixed.is_empty() || !audible {
         return;
     }
-    let mut aec_ref = Vec::with_capacity(frames);
+    aec_ref.clear();
     for (f, &(l, r)) in mixed.iter().enumerate() {
         aec_ref.push((l + r) * 0.5);
         if out_channels >= 2 {
@@ -1640,7 +1640,65 @@ fn fill_voice_output<T: Copy + Default>(
             output[f] = convert((l + r) * 0.5);
         }
     }
-    crate::audio::dsp::push_speaker_reference(&aec_ref);
+    crate::audio::dsp::push_speaker_reference(aec_ref);
+}
+
+/// What one output stream keeps between its callbacks.
+struct VoiceOutput {
+    mixer: VoiceMixer,
+    /// Per SSRC: the settings generation and member it was looked up for, and
+    /// (muted, volume, priority).
+    settings: HashMap<u32, (u64, u64, (bool, f32, i32))>,
+    aec_ref: Vec<f32>,
+    first_callback: bool,
+}
+
+impl VoiceOutput {
+    fn new(out_rate: u32) -> Self {
+        Self { mixer: VoiceMixer::new(out_rate), settings: HashMap::new(), aec_ref: Vec::with_capacity(8192), first_callback: true }
+    }
+}
+
+#[cfg(test)]
+mod voice_rx_output_tests {
+    use super::*;
+
+    #[test]
+    fn deafened_output_is_silent_and_does_not_let_audio_pile_up() {
+        let queues = std::sync::Mutex::new(HashMap::new());
+        let members = std::sync::Mutex::new(HashMap::new());
+        let mut out = VoiceOutput::new(48000);
+        let mut heard = 0usize;
+        // A member talks for 3 s; the listener is deafened for the first 2 s.
+        for callback in 0..300usize {
+            if callback % 2 == 0 {
+                let frame: Vec<(f32, f32)> = (0..960).map(|i| { let v = 0.4 * ((callback * 480 + i) as f32 * 0.05).sin(); (v, v) }).collect();
+                push_voice_frame(queues.lock().unwrap().entry(0x4000_0001).or_default(), &[], &frame);
+            }
+            let audible = callback >= 200;
+            let mut output = [0.5f32; 960];
+            fill_voice_output(&mut output, 2, &mut out, &queues, &members, audible, |s| s);
+            if !audible {
+                assert!(output.iter().all(|s| *s == 0.0), "callback {callback}");
+            } else if output.iter().any(|s| *s != 0.0) {
+                heard += 1;
+            }
+            let waiting = queues.lock().unwrap()[&0x4000_0001].len();
+            assert!(waiting <= 2880, "callback {callback}: {waiting} pairs waiting");
+        }
+        assert!(heard >= 99, "audible again at once: {heard} of 100 callbacks");
+    }
+
+    #[test]
+    fn a_new_stream_does_not_play_what_piled_up_before_it() {
+        let queues = std::sync::Mutex::new(HashMap::new());
+        let members = std::sync::Mutex::new(HashMap::new());
+        queues.lock().unwrap().insert(0x4000_0002u32, VecDeque::from(vec![(0.25f32, 0.25f32); VOICE_QUEUE_LIMIT]));
+        let mut out = VoiceOutput::new(48000);
+        let mut output = [0i16; 960];
+        fill_voice_output(&mut output, 2, &mut out, &queues, &members, true, |s| (s * 32767.0) as i16);
+        assert_eq!(queues.lock().unwrap()[&0x4000_0002].len(), 1920 - 480);
+    }
 }
 
 /// Wait before looking for an output device again: 0.5 s, doubling up to 5 s.
