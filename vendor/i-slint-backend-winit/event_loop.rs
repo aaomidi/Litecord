@@ -86,6 +86,10 @@ pub struct EventLoopState {
     /// issues (see #9038 and #10912).
     pending_mouse_move: Option<(winit::window::WindowId, LogicalPoint)>,
 
+    /// Litecord: when and where the last event of a finger (pixel-delta) scroll that has not
+    /// ended yet arrived. See the MouseWheel handling.
+    pixel_scroll: Option<(std::time::Instant, LogicalPoint)>,
+
     /// Set to true when pumping events for the shortest amount of time possible.
     pumping_events_instantly: bool,
 
@@ -108,6 +112,7 @@ impl EventLoopState {
             loop_error: Default::default(),
             current_resize_direction: Default::default(),
             pending_mouse_move: Default::default(),
+            pixel_scroll: None,
             pumping_events_instantly: Default::default(),
             #[cfg(target_os = "ios")]
             touch_finger_ids: Default::default(),
@@ -213,10 +218,38 @@ impl winit::application::ApplicationHandler<SlintEvent> for EventLoopState {
         if !matches!(event, WindowEvent::CursorMoved { .. } | WindowEvent::AxisMotion { .. }) {
             self.flush_pending_mouse_move();
         }
+        // Litecord: a finger scroll whose end never arrived leaves the Flickable capturing the
+        // pointer (hover and the next click are swallowed). The pointer moving or a button
+        // going down long enough after the last scroll event means the gesture is over. The
+        // threshold is above the Flickable fling window (100 ms), so this never starts a fling.
+        // The end goes to where the finger scroll happened: the pointer may be over another
+        // list by now, and the one that was scrolled is the one waiting for the end.
+        if matches!(event, WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. })
+            && let Some((_, scroll_pos)) =
+                self.pixel_scroll.filter(|(t, _)| t.elapsed() > PIXEL_SCROLL_STALE)
+        {
+            self.pixel_scroll = None;
+            if scroll_trace("wheel") {
+                eprintln!("[scrolltrace] end t={} unfinished finger scroll closed by pointer activity", scroll_trace_now());
+            }
+            runtime_window.process_mouse_input(MouseEvent::Wheel {
+                position: scroll_pos,
+                delta_x: 0.,
+                delta_y: 0.,
+                phase: TouchPhase::Ended,
+            });
+        }
 
         match event {
             WindowEvent::RedrawRequested => {
-                self.loop_error = window.draw().err();
+                if scroll_trace("frames") {
+                    let start = std::time::Instant::now();
+                    let t0 = scroll_trace_now();
+                    self.loop_error = window.draw().err();
+                    eprintln!("[scrolltrace] frame t={} draw_us={}", t0, start.elapsed().as_micros());
+                } else {
+                    self.loop_error = window.draw().err();
+                }
             }
             WindowEvent::Resized(size) => {
                 self.loop_error = window.resize_event(size).err();
@@ -399,14 +432,84 @@ impl winit::application::ApplicationHandler<SlintEvent> for EventLoopState {
                 }
             }
             WindowEvent::MouseWheel { delta, phase, .. } => {
-                let (delta_x, delta_y) = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(lx, ly) => (lx * 60., ly * 60.),
+                // Litecord: scroll input, changed from upstream in three ways (measured with
+                // real Wayland axis events; see the notes above [patch.crates-io] in Cargo.toml).
+                let slint_scale = runtime_window.scale_factor();
+                let winit_scale =
+                    window.winit_window().map(|w| w.scale_factor() as f32).unwrap_or(slint_scale);
+                let (delta_x, delta_y, sent_phase) = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(lx, ly) => {
+                        // A wheel notch arriving while a finger scroll is still open (its end
+                        // was never delivered): close the finger scroll first, or the Flickable
+                        // stays in its touchpad mode and the notch jumps without animation.
+                        if let Some((_, scroll_pos)) = self.pixel_scroll.take() {
+                            if scroll_trace("wheel") {
+                                eprintln!("[scrolltrace] end t={} unfinished finger scroll closed by a wheel notch", scroll_trace_now());
+                            }
+                            runtime_window.process_mouse_input(MouseEvent::Wheel {
+                                position: scroll_pos,
+                                delta_x: 0.,
+                                delta_y: 0.,
+                                phase: TouchPhase::Ended,
+                            });
+                        }
+                        // One notch is WHEEL_NOTCH_PX pixels of the window system (what
+                        // Chromium and Electron apps move), whatever scale factor Slint was
+                        // given: upstream moved 60 Slint-logical px, so the distance on screen
+                        // changed with SLINT_SCALE_FACTOR / the UI scale setting.
+                        let line = WHEEL_NOTCH_PX * winit_scale / slint_scale;
+                        (lx * line, ly * line, phase)
+                    }
                     winit::event::MouseScrollDelta::PixelDelta(d) => {
-                        let d = d.to_logical(runtime_window.scale_factor() as f64);
-                        (d.x, d.y)
+                        // Physical pixels, so one pixel of finger movement is one pixel on screen.
+                        let d = d.to_logical(slint_scale as f64);
+                        // winit on Wayland only reports Started for a finger scroll that
+                        // follows an ended one: after any wheel notch the next finger scroll
+                        // arrives as Moved from its first event, which the Flickable takes for
+                        // a wheel (every event animated, no fling). Track the phase here.
+                        let sent_phase = if cfg!(target_os = "linux") {
+                            match phase {
+                                winit::event::TouchPhase::Ended
+                                | winit::event::TouchPhase::Cancelled => {
+                                    self.pixel_scroll = None;
+                                    phase
+                                }
+                                _ => {
+                                    let started = self.pixel_scroll.is_none();
+                                    self.pixel_scroll =
+                                        Some((std::time::Instant::now(), self.cursor_pos));
+                                    if started {
+                                        winit::event::TouchPhase::Started
+                                    } else {
+                                        winit::event::TouchPhase::Moved
+                                    }
+                                }
+                            }
+                        } else {
+                            phase
+                        };
+                        (d.x, d.y, sent_phase)
                     }
                 };
-                let phase = match phase {
+                if scroll_trace("wheel") {
+                    // Diagnostic (LITECORD_DEBUG_SCROLL=1 or LITECORD_SCROLL_TRACE=wheel): what
+                    // winit hands us for a wheel or finger scroll, and what Slint is given, to
+                    // tell devices apart.
+                    eprintln!(
+                        "[scrolltrace] wheel t={} at={:.0},{:.0} winit={:?} phase={:?} slint_scale={} winit_scale={} sent_phase={:?} -> logical dx={:.3} dy={:.3}",
+                        scroll_trace_now(),
+                        self.cursor_pos.x,
+                        self.cursor_pos.y,
+                        delta,
+                        phase,
+                        slint_scale,
+                        winit_scale,
+                        sent_phase,
+                        delta_x,
+                        delta_y
+                    );
+                }
+                let phase = match sent_phase {
                     winit::event::TouchPhase::Started => TouchPhase::Started,
                     winit::event::TouchPhase::Moved => TouchPhase::Moved,
                     winit::event::TouchPhase::Ended => TouchPhase::Ended,
@@ -772,4 +875,32 @@ impl EventLoopState {
 
         Ok(())
     }
+}
+
+
+/// Litecord: distance of one mouse-wheel notch ("line"), in pixels of the window system
+/// (physical pixels divided by the compositor's scale factor). 120 is what Chromium moves.
+const WHEEL_NOTCH_PX: f32 = 120.;
+/// Litecord: how long after its last event an unfinished finger scroll counts as over once
+/// the pointer moves or a button is pressed.
+const PIXEL_SCROLL_STALE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Diagnostic switch: LITECORD_SCROLL_TRACE is a comma-separated list of "wheel" (one line
+/// per wheel event as winit delivers it) and "frames" (one line per window redraw).
+/// LITECORD_DEBUG_SCROLL=1 is the same as LITECORD_SCROLL_TRACE=wheel.
+fn scroll_trace(what: &str) -> bool {
+    static TRACE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let v = TRACE.get_or_init(|| {
+        let mut v = std::env::var("LITECORD_SCROLL_TRACE").unwrap_or_default();
+        if std::env::var("LITECORD_DEBUG_SCROLL").is_ok_and(|d| !d.is_empty() && d != "0") {
+            v.push_str(",wheel");
+        }
+        v
+    });
+    !v.is_empty() && v.split(',').any(|w| w == what)
+}
+
+/// Microseconds since the Unix epoch, to line trace lines up with other logs.
+fn scroll_trace_now() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros()).unwrap_or(0)
 }

@@ -49,6 +49,19 @@ const DECELERATION: f32 = 2000.;
 /// information to derive a fling velocity.
 /// The unit is: millisecond
 const WHEEL_SCROLL_DURATION: Duration = Duration::from_millis(180);
+/// Litecord: a wheel notch that arrives while the animation of the previous one is still
+/// running gets an animation of WHEEL_SCROLL_PACE times the time since that previous notch,
+/// between WHEEL_SCROLL_DURATION and WHEEL_SCROLL_MAX_DURATION. Upstream restarts a fixed
+/// 180 ms deceleration at every notch, so at a relaxed wheel pace (about ten notches a second)
+/// the speed fell to 40% and jumped back at each notch. Stretching the animation to the pace
+/// of the wheel overlaps the notches into a steadier glide; a single notch and a fast spin
+/// keep the short animation. The distance covered is unchanged and exact.
+const WHEEL_SCROLL_PACE: f32 = 2.5;
+const WHEEL_SCROLL_MAX_DURATION: Duration = Duration::from_millis(300);
+/// Litecord: the stretch above applies in full when at least this fraction of a notch is still
+/// to be played when the next notch arrives, and proportionally less below it (none when the
+/// notch reverses the direction).
+const WHEEL_SCROLL_PACE_FULL_AT: f32 = 0.15;
 /// The maximum duration between a move and a release event to start an animation
 /// If the duration is larger than this value, no animation will be executed because
 /// it is not desired
@@ -216,6 +229,8 @@ impl Item for Flickable {
         _self_rc: &ItemRc,
         size: LogicalSize,
     ) -> RenderingResult {
+        #[cfg(feature = "std")]
+        scroll_trace_position(self, size);
         (*backend).combine_clip(
             LogicalRect::new(LogicalPoint::default(), size),
             LogicalBorderRadius::zero(),
@@ -462,6 +477,9 @@ impl FlickableDataInner {
         let viewport_y = (Flickable::FIELD_OFFSETS.viewport_y()).apply_pin(flick);
         let current_pos = LogicalPoint::from_lengths(viewport_x.get(), viewport_y.get());
 
+        // Litecord: duration of the wheel animation, see WHEEL_SCROLL_PACE.
+        let mut wheel_duration = WHEEL_SCROLL_DURATION;
+        let mut remaining = LogicalVector::default();
         if self.capture_events.is_none()
             && matches!(phase, TouchPhase::Moved)
             && let Some((start_time, [x_simulation, y_simulation])) = &self.running_animation
@@ -470,15 +488,50 @@ impl FlickableDataInner {
             let animation_duration = crate::animations::current_tick().duration_since(*start_time);
 
             if let Some(x_simulation) = x_simulation {
-                delta.x += x_simulation.remaining_distance(animation_duration);
+                remaining.x = x_simulation.remaining_distance(animation_duration);
             }
             if let Some(y_simulation) = y_simulation {
-                delta.y += y_simulation.remaining_distance(animation_duration);
+                remaining.y = y_simulation.remaining_distance(animation_duration);
+            }
+            if remaining != LogicalVector::default() {
+                // The stretch is blended in by how much of a notch is still to be played, so
+                // the duration does not jump from 300 to 180 ms between a notch that arrives
+                // just before the previous animation ends and one that arrives just after. A
+                // notch against the direction of what is left is a fresh notch: no stretch.
+                let reverses = (remaining.x as f32) * (delta.x as f32) < 0.
+                    || (remaining.y as f32) * (delta.y as f32) < 0.;
+                let notch = (delta.x as f32).abs().max((delta.y as f32).abs());
+                let left = (remaining.x as f32).abs().max((remaining.y as f32).abs());
+                let weight = if reverses {
+                    0.
+                } else if notch > 0. {
+                    (left / (notch * WHEEL_SCROLL_PACE_FULL_AT)).min(1.)
+                } else {
+                    1.
+                };
+                let stretched = animation_duration
+                    .mul_f32(WHEEL_SCROLL_PACE)
+                    .clamp(WHEEL_SCROLL_DURATION, WHEEL_SCROLL_MAX_DURATION);
+                wheel_duration =
+                    WHEEL_SCROLL_DURATION + (stretched - WHEEL_SCROLL_DURATION).mul_f32(weight);
+                delta += remaining;
             }
         }
 
         let new_pos = ensure_in_bound(flick, current_pos + delta, flick_rc);
         delta = new_pos - current_pos;
+
+        // Litecord: a notch that adds no distance because the running animation already ends
+        // at the limit leaves that animation alone. Upstream restarted it over what was left,
+        // so spinning the wheel into the top or bottom kept slowing the approach down (each
+        // notch spread the last pixels over another full animation).
+        if remaining != LogicalVector::default()
+            && ((delta.x - remaining.x) as f32).abs() < 0.05
+            && ((delta.y - remaining.y) as f32).abs() < 0.05
+        {
+            self.last_scroll_event = Some((crate::animations::current_tick(), position));
+            return InputEventResult::EventAccepted;
+        }
 
         if phase != TouchPhase::Ended {
             viewport_x.remove_binding();
@@ -495,12 +548,26 @@ impl FlickableDataInner {
             TouchPhase::Started => {
                 self.velocity_rb = VelocityRingBuffer::default();
                 self.capture_events = Some(CaptureEvents::MouseWheel);
+                // Litecord: on Wayland the first event of a finger scroll carries a delta like
+                // the following ones. Upstream dropped it, so the view only began to move on
+                // the second event.
+                if new_pos != current_pos {
+                    self.velocity_rb.push(crate::animations::current_tick(), new_pos - current_pos);
+                    viewport_x.set(new_pos.x_length());
+                    viewport_y.set(new_pos.y_length());
+                }
                 self.last_scroll_event = Some((crate::animations::current_tick(), position));
             }
             TouchPhase::Moved => {
                 if self.capture_events.is_some_and(|capture| capture == CaptureEvents::MouseWheel) {
                     // Touchpad case with different phases
                     self.velocity_rb.push(crate::animations::current_tick(), new_pos - current_pos);
+                    viewport_x.set(new_pos.x_length());
+                    viewport_y.set(new_pos.y_length());
+                } else if (delta.x as f32).abs() < 0.05 && (delta.y as f32).abs() < 0.05 {
+                    // Litecord: nothing visible left to cover, typically the rounding leftover
+                    // of an animation that ended a hair short of the limit. Upstream animated
+                    // it, 180 ms of redraws for every notch turned into the end.
                     viewport_x.set(new_pos.x_length());
                     viewport_y.set(new_pos.y_length());
                 } else {
@@ -517,7 +584,7 @@ impl FlickableDataInner {
                     let x_simulation = (delta.x != Coord::default()).then(|| {
                         let simulation = ConstantDecelerationParameters::new_with_distance(
                             delta.x as f32,
-                            WHEEL_SCROLL_DURATION.as_secs_f32(),
+                            wheel_duration.as_secs_f32(),
                         );
                         viewport_x.set_physic_animation_value(limit_x, simulation.clone());
                         simulation
@@ -526,7 +593,7 @@ impl FlickableDataInner {
                     let y_simulation = (delta.y != Coord::default()).then(|| {
                         let simulation = ConstantDecelerationParameters::new_with_distance(
                             delta.y as f32,
-                            WHEEL_SCROLL_DURATION.as_secs_f32(),
+                            wheel_duration.as_secs_f32(),
                         );
                         viewport_y.set_physic_animation_value(limit_y, simulation.clone());
                         simulation
@@ -954,5 +1021,33 @@ pub unsafe extern "C" fn slint_flickable_data_init(data: *mut FlickableDataBox) 
 pub unsafe extern "C" fn slint_flickable_data_free(data: *mut FlickableDataBox) {
     unsafe {
         core::ptr::drop_in_place(data);
+    }
+}
+
+
+/// Diagnostic (LITECORD_SCROLL_TRACE containing "pos"): one line each time a Flickable is
+/// drawn at another position than last time, to see scrolling as it reaches the screen.
+#[cfg(feature = "std")]
+fn scroll_trace_position(flick: Pin<&Flickable>, size: LogicalSize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| {
+        std::env::var("LITECORD_SCROLL_TRACE").map(|v| v.split(',').any(|w| w == "pos")).unwrap_or(false)
+    }) {
+        return;
+    }
+    std::thread_local! {
+        static LAST: RefCell<std::collections::HashMap<usize, (f32, f32)>> = RefCell::new(Default::default());
+    }
+    let vy = (Flickable::FIELD_OFFSETS.viewport_y()).apply_pin(flick).get_untracked().get() as f32;
+    let vx = (Flickable::FIELD_OFFSETS.viewport_x()).apply_pin(flick).get_untracked().get() as f32;
+    let vh = (Flickable::FIELD_OFFSETS.viewport_height()).apply_pin(flick).get_untracked().get() as f32;
+    let key = &*flick as *const Flickable as usize;
+    let changed = LAST.with(|l| l.borrow_mut().insert(key, (vx, vy)) != Some((vx, vy)));
+    if changed {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros()).unwrap_or(0);
+        std::eprintln!(
+            "[scrolltrace] pos t={} flick={:x} w={:.0} h={:.0} viewport_h={:.1} vx={:.3} vy={:.3}",
+            t, key, size.width, size.height, vh, vx, vy
+        );
     }
 }

@@ -233,6 +233,13 @@ export component AppWindow inherits Window {
         root.scroll_to_bottom_trigger += 1;
     }
 
+    // For a message arriving in the open channel: scrolls only if the chat was at the bottom.
+    in-out property <int> follow_bottom_trigger: 0;
+    in-out property <bool> chat_pinned_to_bottom: true;
+    public function follow_chat_to_bottom() {
+        root.follow_bottom_trigger += 1;
+    }
+
     changed is_voice_focused => {
         if (!root.is_voice_focused) {
             root.scroll_chat_to_bottom();
@@ -2965,6 +2972,8 @@ export component AppWindow inherits Window {
                         is_loading_older_messages: root.is_loading_older_messages;
                         tr_replying_to: root.tr_replying_to;
                         scroll_trigger: root.scroll_to_bottom_trigger;
+                        follow_trigger: root.follow_bottom_trigger;
+                        pinned_to_bottom <=> root.chat_pinned_to_bottom;
                         load_older_messages => { root.load_older_messages(); }
                         open_link(url) => { root.open_link(url); }
                         download_attachment(id, fn, url) => { root.download_attachment(id, fn, url); }
