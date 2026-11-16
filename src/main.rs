@@ -4972,7 +4972,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     ui.set_messages(std::rc::Rc::new(slint::VecModel::from(current_msgs)).into());
                                 }
 
-                                request_chat_scroll_to_bottom(app_weak_inner.clone());
+                                crate::ui::helpers::request_chat_follow_new_message(app_weak_inner.clone(), is_self);
                             }
                         });
                     }

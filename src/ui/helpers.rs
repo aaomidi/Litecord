@@ -94,6 +94,27 @@ pub fn request_chat_scroll_to_bottom(app_weak: slint::Weak<AppWindow>) {
     });
 }
 
+/// For a message that arrives in the open channel. The user's own message always brings the
+/// chat to the bottom. Anyone else's does so only while the chat is resting at the bottom
+/// (checked in the UI at every step, so scrolling away during these 400 ms is respected):
+/// someone reading older messages must not be thrown to the bottom by each new message.
+pub fn request_chat_follow_new_message(app_weak: slint::Weak<AppWindow>, own: bool) {
+    if own {
+        return request_chat_scroll_to_bottom(app_weak);
+    }
+    let _ = slint::invoke_from_event_loop(move || {
+        let delays = [15, 45, 100, 200, 400];
+        for delay in delays {
+            let app_w = app_weak.clone();
+            slint::Timer::single_shot(std::time::Duration::from_millis(delay), move || {
+                if let Some(ui) = app_w.upgrade() {
+                    ui.invoke_follow_chat_to_bottom();
+                }
+            });
+        }
+    });
+}
+
 pub fn parse_hex_color(hex: &str) -> slint::Color {
     if hex.starts_with('#') && hex.len() == 7 {
         if let Ok(r) = u8::from_str_radix(&hex[1..3], 16) {

@@ -64,6 +64,12 @@
 //! {"cmd":"demo_stream","drop":2}             leave the next 2 access units out (lost frames)
 //! {"cmd":"demo_stream","pause":true}         feed nothing until "pause":false
 //! {"cmd":"demo_stream","stop":true}          the stream ends, as when its sender stops
+//! {"cmd":"demo_chat","n":120}                a made-up chat of n messages in the main view
+//!                                            (after demo_voice_stage with "filler":true for
+//!                                            the lists around it), to measure scrolling
+//! {"cmd":"demo_message"}                    one more message appended to that chat as a
+//!                                            received one is ("own":true: the user's own;
+//!                                            "text" optional), to see whether the view follows
 //! {"cmd":"perf"}                             counters for measurements: access units fed,
 //!                                            pictures decoded, pictures given to the UI,
 //!                                            and on Linux pictures offered as GPU buffers
@@ -421,6 +427,7 @@ fn execute(ui: &AppWindow, cmd: &Value) -> Result<Value, String> {
                 "settings_active_tab" => ui.set_settings_active_tab(as_int()?),
                 "show_stream_modal" => ui.set_show_stream_modal(as_bool()?),
                 "show_web_share_modal" => ui.set_show_web_share_modal(as_bool()?),
+                "is_voice_focused" => ui.set_is_voice_focused(as_bool()?),
                 "show_user_menu" => ui.set_show_user_menu(as_bool()?),
                 // Dialogs that otherwise need an account or a running share.
                 "login_alert_message" => ui.set_login_alert_message(as_text()?),
@@ -788,6 +795,80 @@ fn execute(ui: &AppWindow, cmd: &Value) -> Result<Value, String> {
             image::save_buffer(path, shot.as_bytes(), shot.width(), shot.height(), image::ExtendedColorType::Rgba8)
                 .map_err(|e| format!("could not write {path}: {e}"))?;
             Ok(json!({ "ok": true, "path": path, "width": shot.width(), "height": shot.height() }))
+        }
+        "demo_chat" => {
+            // A made-up chat of n messages built the way received ones are (parsed into
+            // lines and blocks), shown instead of the voice stage: something long to scroll.
+            let n = cmd["n"].as_u64().unwrap_or(30) as usize;
+            let authors = ["Bruna", "Caio", "Débora", "Estêvão", "Me"];
+            let texts = [
+                "bom dia pessoal",
+                "alguém viu o jogo ontem? foi **muito** bom, o segundo tempo principalmente. Tem o replay em https://example.com/replay se alguém quiser ver de novo, vale a pena.",
+                "kkkkk",
+                "vou testar isso mais tarde\ne depois conto como foi\nse der certo eu mando o link",
+                "A longer paragraph to wrap over several lines: the quick brown fox jumps over the lazy dog, and then does it again, and again, until the line is long enough that it must wrap at least twice in a chat column of ordinary width, which is the usual case for people who write in paragraphs.",
+                "ok",
+                "`cargo build --release` demorou 4 minutos aqui",
+            ];
+            let weak = ui.as_weak();
+            let messages: Vec<crate::ChatMessage> = (0..n)
+                .map(|i| {
+                    let author = authors[(i / 3) % authors.len()];
+                    let mut links = Vec::new();
+                    let lines = crate::gateway::parse_text_into_lines(&format!("{} #{i}", texts[i % texts.len()]), &mut links);
+                    crate::ChatMessage {
+                        id: (5000 + i).to_string().into(),
+                        author: author.into(),
+                        author_id: ((i / 3) % authors.len() + 1).to_string().into(),
+                        show_header: i % 3 == 0,
+                        day_label: if i % 40 == 0 { "15 de novembro de 2026".into() } else { "".into() },
+                        avatar_initial: author.chars().next().unwrap_or('?').to_string().into(),
+                        timestamp: format!("{:02}:{:02}", 8 + i / 60, i % 60).into(),
+                        hover_timestamp: format!("{:02}:{:02}", 8 + i / 60, i % 60).into(),
+                        content: texts[i % texts.len()].into(),
+                        content_lines: crate::ui::helpers::map_message_lines(&lines, "demo", &weak),
+                        embed_color: slint::Color::from_rgb_u8(88, 101, 242),
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            ui.set_messages(std::rc::Rc::new(slint::VecModel::from(messages)).into());
+            ui.set_has_more_older_messages(cmd["older"].as_bool().unwrap_or(true));
+            ui.set_is_logged_in(true);
+            ui.set_is_voice_focused(false);
+            ui.set_scroll_to_bottom_trigger(ui.get_scroll_to_bottom_trigger() + 1);
+            Ok(json!({ "ok": true, "messages": n }))
+        }
+        "demo_message" => {
+            // One more message appended to the open chat the way a received one is (pushed
+            // onto the existing model, then the same follow-or-stay request), to measure what
+            // an incoming message does to the scroll position. "own":true is the user's own.
+            let own = cmd["own"].as_bool().unwrap_or(false);
+            let text = cmd["text"].as_str().unwrap_or("mensagem nova que acabou de chegar\ncom duas linhas");
+            let mut links = Vec::new();
+            let lines = crate::gateway::parse_text_into_lines(text, &mut links);
+            let messages = ui.get_messages();
+            let n = slint::Model::row_count(&messages);
+            let pinned_before = ui.get_chat_pinned_to_bottom();
+            let message = crate::ChatMessage {
+                id: (900000 + n).to_string().into(),
+                author: if own { "Me".into() } else { "Bruna".into() },
+                author_id: if own { "5".into() } else { "1".into() },
+                show_header: true,
+                avatar_initial: if own { "M".into() } else { "B".into() },
+                timestamp: "agora".into(),
+                hover_timestamp: "agora".into(),
+                content: text.into(),
+                content_lines: crate::ui::helpers::map_message_lines(&lines, "demo", &ui.as_weak()),
+                embed_color: slint::Color::from_rgb_u8(88, 101, 242),
+                ..Default::default()
+            };
+            match slint::Model::as_any(&messages).downcast_ref::<slint::VecModel<crate::ChatMessage>>() {
+                Some(model) => model.push(message),
+                None => return Err("the chat model is not a VecModel; run demo_chat first".into()),
+            }
+            crate::ui::helpers::request_chat_follow_new_message(ui.as_weak(), own);
+            Ok(json!({ "ok": true, "messages": n + 1, "pinned_before": pinned_before }))
         }
         "state" => Ok(state(ui)),
         other => Err(format!("unknown cmd {other}")),

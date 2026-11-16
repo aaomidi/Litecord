@@ -160,13 +160,50 @@ lto = "off"
 strip = false
 
 
-# Local copy of i-slint-core 1.17.1 with one fix: a mouse-wheel scroll animation could get
-# stuck (subnormal velocity, zero-length steps) and keep the UI redrawing ~130 times per
-# second forever, even hidden in the tray. See step_internal in
-# vendor/i-slint-core/animations/physics_simulation.rs.
+# Local copy of i-slint-core 1.17.1 with these changes (each marked "Litecord:" in the source):
+# 1. A mouse-wheel scroll animation could get stuck (subnormal velocity, zero-length steps)
+#    and keep the UI redrawing ~130 times per second forever, even hidden in the tray. See
+#    step_internal in vendor/i-slint-core/animations/physics_simulation.rs.
+# 2. Scrolling feel, all in process_wheel_event in vendor/i-slint-core/items/flickable.rs:
+#    a. The first event of a finger scroll (phase Started) moves the view. Upstream dropped
+#       its delta, so the view only began to follow on the second event.
+#    b. A wheel notch that arrives while the previous notch is still animating gets an
+#       animation 2.5 times as long as the time since that notch, between 180 and 300 ms
+#       (WHEEL_SCROLL_PACE, WHEEL_SCROLL_MAX_DURATION). Upstream restarted a fixed 180 ms
+#       deceleration per notch, so at about ten notches a second the speed fell to 40% and
+#       jumped back at every notch; now it stays above 60%. A single notch is unchanged.
+#       The stretch is blended in by how much of a notch is still to be played (in full from
+#       15%, WHEEL_SCROLL_PACE_FULL_AT) and is not applied to a notch that reverses the
+#       direction, so the duration does not jump between 300 and 180 ms around the moment
+#       the previous animation ends.
+#    c. A notch that adds no distance because the running animation already ends at the top
+#       or bottom leaves that animation alone, instead of restarting it over what is left
+#       (which made the last pixels crawl while the wheel kept turning). A leftover of less
+#       than 0.05 px is set at once instead of animated (no redraws for nothing at the end).
 [patch.crates-io]
 i-slint-core = { path = "vendor/i-slint-core" }
-# Local copy of i-slint-backend-winit 1.17.1 with one fix: an animation running while the
-# window is hidden in the tray made the event loop request redraws forever. See
-# about_to_wait in vendor/i-slint-backend-winit/event_loop.rs.
+# Local copy of i-slint-backend-winit 1.17.1 with these changes:
+# 1. An animation running while the window is hidden in the tray made the event loop request
+#    redraws forever. See about_to_wait in vendor/i-slint-backend-winit/event_loop.rs.
+# 2. Scrolling input, in the WindowEvent::MouseWheel arm of event_loop.rs:
+#    a. One wheel notch moves WHEEL_NOTCH_PX = 120 pixels of the window system (as Chromium
+#       does) whatever scale factor Slint runs at. Upstream moved 60 Slint-logical px, so a
+#       notch was small and its size on screen changed with SLINT_SCALE_FACTOR / UI scale.
+#    b. The phase of a finger (pixel-delta) scroll is tracked here on Linux. winit on Wayland
+#       reports Started only after an ended finger scroll; after any wheel notch the next
+#       finger scroll arrives as Moved from its first event, which the Flickable took for a
+#       wheel (every event animated over 180 ms, no fling).
+#    c. A finger scroll whose end never arrives is closed by the next wheel notch, or by the
+#       pointer moving or a button press 150 ms after its last event. The made-up end is
+#       sent to where the last finger event happened, not to where the pointer is by then,
+#       so it reaches the list that was being scrolled. Upstream left the
+#       Flickable in its touchpad mode: notches jumped without animation, hover and the next
+#       click were swallowed.
+# Diagnostics, off unless an environment variable is set; lines start with "[scrolltrace]" on
+# stderr. LITECORD_DEBUG_SCROLL=1 logs every wheel or finger scroll event as winit delivers it
+# and as it is passed on (line or pixel delta, phase, pointer position, both scale factors,
+# resulting logical delta): use it to see what a real device sends. LITECORD_SCROLL_TRACE is a
+# comma-separated list of "wheel" (the same), "frames" (every window redraw with its draw
+# time), both in event_loop.rs, and "pos" (each position a Flickable is drawn at, in
+# vendor/i-slint-core/items/flickable.rs).
 i-slint-backend-winit = { path = "vendor/i-slint-backend-winit" }

@@ -106,8 +106,27 @@ export component ChatMessagesView inherits Rectangle {
     callback download_attachment(string, string, string);
     callback click_command(string);
 
+    // Bumped when a message arrives in the open channel: follow it only if the view was
+    // resting at the bottom. Someone reading older messages is left where they are.
+    in-out property <int> follow_trigger: 0;
+    // Whether the view was at the bottom the last time its position changed. Content growing
+    // below (a new message, an image finishing loading) does not change the position, so this
+    // stays true until the user scrolls away.
+    in-out property <bool> pinned_to_bottom: true;
+
     changed scroll_trigger => {
         root.scroll_to_bottom();
+    }
+
+    changed follow_trigger => {
+        if (root.pinned_to_bottom) {
+            root.scroll_to_bottom();
+        }
+    }
+
+    changed scroll_y => {
+        root.pinned_to_bottom = msg_scroll.viewport-height <= msg_scroll.visible-height
+            || root.scroll_y <= msg_scroll.visible-height - msg_scroll.viewport-height + 8px;
     }
 
     public function scroll_to_bottom() {
@@ -116,6 +135,7 @@ export component ChatMessagesView inherits Rectangle {
         } else {
             scroll_y = 0px;
         }
+        root.pinned_to_bottom = true;
     }
 
     msg_scroll := ScrollView {
