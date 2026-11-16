@@ -203,6 +203,7 @@ impl ScreenCaptureManager {
             // Viewers believe an OP_STOP only with this proof (taken before the key goes).
             let stop_proof = super::watch::session_key().and_then(|k| super::watch::stop_proof(&k));
             super::watch::end_session();
+            super::live_controls::end_share();
             CURRENT_TX_FPS.store(0, Ordering::Relaxed);
             info!("🛑 Parando captura e transmissão de tela P2P...");
             let mut cid = self.channel_id.load(Ordering::Relaxed);
@@ -280,8 +281,9 @@ impl ScreenCaptureManager {
         super::gpu_tx::begin_stream(
             camera_index.is_none() && super::gpu_capture::choice() != super::gpu_capture::Choice::Cpu,
         );
-        // The stream settings as they are now: changing them later is for the next share.
-        let max_bitrate = crate::video_settings::get_stream_max_bitrate_bps();
+        // The stream settings as they are now: a share starts from them, and the stream
+        // controls change its maximum bitrate and quality floor from there (`live_controls`).
+        let max_bitrate = super::live_controls::begin_share();
         let stream_profile = crate::video_settings::get_stream_profile();
         REQUESTED_BITRATE_BPS.store(max_bitrate, Ordering::Relaxed);
         force_signaling_broadcast();
@@ -1077,10 +1079,13 @@ impl ScreenCaptureManager {
                     // Browsers report no loss, so nothing would bring a higher rate down for
                     // them, and a keyframe has to fit their packet buffers.
                     let rate_cap = if web_viewers > 0 { WEB_VIEWER_MAX_BITRATE } else { u32::MAX };
+                    // The stream controls: the ceiling of `rate`, and the encoder's quality floor.
+                    let live_min_qp = super::live_controls::turn(&mut rate, rate_cap, efficient, Instant::now());
                     REQUESTED_BITRATE_BPS.store(rate.current().min(rate_cap), Ordering::Relaxed);
                     if watched != was_watched {
                         was_watched = watched;
                         TX_WATCHED.store(watched, Ordering::Relaxed);
+                        super::live_controls::set_watched(watched);
                         #[cfg(all(target_os = "linux", feature = "vaapi"))]
                         super::linux_gpu_tx::set_watched(watched);
                         info!("👀 [ASSISTIR SOB DEMANDA] {}", if watched { "Alguém começou a assistir: codificando." } else { "Ninguém assistindo: codificação pausada." });
@@ -1117,6 +1122,7 @@ impl ScreenCaptureManager {
                                 last_idr = Instant::now();
                             }
                             // (`efficient`: the capture's encoder follows the viewers' profile too.)
+                            super::linux_gpu_tx::set_min_qp(live_min_qp);
                             super::linux_gpu_tx::next_au(REQUESTED_BITRATE_BPS.load(Ordering::Relaxed), want_idr, efficient)
                         }
                         #[cfg(not(any(windows, all(target_os = "linux", feature = "vaapi"))))]
@@ -1131,6 +1137,7 @@ impl ScreenCaptureManager {
                             asked_bitrate = target_bitrate;
                         }
                         enc.set_efficient_profile(efficient);
+                        enc.set_quality_floor(live_min_qp);
                         if KEYFRAME_REQUESTED.swap(false, Ordering::Relaxed) || last_idr.elapsed() >= Duration::from_millis(2000) {
                             last_idr = Instant::now();
                             enc.force_intra_frame();

@@ -148,7 +148,8 @@ use log::{info, warn};
 use slint::{Rgba8Pixel, SharedPixelBuffer};
 use std::collections::VecDeque;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use super::live_controls::EncoderFloor;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -226,7 +227,7 @@ impl Config {
         let max_fps = std::env::var("LITECORD_VAAPI_CAPTURE_MAXFPS").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0);
         // (The profile is not a setting of the capture: it starts in Constrained Baseline
         // and follows what the send loop asks for with every `next_picture`.)
-        let min_qp = crate::video_settings::get_stream_min_qp();
+        let min_qp = super::live_controls::min_qp_for_new_encoder();
         Self { fd, node, width, height, fps, memory, max_fps, min_qp }
     }
 }
@@ -241,7 +242,10 @@ impl Config {
 /// `mainlate:N` withholds the first picture of a Main encoder N times (one is forgiven).
 /// `prepstuck:N` blocks the making of a new encoder from the Nth replacement on (a driver
 /// that hangs while a VA context is created), and `nobars` makes the painting of the bars
-/// around the picture fail.
+/// around the picture fail. A change of quality floor going wrong: `floorrefuse` makes the
+/// encoder for a new floor refuse the pictures' format (the old one goes on), `floormute`
+/// makes it put out nothing and `floorbreak` makes it fail on its first picture (the floor
+/// before it comes back with another encoder).
 #[derive(Clone, Copy, PartialEq)]
 enum TestFail {
     None,
@@ -258,6 +262,9 @@ enum TestFail {
     MainLate(u64),
     PrepStuck(u64),
     NoBars,
+    FloorRefuse,
+    FloorMute,
+    FloorBreak,
 }
 
 fn test_fail() -> TestFail {
@@ -271,6 +278,9 @@ fn test_fail() -> TestFail {
         Some(("mainlate", s)) => TestFail::MainLate(n(s)),
         Some(("prepstuck", s)) => TestFail::PrepStuck(n(s)),
         _ if v == "nobars" => TestFail::NoBars,
+        _ if v == "floorrefuse" => TestFail::FloorRefuse,
+        _ if v == "floormute" => TestFail::FloorMute,
+        _ if v == "floorbreak" => TestFail::FloorBreak,
         _ if v == "nomain" => TestFail::NoMain,
         _ if v == "mainrefuse" => TestFail::MainRefuse,
         _ if v == "mainprofile" => TestFail::MainProfile,
@@ -320,6 +330,10 @@ pub struct Stats {
     pub main_unavailable: bool,
     pub profile_switches: u64,
     pub last_switch_us: u64,
+    /// The quality floor (min-qp) of the encoder now in the pipeline, and whether a change
+    /// of floor still waits for its encoder's first keyframe.
+    pub min_qp: u32,
+    pub floor_in_flight: bool,
     /// Where the picture lies in the stream's frame (x, y, width, height); surfaces whose
     /// bars were painted, the microseconds that took in all, and surfaces that could not be
     /// painted.
@@ -473,6 +487,15 @@ struct Tx {
     mute_main: u64,
     switches: u64,
     last_switch_us: u64,
+    /// The quality floor (min-qp) of the encoder in the pipeline; the one change of floor
+    /// that may be on its way (`follow_floor`), and since when its encoder has been asked
+    /// for its first keyframe.
+    min_qp: u32,
+    floor: EncoderFloor,
+    floor_wait: Option<Instant>,
+    /// Nobody watched when the encoder for the floor on its way was put in: no viewer went
+    /// without pictures for it.
+    floor_idle: bool,
 }
 
 /// Why the encoder could not be replaced.
@@ -492,7 +515,6 @@ struct Stream {
     /// (after `tx`, where both are held).
     section: Mutex<EncoderSection>,
     element: &'static str,
-    min_qp: u32,
     /// The duplicate of the PipeWire fd pipewiresrc was pointed at.
     fd: Option<OwnedFd>,
     shared: Arc<Shared>,
@@ -515,6 +537,8 @@ struct Stream {
 static CURRENT: Mutex<Option<Arc<Stream>>> = Mutex::new(None);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// What `set_min_qp` asked for last; 0 until it is called (the encoder keeps its floor).
+static WANTED_MIN_QP: AtomicU32 = AtomicU32::new(0);
 /// Pipelines started and not yet fully stopped (a stopped share's pipeline ends in the
 /// background).
 static LIVE_PIPELINES: AtomicU64 = AtomicU64::new(0);
@@ -707,7 +731,6 @@ impl Stream {
             chain: Some(chain),
             section,
             element,
-            min_qp: cfg.min_qp,
             fd,
             shared,
             tx: Mutex::new(Tx {
@@ -732,6 +755,10 @@ impl Stream {
                 mute_main: if let TestFail::MainLate(n) = test_fail { n } else { 0 },
                 switches: 0,
                 last_switch_us: 0,
+                min_qp: cfg.min_qp,
+                floor: EncoderFloor::new(cfg.min_qp),
+                floor_wait: None,
+                floor_idle: false,
             }),
             failure: Mutex::new(None),
             buffers_removed: AtomicBool::new(false),
@@ -828,6 +855,9 @@ impl Stream {
             tx.await_keyframe = true;
             // A Main encoder still to prove itself is given its time from now.
             tx.main_wait = tx.main_wait.map(|_| Instant::now());
+            tx.floor_wait = tx.floor_wait.map(|_| Instant::now());
+            // (Its viewers left before its keyframe: nobody went without pictures for it.)
+            tx.floor_idle |= tx.floor.in_flight().is_some();
             tx.keyframe_tries = 0;
             self.want_keyframe(tx, false);
         } else {
@@ -924,7 +954,7 @@ impl Stream {
         if want_main == tx.main || (want_main && !want_idr && !opening) {
             return Ok(());
         }
-        match self.switch_profile(tx, want_main) {
+        match self.replace_encoder(tx, want_main, tx.min_qp) {
             Ok(()) => Ok(()),
             Err(SwitchError::Refused(why)) if want_main => {
                 self.main_unavailable(tx, &why);
@@ -934,15 +964,78 @@ impl Stream {
         }
     }
 
-    /// Replaces the encoder (with its profile filter and appsink) by one for the other
-    /// profile, while everything in front of it keeps running. Its first picture is an IDR
-    /// with SPS and PPS; whatever the old encoder still held is gone with it.
-    fn switch_profile(&self, tx: &mut Tx, main: bool) -> Result<(), SwitchError> {
+    /// Makes the encoder's quality floor the one the stream controls ask for (`set_min_qp`).
+    /// vah264enc does not take `min-qp` while it runs, so the encoder is replaced as for a
+    /// change of profile, with the same care: one replacement at a time (none while a new
+    /// encoder of any kind still owes its first keyframe), the old encoder goes on when the
+    /// new one is refused, and one that shows no keyframe within `MAIN_FIRST_PICTURE` is
+    /// replaced by one with the floor before it. An error means the stream is to be given up
+    /// (the gst-launch capture's encoder then starts with the last floor that worked).
+    fn follow_floor(&self, tx: &mut Tx) -> Result<(), String> {
+        use super::live_controls::{floor_refused, Path};
+        if tx.floor.in_flight().is_some() {
+            // The encoder that carries the new floor failed (an error of its own, or a first
+            // keyframe that is not what the viewers were promised: `guard_main`), or it has
+            // shown nothing in its time.
+            let broke = tx.first_keyframe_due && self.shared.main_broke.load(Ordering::SeqCst) == tx.switches;
+            let late = tx.floor_wait.is_some_and(|since| since.elapsed() >= MAIN_FIRST_PICTURE) && self.shared.at_encoder_ms.load(Ordering::Relaxed) == 0;
+            if !(broke || (late && tx.first_keyframe_due && self.shared.watched.load(Ordering::Relaxed))) {
+                return Ok(());
+            }
+            let Some((refused, back)) = tx.floor.failed() else { return Ok(()) };
+            tx.floor_wait = None;
+            let why = if broke { "the new encoder failed before its first keyframe".to_string() } else { format!("no keyframe from the new encoder in {} ms", MAIN_FIRST_PICTURE.as_millis()) };
+            floor_refused(Path::GpuCapture, refused, back, &why);
+            lock(&self.shared.in_flight).clear();
+            return match self.replace_encoder(tx, tx.main, back) {
+                Ok(()) => Ok(()),
+                Err(SwitchError::Refused(why)) | Err(SwitchError::Broken(why)) => Err(format!("a volta do codificador para min-qp {back} falhou: {why}")),
+            };
+        }
+        let wanted = WANTED_MIN_QP.load(Ordering::Relaxed);
+        if wanted == 0 || tx.first_keyframe_due {
+            return Ok(());
+        }
+        let Some(min_qp) = tx.floor.next(wanted, Instant::now()) else { return Ok(()) };
+        tx.floor_idle = !self.shared.watched.load(Ordering::Relaxed);
+        let failure = match self.replace_encoder(tx, tx.main, min_qp) {
+            Ok(()) => {
+                tx.floor_wait = Some(Instant::now());
+                return Ok(());
+            }
+            Err(failure) => failure,
+        };
+        let back = tx.floor.failed().map_or(tx.min_qp, |(_, back)| back);
+        match failure {
+            // The encoder with the floor before it was never taken out.
+            SwitchError::Refused(why) => {
+                floor_refused(Path::GpuCapture, min_qp, back, &why);
+                Ok(())
+            }
+            SwitchError::Broken(why) => {
+                floor_refused(Path::GpuCapture, min_qp, back, &why);
+                Err(format!("a troca do codificador para min-qp {min_qp} falhou: {why}"))
+            }
+        }
+    }
+
+    /// Replaces the encoder (with its profile filter and appsink) by one for profile `main`
+    /// and quality floor `min_qp` (a change of either: neither is something vah264enc takes
+    /// while it runs), while everything in front of it keeps running. Its first picture is
+    /// an IDR with SPS and PPS; whatever the old encoder still held is gone with it.
+    fn replace_encoder(&self, tx: &mut Tx, main: bool, min_qp: u32) -> Result<(), SwitchError> {
         use SwitchError::{Broken, Refused};
         let started = Instant::now();
         let pipeline = &self.chain().pipeline;
         let input = pipeline.by_name(vaapi::ENCODER_INPUT).and_then(|e| e.static_pad("src")).ok_or_else(|| Refused("sem a entrada do codificador".into()))?;
-        let mut description = EncodeChain::encoder_description(self.element, tx.requested_bps, self.min_qp, main && self.test_fail != TestFail::MainProfile);
+        let mut description = EncodeChain::encoder_description(self.element, tx.requested_bps, min_qp, main && self.test_fail != TestFail::MainProfile);
+        if self.test_fail == TestFail::FloorRefuse && min_qp != tx.floor.applied() {
+            description = format!("capsfilter caps=\"video/x-raw(memory:VAMemory),width=640,height=368\" ! {description}");
+        } else if self.test_fail == TestFail::FloorMute && min_qp != tx.floor.applied() {
+            description = description.replace("appsink name=sink", "identity drop-probability=1.0 ! appsink name=sink");
+        } else if self.test_fail == TestFail::FloorBreak && min_qp != tx.floor.applied() {
+            description = format!("identity error-after=1 ! {description}");
+        }
         if main && self.test_fail == TestFail::NoMain {
             description = description.replace("profile=main", "profile=high-4:4:4");
         } else if main && self.test_fail == TestFail::MainRefuse {
@@ -969,7 +1062,10 @@ impl Stream {
             (old.input(), old.sink.clone())
         };
         // This encoder's number, when it is a Main one still to prove itself.
-        let guard = if main && !tx.main_proven { tx.switches + 1 } else { 0 };
+        // (Or one that carries a quality floor still to be proven: an error of its own puts
+        // the floor before it back, `follow_floor`, and is not one of the capture either.)
+        let unproven_main = main && !tx.main_proven;
+        let guard = if unproven_main || tx.floor.in_flight().is_some_and(|(qp, _)| qp == min_qp) { tx.switches + 1 } else { 0 };
         let guarded = if guard != 0 { new.objects() } else { Vec::new() };
         let abandoned = Arc::new(AtomicBool::new(false));
         let (done_tx, done_rx) = sync_channel::<Result<(), String>>(1);
@@ -1032,7 +1128,8 @@ impl Stream {
         if unproven {
             lock(&self.shared.in_flight).clear();
         }
-        tx.main = main;
+        let profile_changed = std::mem::replace(&mut tx.main, main) != main;
+        let old_min_qp = std::mem::replace(&mut tx.min_qp, min_qp);
         tx.ready.clear();
         tx.applied_bps = tx.requested_bps;
         tx.encoder_said = false;
@@ -1044,12 +1141,19 @@ impl Stream {
         // for twice `MAIN_FIRST_PICTURE` already: the encoder that follows it gets one
         // `KEYFRAME_RETRY` for its keyframe, not all of them, before gst-launch takes over.
         tx.keyframe_tries = if unproven && tx.main_failed && tx.main_was_late { KEYFRAME_TRIES - 1 } else { 0 };
-        tx.main_wait = (guard != 0).then(Instant::now);
+        tx.main_wait = unproven_main.then(Instant::now);
+        // A floor in flight is judged on the encoder that carries it now.
+        tx.floor_wait = tx.floor_wait.map(|_| Instant::now());
         tx.switches += 1;
         tx.last_switch_us = started.elapsed().as_micros() as u64;
         // The new encoder's first picture, at once.
         self.shared.pass_next.store(true, Ordering::Relaxed);
-        info!("🔀 [VAAPI] Perfil H.264 da captura na GPU muda para {} (codificador trocado em {:.1} ms)", vaapi::profile_name(main), started.elapsed().as_secs_f64() * 1000.0);
+        if profile_changed || old_min_qp == min_qp {
+            info!("🔀 [VAAPI] Perfil H.264 da captura na GPU muda para {} (codificador trocado em {:.1} ms)", vaapi::profile_name(main), started.elapsed().as_secs_f64() * 1000.0);
+        }
+        if old_min_qp != min_qp {
+            info!("🔀 [VAAPI] GPU capture encoder replaced for min-qp {} -> {} in {:.1} ms; its first keyframe is awaited", old_min_qp, min_qp, started.elapsed().as_secs_f64() * 1000.0);
+        }
         Ok(())
     }
 
@@ -1097,13 +1201,23 @@ impl Stream {
                     self.main_unavailable(tx, &e);
                     return Ok(None);
                 }
+                if tx.floor.in_flight().is_some() {
+                    // Thrown away too: the next turn puts the floor before it back.
+                    warn!("⚠️ [VAAPI] First keyframe of the encoder made for the new quality floor is not usable: {}", e);
+                    self.shared.main_broke.store(tx.switches, Ordering::SeqCst);
+                    return Ok(None);
+                }
                 return Err(e);
             }
             tx.first_keyframe_due = false;
+            if let Some((old, new, since)) = tx.floor.proven() {
+                tx.floor_wait = None;
+                super::live_controls::floor_applied(super::live_controls::Path::GpuCapture, old, new, Some(since.elapsed()).filter(|_| !tx.floor_idle));
+            }
             if tx.main && !tx.main_proven {
                 tx.main_proven = true;
-                self.shared.guard_main.store(0, Ordering::SeqCst);
             }
+            self.shared.guard_main.store(0, Ordering::SeqCst);
             tx.main_wait = None;
         }
         if !std::mem::replace(&mut tx.encoder_said, true) {
@@ -1119,9 +1233,10 @@ impl Stream {
                 self.element,
                 profile.as_deref().unwrap_or("sem SPS"),
                 tx.applied_bps as f64 / 1e6,
-                self.min_qp,
+                tx.min_qp,
                 au.len()
             );
+            super::live_controls::encoder_in_effect(super::live_controls::Path::GpuCapture, tx.main, tx.min_qp);
         }
         tx.await_keyframe = false;
         tx.keyframe_asked_at = None;
@@ -1149,7 +1264,7 @@ impl Stream {
                 // Constrained Baseline one (`follow_profile`).
                 let guarded = self.shared.guard_main.load(Ordering::SeqCst);
                 if guarded != 0 && lock(&self.shared.guarded).iter().any(|part| src == part || src.has_as_ancestor(part)) {
-                    warn!("⚠️ [VAAPI] Erro do codificador Main antes do primeiro keyframe: {}", e.error());
+                    warn!("⚠️ [VAAPI] Erro do codificador novo (Main, ou de outro QP mínimo) antes do primeiro keyframe: {}", e.error());
                     self.shared.main_broke.store(guarded, Ordering::SeqCst);
                     continue;
                 }
@@ -1253,6 +1368,8 @@ impl Stream {
             main_unavailable: tx.main_failed,
             profile_switches: tx.switches,
             last_switch_us: tx.last_switch_us,
+            min_qp: tx.min_qp,
+            floor_in_flight: tx.floor.in_flight().is_some(),
             picture_rect: self.shared.picture_rect(),
             bars_painted: load(&self.shared.bars_painted),
             bars_us: load(&self.shared.bars_us),
@@ -1974,6 +2091,8 @@ pub fn end() {
     if retire(None).is_some() {
         info!("🛑 [VAAPI] Captura na GPU encerrada");
     }
+    // The next share asks for its own floor.
+    WANTED_MIN_QP.store(0, Ordering::Relaxed);
 }
 
 /// How a stream that was running came to its end.
@@ -2073,7 +2192,7 @@ pub fn next_picture(bitrate_bps: u32, want_idr: bool, main: bool) -> Option<Pict
         tx.requested_bps = bitrate_bps;
         tx.asked_at = Instant::now();
     }
-    if let Err(reason) = stream.follow_profile(&mut tx, main, want_idr) {
+    if let Err(reason) = stream.follow_profile(&mut tx, main, want_idr).and_then(|()| stream.follow_floor(&mut tx)) {
         drop(tx);
         give_up_stream(&stream, &reason);
         return None;
@@ -2109,8 +2228,9 @@ pub fn next_picture(bitrate_bps: u32, want_idr: bool, main: bool) -> Option<Pict
         };
         let Some(sample) = sample else {
             // Nothing finished. (A Main encoder that has not shown its first keyframe has
-            // its own deadline, in `follow_profile`.)
-            break stream.health(true, !tx.main || tx.main_proven);
+            // its own deadline, in `follow_profile`; one made for a new quality floor has
+            // its own in `follow_floor`.)
+            break stream.health(true, (!tx.main || tx.main_proven) && tx.floor.in_flight().is_none());
         };
         if swallow || (tx.mute_main > 0 && tx.main && !tx.main_proven) {
             continue;
@@ -2129,6 +2249,14 @@ pub fn next_picture(bitrate_bps: u32, want_idr: bool, main: bool) -> Option<Pict
         give_up_stream(&stream, &reason);
     }
     None
+}
+
+/// The quality floor (min-qp) the stream controls ask for now, told by the send loop before
+/// each `next_au`: the stream in service follows it (`Stream::follow_floor`). It is not a
+/// property of a stream: one that starts later is made with `Config::min_qp` and follows
+/// what is asked from then on.
+pub fn set_min_qp(min_qp: u32) {
+    WANTED_MIN_QP.store(min_qp, Ordering::Relaxed);
 }
 
 /// `next_picture` for the send loop, which only wants the bytes.

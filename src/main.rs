@@ -243,6 +243,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let popout_weak = popout_window.as_weak();
     #[cfg(feature = "automation")]
     automation::set_popout(&popout_window);
+    // The stream controls on the own stream (both windows), refreshed while this lives.
+    let _live_stream_controls = crate::ui::live_stream::install(&app, &popout_window);
     // Before either window draws its first frame: that is when a window finds out
     // whether it can show received streams from the decoder's GPU buffers.
     #[cfg(all(target_os = "linux", feature = "vaapi"))]
@@ -2511,7 +2513,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Stream quality (advanced): read by the next screen share.
+    // Stream quality (advanced): what the next screen share starts from (a running one has
+    // its own values, changed by the stream controls: ui::live_stream).
     {
         use slint::ComponentHandle;
         let quality = app.global::<StreamQuality>();

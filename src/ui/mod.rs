@@ -8,6 +8,7 @@ pub mod gpu_video;
 #[cfg(all(target_os = "linux", feature = "vaapi"))]
 pub mod gl_video;
 pub mod window_place;
+pub mod live_stream;
 
 pub use helpers::*;
 pub use data_loader::*;

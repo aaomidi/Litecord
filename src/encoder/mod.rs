@@ -59,6 +59,12 @@ pub trait VideoEncoder: Send {
     /// Constrained Baseline again.
     fn set_efficient_profile(&mut self, _on: bool) {}
 
+    /// The quality floor (lowest QP) the stream controls ask for, called before each
+    /// `encode`. Only the VA-API encoder has one; it replaces its pipeline for a new value,
+    /// one replacement at a time, and goes back to the previous floor if the new one fails.
+    /// 0 asks for nothing (the share has ended).
+    fn set_quality_floor(&mut self, _min_qp: u32) {}
+
     /// Retorna o nome amigável do backend ativo
     fn name(&self) -> &'static str;
 

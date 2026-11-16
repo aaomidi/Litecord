@@ -1,0 +1,326 @@
+import { Slider } from "std-widgets.slint";
+import { AppTheme, TypeScale } from "../theme.slint";
+import { Tr } from "tr.slint";
+import { SettingsButton } from "settings_kit.slint";
+
+// Quality of the share that is running (src/screen_capture/live_controls.rs): the button on
+// the streamer's own stream and the panel it opens. Rust fills the values a few times a
+// second and applies what the callbacks report, to this share only; the saved settings
+// (StreamQuality) change only through save-default.
+export global LiveStream {
+    // A share of ours is running.
+    in property <bool> sharing;
+    // Built with the VA-API encoder, the one the quality floor acts on.
+    in property <bool> has-floor;
+    in property <float> min-qp-lowest: 18;
+    in property <float> min-qp-highest: 36;
+    in property <float> max-bitrate-lowest: 3;
+    in property <float> max-bitrate-highest: 50;
+    in-out property <float> min-qp: 30;
+    in-out property <float> max-bitrate: 8;
+    // What is in effect now, as one line; and the line under it while a browser viewer
+    // holds the rate down (empty otherwise).
+    in property <string> status;
+    in property <string> capped;
+    // Set while the share runs on an encoder that has no quality floor (empty otherwise).
+    in property <string> floor-note;
+    // The share's values are the saved defaults.
+    in property <bool> is-default: true;
+    // The panel is showing, below this point of the window (the button's lower right corner).
+    in-out property <bool> open;
+    in-out property <length> anchor-x;
+    in-out property <length> anchor-y;
+    // Counted up by the button while its panel is open: Rust closes a panel whose button
+    // is gone (src/ui/live_stream.rs).
+    in-out property <int> anchor-beat;
+    // (value, released): a slider that is still held reports released = false.
+    callback set-max-bitrate(int, bool);
+    callback set-min-qp(int, bool);
+    callback save-default();
+}
+
+// The button on the stream tile's top bar, in the look of its neighbours.
+export component LiveStreamButton inherits Rectangle {
+    in property <bool> active;
+    callback clicked();
+
+    width: 28px;
+    height: 24px;
+    border-radius: 4px;
+    background: (ta.has-hover || root.active) ? AppTheme.backdrop-max : AppTheme.backdrop;
+    accessible-role: button;
+    accessible-label: Tr.live_button_tip;
+
+    Image {
+        source: @image-url("../../assets/sliders.svg");
+        width: 12px;
+        height: 12px;
+        colorize: root.active ? AppTheme.accent : AppTheme.text-on-accent;
+        image-fit: contain;
+    }
+
+    if ta.has-hover && !root.active: Rectangle {
+        z: 10;
+        x: parent.width - self.width;
+        y: parent.height + 6px;
+        width: tip.preferred-width + 16px;
+        height: 24px;
+        border-radius: 4px;
+        background: AppTheme.backdrop-max;
+        tip := Text {
+            text: Tr.live_button_tip;
+            color: AppTheme.text-on-accent;
+            font-size: TypeScale.caption;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    Timer {
+        interval: 100ms;
+        running: root.active;
+        triggered => { LiveStream.anchor-beat += 1; }
+    }
+}
+
+component StepButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 22px;
+    height: 22px;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: AppTheme.border-subtle;
+    background: ta.has-hover && root.enabled ? AppTheme.interactive-hover : AppTheme.surface-window;
+    accessible-role: button;
+    accessible-label: root.text;
+    Text {
+        text: root.text;
+        color: root.enabled ? AppTheme.text-strong : AppTheme.text-muted;
+        font-size: TypeScale.body;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+// A whole-number value of the share: title with the number, and a slider between two
+// one-step buttons. `moved(value, released)`.
+component LiveSlider inherits VerticalLayout {
+    in property <string> title;
+    in property <string> value-text;
+    in property <float> minimum;
+    in property <float> maximum;
+    in-out property <float> value;
+    in property <bool> enabled: true;
+    callback moved(int, bool);
+
+    spacing: 4px;
+    HorizontalLayout {
+        spacing: 8px;
+        Text {
+            horizontal-stretch: 1;
+            text: root.title;
+            color: AppTheme.text-strong;
+            font-size: TypeScale.small;
+            font-weight: 600;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        Text {
+            text: root.value-text;
+            color: AppTheme.text-strong;
+            font-size: TypeScale.small;
+            font-weight: 700;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+    }
+    HorizontalLayout {
+        spacing: 6px;
+        VerticalLayout {
+            alignment: center;
+            StepButton {
+                text: "−";
+                enabled: root.enabled && root.value > root.minimum;
+                clicked => {
+                    root.value = Math.max(root.minimum, Math.round(root.value) - 1);
+                    root.moved(Math.round(root.value), false);
+                }
+            }
+        }
+        Slider {
+            horizontal-stretch: 1;
+            enabled: root.enabled;
+            minimum: root.minimum;
+            maximum: root.maximum;
+            step: 1;
+            value <=> root.value;
+            changed(val) => {
+                root.value = Math.round(val);
+                root.moved(Math.round(val), false);
+            }
+            released(val) => {
+                root.value = Math.round(val);
+                root.moved(Math.round(val), true);
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            StepButton {
+                text: "+";
+                enabled: root.enabled && root.value < root.maximum;
+                clicked => {
+                    root.value = Math.min(root.maximum, Math.round(root.value) + 1);
+                    root.moved(Math.round(root.value), false);
+                }
+            }
+        }
+    }
+}
+
+// The panel the button opens: the two values of this share, what is in effect now, and
+// the way to make them the default.
+export component LiveStreamPanel inherits Rectangle {
+    callback close();
+
+    width: 300px;
+    height: content.preferred-height;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: AppTheme.border-subtle;
+    background: AppTheme.surface-window;
+    drop-shadow-blur: 12px;
+    drop-shadow-color: #00000060;
+
+    // Clicks on the panel itself are not clicks outside it.
+    TouchArea { }
+
+    content := VerticalLayout {
+        padding: 12px;
+        spacing: 10px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                horizontal-stretch: 1;
+                text: Tr.live_title;
+                color: AppTheme.text-strong;
+                font-size: TypeScale.body;
+                font-weight: 700;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            Rectangle {
+                width: 22px;
+                height: 22px;
+                border-radius: 4px;
+                background: close_ta.has-hover ? AppTheme.interactive-hover : transparent;
+                accessible-role: button;
+                accessible-label: Tr.live_close;
+                Image {
+                    source: @image-url("../../assets/chrome-close.svg");
+                    width: 10px;
+                    height: 10px;
+                    colorize: AppTheme.text-primary;
+                    image-fit: contain;
+                }
+                close_ta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.close(); }
+                }
+            }
+        }
+
+        LiveSlider {
+            title: Tr.live_max_bitrate;
+            value-text: Math.round(LiveStream.max-bitrate) + " Mbit/s";
+            minimum: LiveStream.max-bitrate-lowest;
+            maximum: LiveStream.max-bitrate-highest;
+            value <=> LiveStream.max-bitrate;
+            moved(mbps, released) => { LiveStream.set-max-bitrate(mbps, released); }
+        }
+
+        if LiveStream.has-floor: VerticalLayout {
+            spacing: 2px;
+            LiveSlider {
+                title: Tr.live_quality_floor;
+                value-text: "QP " + Math.round(LiveStream.min-qp);
+                minimum: LiveStream.min-qp-lowest;
+                maximum: LiveStream.min-qp-highest;
+                value <=> LiveStream.min-qp;
+                enabled: LiveStream.floor-note == "";
+                moved(qp, released) => { LiveStream.set-min-qp(qp, released); }
+            }
+            // Which way is sharper: under the two ends of the slider.
+            HorizontalLayout {
+                padding-left: 28px;
+                padding-right: 28px;
+                Text {
+                    horizontal-stretch: 1;
+                    text: "← " + Tr.live_sharper;
+                    color: AppTheme.text-muted;
+                    font-size: TypeScale.caption;
+                    overflow: elide;
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    text: Tr.live_softer + " →";
+                    color: AppTheme.text-muted;
+                    font-size: TypeScale.caption;
+                    horizontal-alignment: right;
+                    overflow: elide;
+                }
+            }
+            if LiveStream.floor-note != "": Text {
+                text: LiveStream.floor-note;
+                color: AppTheme.text-muted;
+                font-size: TypeScale.caption;
+                wrap: word-wrap;
+            }
+        }
+
+        Rectangle { height: 1px; background: AppTheme.border-subtle; }
+
+        Text {
+            text: LiveStream.status;
+            color: AppTheme.text-primary;
+            font-size: TypeScale.small;
+            font-weight: 600;
+            wrap: word-wrap;
+        }
+        if LiveStream.capped != "": Text {
+            text: LiveStream.capped;
+            color: AppTheme.accent;
+            font-size: TypeScale.caption;
+            wrap: word-wrap;
+        }
+
+        Text {
+            text: Tr.live_this_share_only;
+            color: AppTheme.text-muted;
+            font-size: TypeScale.caption;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            alignment: end;
+            SettingsButton {
+                height: 28px;
+                text: LiveStream.is-default ? Tr.live_saved : Tr.live_save_default;
+                enabled: !LiveStream.is-default;
+                clicked => { LiveStream.save-default(); }
+            }
+        }
+    }
+}
