@@ -10,6 +10,7 @@ pub mod audio_loopback;
 pub mod manager;
 pub mod net_diagnostics;
 pub mod web_share;
+pub mod golive;
 pub mod watch;
 pub mod live_controls;
 pub mod web_link;

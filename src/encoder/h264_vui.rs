@@ -153,7 +153,7 @@ fn skip_scaling_list(r: &mut BitReader, size: usize) -> Option<()> {
 }
 
 /// RBSP without emulation prevention bytes (00 00 03 -> 00 00).
-fn unescape(data: &[u8]) -> Vec<u8> {
+pub(crate) fn unescape(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     let mut zeros = 0;
     for &b in data {
@@ -168,7 +168,7 @@ fn unescape(data: &[u8]) -> Vec<u8> {
 }
 
 /// Emulation prevention: 00 00 followed by 00..03 gets a 03 in between.
-fn escape(rbsp: &[u8]) -> Vec<u8> {
+pub(crate) fn escape(rbsp: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rbsp.len() + 4);
     let mut zeros = 0;
     for &b in rbsp {
@@ -182,16 +182,16 @@ fn escape(rbsp: &[u8]) -> Vec<u8> {
     out
 }
 
-struct BitReader<'a> {
+pub(crate) struct BitReader<'a> {
     data: &'a [u8],
-    pos: usize,
+    pub(crate) pos: usize,
 }
 
 impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
     }
-    fn bits(&mut self, n: u32) -> Option<u32> {
+    pub(crate) fn bits(&mut self, n: u32) -> Option<u32> {
         let mut v = 0u32;
         for _ in 0..n {
             let byte = *self.data.get(self.pos / 8)?;
@@ -200,7 +200,7 @@ impl<'a> BitReader<'a> {
         }
         Some(v)
     }
-    fn ue(&mut self) -> Option<u32> {
+    pub(crate) fn ue(&mut self) -> Option<u32> {
         let mut zeros = 0;
         while self.bits(1)? == 0 {
             zeros += 1;
@@ -210,20 +210,20 @@ impl<'a> BitReader<'a> {
         }
         Some((1u32 << zeros) - 1 + self.bits(zeros)?)
     }
-    fn se(&mut self) -> Option<i64> {
+    pub(crate) fn se(&mut self) -> Option<i64> {
         let k = self.ue()? as i64;
         Some(if k % 2 == 1 { (k + 1) / 2 } else { -k / 2 })
     }
 }
 
 #[derive(Default)]
-struct BitWriter {
-    bytes: Vec<u8>,
-    n: usize,
+pub(crate) struct BitWriter {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) n: usize,
 }
 
 impl BitWriter {
-    fn bit(&mut self, b: u8) {
+    pub(crate) fn bit(&mut self, b: u8) {
         if self.n % 8 == 0 {
             self.bytes.push(0);
         }

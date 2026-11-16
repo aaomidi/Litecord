@@ -1661,6 +1661,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "davey"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91ef355984c094657aa4d0974cae40a144a11a001558dacab3ec3ac06c63ca34"
+dependencies = [
+ "aead",
+ "aes",
+ "cipher",
+ "ctr",
+ "ghash",
+ "hex-literal",
+ "hmac",
+ "num-derive",
+ "num-traits",
+ "openmls",
+ "openmls_basic_credential",
+ "openmls_rust_crypto",
+ "openmls_traits",
+ "p256",
+ "rand 0.8.7",
+ "scrypt",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
 name = "defmt"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4871,7 +4899,8 @@ dependencies = [
  "chrono",
  "copypasta",
  "cpal",
- "davey",
+ "davey 0.1.4",
+ "davey 0.2.0",
  "env_logger",
  "futures-util",
  "gstreamer",
@@ -4888,6 +4917,9 @@ dependencies = [
  "mimalloc",
  "nnnoiseless",
  "openh264",
+ "openmls",
+ "openmls_basic_credential",
+ "openmls_rust_crypto",
  "opus-rs",
  "qrcode",
  "rand 0.8.7",
