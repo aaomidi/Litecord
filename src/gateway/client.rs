@@ -668,6 +668,7 @@ impl GatewayClient {
                                         String::new()
                                     };
                                     if u_id > 0 && !c_str.is_empty() {
+                                        crate::audio::call_sounds::seed_voice_state(u_id, vs["self_stream"].as_bool().unwrap_or(false));
                                         if let Ok(mut gvs) = get_guild_voice_states_store().lock() {
                                             gvs.insert(u_id, c_str.clone());
                                             info!("📌 [READY] Pré-carregado estado de voz: User {} -> Canal {}", u_id, c_str);
@@ -705,6 +706,7 @@ impl GatewayClient {
                                 String::new()
                             };
                             if u_id > 0 && !c_str.is_empty() {
+                                crate::audio::call_sounds::seed_voice_state(u_id, vs["self_stream"].as_bool().unwrap_or(false));
                                 if let Ok(mut gvs) = get_guild_voice_states_store().lock() {
                                     gvs.insert(u_id, c_str.clone());
                                     info!("📌 [READY_SUPPLEMENTAL] Estado de voz pré-carregado: User {} -> Canal {}", u_id, c_str);
@@ -731,6 +733,7 @@ impl GatewayClient {
                                         String::new()
                                     };
                                     if u_id > 0 && !c_str.is_empty() {
+                                        crate::audio::call_sounds::seed_voice_state(u_id, vs["self_stream"].as_bool().unwrap_or(false));
                                         if let Ok(mut gvs) = get_guild_voice_states_store().lock() {
                                             gvs.insert(u_id, c_str.clone());
                                             info!("📌 [READY_SUPPLEMENTAL] Estado de voz pré-carregado: User {} -> Canal {}", u_id, c_str);
@@ -816,6 +819,8 @@ impl GatewayClient {
                             None
                         };
                         let my_voice_chan = self.voice_channel_id.lock().unwrap().clone();
+                        // Interface sounds: someone entering or leaving our channel, a Discord stream there.
+                        crate::audio::call_sounds::on_voice_state(event_uid, my_voice_chan.as_deref(), previous_chan.as_deref(), event_chan.as_deref(), &v["d"]);
 
                         if let Some(ref my_cid) = my_voice_chan {
                             if event_chan.as_deref() == Some(my_cid.as_str()) {
@@ -992,6 +997,8 @@ impl GatewayClient {
                     let channel_id = v["d"]["channel_id"].as_str().unwrap_or("").to_string();
                     let my_uid = self.user_id.lock().unwrap().clone().unwrap_or_default();
                     info!("📞 {} recebido bruto: {:?}", t, v["d"]);
+                    // Interface sounds: who is in the call already is not someone arriving later.
+                    crate::audio::call_sounds::seed_call(&v["d"]);
 
                     // Extrai IDs dos usuários presentes nos voice_states da chamada
                     let voice_uids: Vec<String> = v["d"]["voice_states"]
@@ -1119,6 +1126,7 @@ impl GatewayClient {
                             };
 
                             if uid > 0 && !cid_str.is_empty() {
+                                crate::audio::call_sounds::seed_voice_state(uid, vs["self_stream"].as_bool().unwrap_or(false));
                                 if let Ok(mut gvs) = get_guild_voice_states_store().lock() {
                                     gvs.insert(uid, cid_str.clone());
                                     info!("📌 [GUILD_CREATE] Pré-carregado estado de voz: User {} -> Canal {}", uid, cid_str);

@@ -171,6 +171,11 @@ pub fn process_signaling_json(
             if is_streaming {
                 mark_stream_started(pkt_uid);
             }
+            // Interface sound for a stream starting. Its end is only told by
+            // `trigger_stream_stopped`: a "not streaming" presence proves nothing by itself.
+            if is_streaming {
+                crate::audio::call_sounds::on_peer_stream(pkt_uid, true);
+            }
 
             // Se o peer parou de transmitir tela, fecha imediatamente (<50ms) sem esperar timeout de pacotes UDP.
             // Anyone who knows the channel can send this presence under any id: while

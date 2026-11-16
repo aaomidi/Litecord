@@ -222,6 +222,7 @@ pub fn trigger_stream_stopped(uid: u64) {
     info!("🛑 [STREAM STOPPED] Encerrando imediatamente estado do stream UID={}", uid);
     // The next stream of this peer comes with a new key.
     super::watch::forget_stream(uid);
+    crate::audio::call_sounds::on_peer_stream(uid, false);
     if let Ok(mut guard) = STREAM_STOPPED_AT.lock() {
         guard.get_or_insert_with(HashMap::new).insert(uid, Instant::now());
     }
