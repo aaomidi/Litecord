@@ -169,6 +169,8 @@ impl ScreenCaptureManager {
 
     pub fn stop(&self) {
         super::web_share::stop();
+        // The Discord stream (Go Live) ends with the share it carries.
+        super::golive::share_ended();
         stop_window_border_overlay();
         #[cfg(not(windows))]
         {
@@ -997,6 +999,9 @@ impl ScreenCaptureManager {
                         total_blt_us += blt_us;
                         total_pix_us += pix_us;
                     }
+                    // From here the share has a picture source: a Discord stream that waits
+                    // for one (Go Live) may be announced.
+                    super::golive::capture_ready();
 
                     let t_preview_start = Instant::now();
                     #[cfg(windows)]
@@ -1059,9 +1064,11 @@ impl ScreenCaptureManager {
                     if last_rate_update.elapsed() >= Duration::from_secs(1) {
                         last_rate_update = Instant::now();
                         let before = rate.current();
-                        let bps = rate.update(super::watch::worst_loss(), last_rate_update);
+                        // (The loss Discord's media server reports counts like a viewer's.)
+                        let worst_loss = super::watch::worst_loss().max(super::golive::worst_loss());
+                        let bps = rate.update(worst_loss, last_rate_update);
                         if bps != before {
-                            info!("📶 [ABR] Taxa da transmissão: {:.1} -> {:.1} Mbps (pior perda entre espectadores: {:?}‰)", before as f64 / 1e6, bps as f64 / 1e6, super::watch::worst_loss());
+                            info!("📶 [ABR] Taxa da transmissão: {:.1} -> {:.1} Mbps (pior perda entre espectadores: {:?}‰)", before as f64 / 1e6, bps as f64 / 1e6, worst_loss);
                         }
                     }
 
@@ -1072,12 +1079,28 @@ impl ScreenCaptureManager {
                     // in turns that encode Constrained Baseline.
                     let (viewer_addrs, viewers_decode_main) = super::watch::viewers_now();
                     let web_viewers = super::web_share::viewer_count();
-                    let watched = !viewer_addrs.is_empty() || web_viewers > 0;
-                    let efficient = profile_choice.update(watched, viewers_decode_main && web_viewers == 0, Instant::now());
+                    // Somebody watches on Discord (Go Live): they get Constrained Baseline at
+                    // the bitrate announced to Discord, as a browser viewer does.
+                    let golive = super::golive::wanted();
+                    let watched = !viewer_addrs.is_empty() || web_viewers > 0 || golive;
+                    let efficient = profile_choice.update(watched, viewers_decode_main && web_viewers == 0 && !golive, Instant::now());
                     // Browsers report no loss, so nothing would bring a higher rate down for
                     // them, and a keyframe has to fit their packet buffers.
-                    let rate_cap = if web_viewers > 0 { WEB_VIEWER_MAX_BITRATE } else { u32::MAX };
+                    let rate_cap = if golive {
+                        // (What was announced to Discord, and what its media server says it
+                        // can take, less what packets add: `golive::rate`.)
+                        super::golive::rate_cap()
+                    } else if web_viewers > 0 {
+                        WEB_VIEWER_MAX_BITRATE
+                    } else {
+                        u32::MAX
+                    };
                     REQUESTED_BITRATE_BPS.store(rate.current().min(rate_cap), Ordering::Relaxed);
+                    // The periodic keyframe: every 2 s, the safety net of the direct stream.
+                    // While somebody watches on Discord it follows that stream's rule (about
+                    // one a minute, as official senders make them): every viewer of any kind
+                    // asks for a keyframe when it needs one.
+                    let idr_every = if golive { super::golive::keyframe_interval() } else { None }.unwrap_or(Duration::from_millis(2000));
                     if watched != was_watched {
                         was_watched = watched;
                         TX_WATCHED.store(watched, Ordering::Relaxed);
@@ -1112,7 +1135,7 @@ impl ScreenCaptureManager {
                         }
                         #[cfg(all(target_os = "linux", feature = "vaapi"))]
                         {
-                            let want_idr = KEYFRAME_REQUESTED.swap(false, Ordering::Relaxed) || last_idr.elapsed() >= Duration::from_millis(2000);
+                            let want_idr = KEYFRAME_REQUESTED.swap(false, Ordering::Relaxed) || last_idr.elapsed() >= idr_every;
                             if want_idr {
                                 last_idr = Instant::now();
                             }
@@ -1131,7 +1154,7 @@ impl ScreenCaptureManager {
                             asked_bitrate = target_bitrate;
                         }
                         enc.set_efficient_profile(efficient);
-                        if KEYFRAME_REQUESTED.swap(false, Ordering::Relaxed) || last_idr.elapsed() >= Duration::from_millis(2000) {
+                        if KEYFRAME_REQUESTED.swap(false, Ordering::Relaxed) || last_idr.elapsed() >= idr_every {
                             last_idr = Instant::now();
                             enc.force_intra_frame();
                         }
@@ -1150,6 +1173,10 @@ impl ScreenCaptureManager {
                         // before it was encoded (one that connected since waits for the next).
                         if web_viewers > 0 {
                             super::web_share::offer_frame(&raw_frame_bytes);
+                        }
+                        // And so do the people watching on Discord.
+                        if golive {
+                            super::golive::offer_frame(&raw_frame_bytes);
                         }
                         let t_crypt_start = Instant::now();
                         let Some(frame_bytes) = super::watch::session_key().and_then(|k| encrypt_signaling_payload(&k, &raw_frame_bytes)) else {

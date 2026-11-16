@@ -1149,6 +1149,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_web_share_active(false);
             ui.set_web_share_url("".into());
             ui.set_web_share_viewers(0);
+            ui.set_golive_state(0);
+            ui.set_golive_viewers(0);
+            ui.set_golive_e2ee(true);
             ui.set_show_self_preview_notice(false);
             ui.set_local_preview_fps("".into());
             ui.set_active_stream_frame(Image::default());
@@ -1262,6 +1265,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
                 ui.set_is_screen_sharing(true);
+                // Go Live: a screen or window share can also be a Discord stream, for people
+                // on the official clients (a camera is not a stream on Discord). With the
+                // dialog's switch on it is asked for now; the button asks later.
+                if camera_index.is_none() {
+                    let share = screen_capture::golive::Params::for_share(res_val, target_fps, include_audio);
+                    screen_capture::golive::share_started(share);
+                    if video_settings::get_stream_to_discord() {
+                        if let Err(failure) = screen_capture::golive::start(share) {
+                            ui.set_share_notice(failure.notice().into());
+                        }
+                    }
+                }
                 if video_settings::get_enable_self_preview_notice() {
                     ui.set_show_self_preview_notice(true);
                     let app_weak_notice = app_weak_ss.clone();
@@ -1274,6 +1289,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ui.set_show_self_preview_notice(false);
                 }
             }
+        }
+    });
+
+    // Go Live: the state of the Discord stream, from its own thread. A stream that ended by
+    // itself says why in the share's banner; the share goes on.
+    let golive_status_weak = app.as_weak();
+    screen_capture::golive::on_status_change(move || {
+        let weak = golive_status_weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = weak.upgrade() else { return; };
+            let status = screen_capture::golive::status();
+            ui.set_golive_state(status.phase.ui_state());
+            ui.set_golive_viewers(status.viewers as i32);
+            // A stream that runs without end-to-end encryption (Discord negotiates that for
+            // stage channels, and may downgrade a call): the tooltip says so for as long
+            // as it lasts, and the banner once per stream.
+            static TOLD_NOT_E2EE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            let unencrypted = status.phase.ui_state() == 2 && !status.e2ee;
+            ui.set_golive_e2ee(!unencrypted);
+            if status.phase == screen_capture::golive::Phase::Off {
+                TOLD_NOT_E2EE.store(false, std::sync::atomic::Ordering::Relaxed);
+            } else if unencrypted && !TOLD_NOT_E2EE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                ui.set_web_share_error("".into());
+                ui.set_share_notice(crate::utils::i18n_ui::ui_text().golive_not_e2ee.into());
+            }
+            if let Some(failure) = screen_capture::golive::take_notice() {
+                // (One banner shows both kinds of message: the newer one replaces the other.)
+                ui.set_web_share_error("".into());
+                ui.set_share_notice(failure.notice().into());
+            }
+        });
+    });
+    let golive_weak = app.as_weak();
+    app.on_toggle_golive(move || {
+        let Some(ui) = golive_weak.upgrade() else { return; };
+        if let Err(failure) = screen_capture::golive::toggle() {
+            ui.set_web_share_error("".into());
+            ui.set_share_notice(failure.notice().into());
+        }
+    });
+    let golive_switch_weak = app.as_weak();
+    app.on_toggle_stream_to_discord(move || {
+        let on = video_settings::toggle_stream_to_discord();
+        if let Some(ui) = golive_switch_weak.upgrade() {
+            ui.set_stream_to_discord(on);
         }
     });
 
@@ -2824,6 +2884,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_web_share_active(false);
             ui.set_web_share_url("".into());
             ui.set_web_share_viewers(0);
+            ui.set_golive_state(0);
+            ui.set_golive_viewers(0);
+            ui.set_golive_e2ee(true);
             ui.set_web_link_pending_uid("".into());
             ui.set_local_preview_fps("".into());
             ui.set_remote_stream_fps("".into());
@@ -4808,6 +4871,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ui.set_is_in_voice(false);
                             ui.set_is_voice_connecting(false);
                             ui.set_is_screen_sharing(false);
+                            ui.set_golive_state(0);
+                            ui.set_golive_viewers(0);
+                            ui.set_golive_e2ee(true);
                             ui.set_has_active_stream(false);
                             ui.set_popped_out_stream_uid("".into());
                             ui.set_voice_participants(slint::ModelRc::new(slint::VecModel::from(vec![])));

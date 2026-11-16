@@ -359,6 +359,11 @@ impl Preparer {
         Self::default()
     }
 
+    /// `profile_idc`, the constraint flags and `level_idc` of the stream's last SPS, for the log.
+    pub fn profile_level(&self) -> Option<(u8, u8, u8)> {
+        self.sps.as_ref().filter(|sps| sps.len() >= 4).map(|sps| (sps[1], sps[2], sps[3]))
+    }
+
     /// The unit the encoder produced, as it is sent. The parameter sets of a unit are
     /// remembered even when the unit itself is skipped.
     pub fn prepare(&mut self, access_unit: &[u8]) -> Result<Prepared, Skip> {

@@ -13,12 +13,89 @@ mod e2e;
 mod fake;
 mod h264;
 mod pcap;
+mod rate;
 mod rtcp;
 mod rtp;
 mod synth;
 mod wire;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
 use super::h264::find_nalus;
+
+/// The `[GO LIVE]` lines logged so far in this test run, by all tests together.
+static LOG_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static LOG_IS_OURS: AtomicBool = AtomicBool::new(false);
+
+struct TestLog;
+
+impl log::Log for TestLog {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record) {
+        let line = format!("{:5} {}", record.level(), record.args());
+        if line.contains("[GO LIVE]") {
+            LOG_LINES.lock().unwrap_or_else(|e| e.into_inner()).push(line.clone());
+        }
+        // (Through the test harness: shown for a failed test, or with --nocapture.)
+        println!("{line}");
+    }
+
+    fn flush(&self) {}
+}
+
+/// Log lines of the module go to the test output, and are kept for `logged`.
+pub(super) fn log_init() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if log::set_logger(&TestLog).is_ok() {
+            log::set_max_level(log::LevelFilter::Info);
+            LOG_IS_OURS.store(true, Ordering::SeqCst);
+        }
+    });
+}
+
+/// Whether a `[GO LIVE]` line containing `needle` was logged. `None` when another test of
+/// the crate installed its own logger first (then nothing can be said).
+pub(super) fn logged(needle: &str) -> Option<bool> {
+    LOG_IS_OURS.load(Ordering::SeqCst).then(|| LOG_LINES.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|line| line.contains(needle)))
+}
+
+/// Runs an async test on a runtime of its own, and fails it when it takes too long.
+pub(super) fn run<F: std::future::Future<Output = ()>>(limit_secs: u64, test: F) {
+    log_init();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        if tokio::time::timeout(std::time::Duration::from_secs(limit_secs), test).await.is_err() {
+            panic!("the test took more than {limit_secs} s");
+        }
+    });
+}
+
+/// Whether `program` can be run; a missing tool fails the test with `LITECORD_GOLIVE_REQUIRE=1`.
+pub(super) fn tool(program: &str, version_flag: &str) -> bool {
+    let found = std::process::Command::new(program).arg(version_flag).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
+    assert!(found || !required(), "LITECORD_GOLIVE_REQUIRE=1 but {program} cannot be run");
+    if !found {
+        println!("{program} is not installed: nothing tested");
+    }
+    found
+}
+
+/// The MD5 of every picture ffmpeg's software H.264 decoder makes of an Annex B file.
+pub(super) fn framemd5(path: &std::path::Path) -> Vec<String> {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-v", "error", "-threads", "2", "-c:v", "h264", "-i"])
+        .arg(path)
+        .args(["-f", "framemd5", "-"])
+        .output()
+        .expect("ffmpeg runs");
+    assert!(out.status.success(), "ffmpeg on {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.starts_with('#')).filter_map(|l| l.rsplit(',').next()).map(|h| h.trim().to_string()).collect()
+}
 
 pub(super) fn hex(text: &str) -> Vec<u8> {
     let digits: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();

@@ -19,7 +19,8 @@
 //! {"cmd":"key","key":"c","ctrl":true}        a shortcut: Ctrl+C
 //! {"cmd":"set","prop":"show_settings_modal","value":true}
 //! {"cmd":"set","prop":"login_alert_message","value":"text"}  also login_alert_is_error,
-//!                                            web_share_active, web_share_url
+//!                                            web_share_active, web_share_url,
+//!                                            stream_to_discord (the saved switch)
 //! {"cmd":"set_language","code":"de"}
 //! {"cmd":"video_encoder_options"}           choices and the current capture path
 //! {"cmd":"select_video_encoder","id":"auto"} same callback as the settings radio button
@@ -48,6 +49,20 @@
 //! {"cmd":"resize","width":1920,"height":1080} set the window size in logical pixels
 //! {"cmd":"web_share_start"}                  start sharing to browsers; replies with the link
 //! {"cmd":"web_share_stop"}
+//! {"cmd":"golive_start"}                     same as the Go Live button while it is off: the
+//!                                            running screen share also becomes a Discord
+//!                                            stream; replies with the phase, or the reason
+//!                                            it did not start (no share, not in a voice call)
+//! {"cmd":"golive_stop"}                      ends the Discord stream; the share goes on
+//! {"cmd":"golive_demo","state":"live","viewers":2}  the Go Live button and labels as they
+//!                                            look off, connecting or live; nothing is
+//!                                            connected. "sharing":false takes the made-up
+//!                                            share away again; "notice":"refused" (or voice,
+//!                                            no_answer, lost, ended) shows that banner;
+//!                                            "e2ee":false adds what the tooltip says about a
+//!                                            stream without end-to-end encryption
+//! {"cmd":"start_screen_share", ... ,"discord":true}  with the dialog's "Also stream on
+//!                                            Discord" switch set for this share (default off)
 //! {"cmd":"open_in_browser","user_id":"123"}  same as the "Open in browser" button of a stream
 //! {"cmd":"demo_voice_stage","a":"Name"}      a made-up call (nothing is connected) with one
 //!                                            stream not watched (named "a" if given) and one
@@ -427,6 +442,12 @@ fn execute(ui: &AppWindow, cmd: &Value) -> Result<Value, String> {
                 "login_alert_is_error" => ui.set_login_alert_is_error(as_bool()?),
                 "web_share_active" => ui.set_web_share_active(as_bool()?),
                 "web_share_url" => ui.set_web_share_url(as_text()?),
+                // The share dialog's switch, saved as a click on it saves it.
+                "stream_to_discord" => {
+                    let on = as_bool()?;
+                    crate::video_settings::set_stream_to_discord(on);
+                    ui.set_stream_to_discord(on);
+                }
                 other => return Err(format!("property {other} is not settable from automation")),
             }
             Ok(json!({ "ok": true }))
@@ -593,6 +614,10 @@ fn execute(ui: &AppWindow, cmd: &Value) -> Result<Value, String> {
             ui.set_stream_selected_fps(cmd["fps"].as_i64().unwrap_or(60) as i32);
             ui.set_stream_selected_source_index(cmd["screen"].as_i64().unwrap_or(0) as i32);
             ui.set_stream_include_audio(cmd["audio"].as_bool().unwrap_or(false));
+            // The "Also stream on Discord" switch, for this share.
+            let discord = cmd["discord"].as_bool().unwrap_or(false);
+            crate::video_settings::set_stream_to_discord(discord);
+            ui.set_stream_to_discord(discord);
             ui.invoke_toggle_screen_share();
             Ok(json!({ "ok": true }))
         }
@@ -740,6 +765,51 @@ fn execute(ui: &AppWindow, cmd: &Value) -> Result<Value, String> {
             ui.set_is_in_voice(true);
             ui.set_is_voice_focused(true);
             Ok(json!({ "ok": true }))
+        }
+        "golive_start" => {
+            use crate::screen_capture::golive;
+            if !ui.get_is_screen_sharing() {
+                return Err("start a screen share first".into());
+            }
+            if golive::status().phase == golive::Phase::Off {
+                ui.set_share_notice("".into());
+                ui.invoke_toggle_golive();
+            }
+            let status = golive::status();
+            if status.phase == golive::Phase::Off {
+                let why = ui.get_share_notice().to_string();
+                return Err(if why.is_empty() { "the Discord stream did not start (a camera share cannot be one)".into() } else { why });
+            }
+            Ok(json!({ "ok": true, "phase": status.phase.name() }))
+        }
+        "golive_stop" => {
+            crate::screen_capture::golive::stop();
+            Ok(json!({ "ok": true, "phase": crate::screen_capture::golive::status().phase.name() }))
+        }
+        "golive_demo" => {
+            use crate::screen_capture::golive::Failure;
+            let state = match cmd["state"].as_str().unwrap_or("off") {
+                "off" => 0,
+                "connecting" => 1,
+                "live" => 2,
+                other => return Err(format!("unknown state {other}: off, connecting or live")),
+            };
+            // The button and the labels show while a share runs: a made-up one will do.
+            ui.set_is_screen_sharing(cmd["sharing"].as_bool().unwrap_or(true));
+            ui.set_golive_state(state);
+            ui.set_golive_viewers(cmd["viewers"].as_i64().unwrap_or(0) as i32);
+            // ("e2ee":false: the tooltip of a stream without end-to-end encryption.)
+            ui.set_golive_e2ee(cmd["e2ee"].as_bool().unwrap_or(true));
+            match cmd["notice"].as_str() {
+                None => {}
+                Some("voice") => ui.set_share_notice(Failure::NotInVoice.notice().into()),
+                Some("refused") => ui.set_share_notice(Failure::Refused("unauthorized".into()).notice().into()),
+                Some("no_answer") => ui.set_share_notice(Failure::NoAnswer.notice().into()),
+                Some("lost") => ui.set_share_notice(Failure::Lost("4014".into()).notice().into()),
+                Some("ended") => ui.set_share_notice(Failure::Ended("stream_ended".into()).notice().into()),
+                Some(other) => return Err(format!("unknown notice {other}: voice, refused, no_answer, lost or ended")),
+            }
+            Ok(json!({ "ok": true, "label": ui.get_golive_label().to_string() }))
         }
         "web_share_stop" => {
             crate::screen_capture::web_share::stop();
@@ -896,6 +966,21 @@ fn state(ui: &AppWindow) -> Value {
     });
     // (Added here: one more key would take `json!` past the macro recursion limit.)
     state["stream"]["share_notice"] = json!(ui.get_share_notice().to_string());
+    // Go Live: the Discord stream of the share ("ui_*": what the window shows, which
+    // `golive_demo` sets without a stream).
+    let golive = crate::screen_capture::golive::status();
+    state["stream"]["golive"] = json!({
+        "switch": ui.get_stream_to_discord(),
+        "saved": crate::video_settings::get_stream_to_discord(),
+        "phase": golive.phase.name(),
+        "viewers": golive.viewers,
+        "e2ee": golive.e2ee,
+        "error": golive.failure.as_ref().map(|f| f.notice()).unwrap_or_default(),
+        "key": golive.stream_key,
+        "ui_state": ui.get_golive_state(),
+        "ui_viewers": ui.get_golive_viewers(),
+        "label": ui.get_golive_label().to_string(),
+    });
     state
 }
 

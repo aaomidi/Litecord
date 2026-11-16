@@ -4,8 +4,8 @@
 use serde_json::{json, Value};
 
 use super::super::dave::GroupChoice;
-use super::super::rtp::ExtProfile;
-use super::super::session::Switches;
+use super::super::rtp::{Ext, ExtProfile, Playout, OMIT_TIMING, OMIT_TOFFSET};
+use super::super::session::{KeyInt, Switches};
 use super::super::signal::{self, Event, Region, StreamKey};
 use super::super::wire::{self, CloseAction};
 
@@ -262,7 +262,15 @@ fn golive_switches_are_read_from_the_environment() {
     assert!(unknown.is_empty());
     assert_eq!((defaults.ext, defaults.gateway_version, defaults.payload_type, defaults.rtx, defaults.stream_type), (ExtProfile::Full, 8, 101, true, "video"));
     assert_eq!((defaults.region, defaults.group, defaults.dave_check, defaults.require_dave, defaults.dump.is_none()), (Region::Null, GroupChoice::Auto, true, false, true));
-    assert_eq!(defaults.describe(), "EXT=full GW=8 PT=101 RTX=1 STREAM_TYPE=video REGION=null GROUP=auto DAVE_CHECK=1 REQUIRE_DAVE=0 DUMP=off");
+    assert_eq!((defaults.audio_ext, defaults.idle_report), (false, false));
+    // What the first live runs confirmed stays as it was; what they called for is new.
+    assert_eq!((defaults.playout, defaults.ext_omit, defaults.keyint), (Playout::SMOOTH, 0, KeyInt::Seconds(60)));
+    assert_eq!((defaults.even_timestamps, defaults.hold_ms, defaults.follow_remb, defaults.pace, defaults.max_kbps), (true, 20, true, 25, None));
+    assert_eq!(defaults.ext(), Ext { profile: ExtProfile::Full, playout: Playout::Limits { min: 5, max: 1000 }, omit: 0 });
+    assert_eq!(
+        defaults.describe(),
+        "EXT=full GW=8 PT=101 RTX=1 STREAM_TYPE=video REGION=null GROUP=auto DAVE_CHECK=1 REQUIRE_DAVE=0 AUDIO_EXT=none IDLE_SR=0 DUMP=off PLAYOUT=5,1000 EXT_OMIT=none KEYINT=60 TS=even HOLD=20 REMB=1 PACE=2.5 MAX_KBPS=share"
+    );
 
     let (all, unknown) = from(&[
         ("LITECORD_GOLIVE_EXT", "min"),
@@ -274,13 +282,40 @@ fn golive_switches_are_read_from_the_environment() {
         ("LITECORD_GOLIVE_GROUP", "channel"),
         ("LITECORD_GOLIVE_DAVE_CHECK", "0"),
         ("LITECORD_GOLIVE_REQUIRE_DAVE", "1"),
+        ("LITECORD_GOLIVE_AUDIO_EXT", "full"),
+        ("LITECORD_GOLIVE_IDLE_SR", "1"),
         ("LITECORD_GOLIVE_DUMP", " /tmp/x "),
+        ("LITECORD_GOLIVE_PLAYOUT", "0"),
+        ("LITECORD_GOLIVE_EXT_OMIT", "timing,toffset"),
+        ("LITECORD_GOLIVE_KEYINT", "share"),
+        ("LITECORD_GOLIVE_TS", "clock"),
+        ("LITECORD_GOLIVE_HOLD", "0"),
+        ("LITECORD_GOLIVE_REMB", "0"),
+        ("LITECORD_GOLIVE_PACE", "burst"),
+        ("LITECORD_GOLIVE_MAX_KBPS", "6000"),
     ]);
     assert!(unknown.is_empty());
+    assert_eq!((all.playout, all.ext_omit, all.keyint, all.even_timestamps, all.hold_ms), (Playout::ASAP, OMIT_TIMING | OMIT_TOFFSET, KeyInt::Share, false, 0));
+    assert_eq!((all.follow_remb, all.pace, all.max_kbps), (false, 0, Some(6000)));
     assert_eq!((all.ext, all.gateway_version, all.payload_type, all.rtx, all.stream_type), (ExtProfile::Min, 9, 105, false, "screen"));
     assert_eq!((all.region, all.group, all.dave_check, all.require_dave), (Region::Omit, GroupChoice::Channel, false, true));
     assert_eq!(all.dump.as_deref(), Some(std::path::Path::new("/tmp/x")));
-    assert_eq!(all.describe(), "EXT=min GW=9 PT=105 RTX=0 STREAM_TYPE=screen REGION=omit GROUP=channel DAVE_CHECK=0 REQUIRE_DAVE=1 DUMP=/tmp/x");
+    assert_eq!((all.audio_ext, all.idle_report), (true, true));
+    assert_eq!(
+        all.describe(),
+        "EXT=min GW=9 PT=105 RTX=0 STREAM_TYPE=screen REGION=omit GROUP=channel DAVE_CHECK=0 REQUIRE_DAVE=1 AUDIO_EXT=full IDLE_SR=1 DUMP=/tmp/x PLAYOUT=0,0 EXT_OMIT=toffset,timing KEYINT=share TS=clock HOLD=0 REMB=0 PACE=burst MAX_KBPS=6000"
+    );
+    let one = |name: &str, value: &str| from(&[(name, value)]).0;
+    assert_eq!(one("LITECORD_GOLIVE_PLAYOUT", "none").playout, Playout::None);
+    assert_eq!(one("LITECORD_GOLIVE_PLAYOUT", "10,1000").playout, Playout::Limits { min: 10, max: 1000 });
+    assert_eq!(one("LITECORD_GOLIVE_EXT_OMIT", "none").ext_omit, 0);
+    assert_eq!((one("LITECORD_GOLIVE_KEYINT", "0").keyint, one("LITECORD_GOLIVE_KEYINT", "5").keyint, one("LITECORD_GOLIVE_KEYINT", "server").keyint), (KeyInt::Seconds(0), KeyInt::Seconds(5), KeyInt::Server));
+    assert_eq!((one("LITECORD_GOLIVE_PACE", "4").pace, one("LITECORD_GOLIVE_PACE", "1.5").pace, one("LITECORD_GOLIVE_TS", "even").even_timestamps), (40, 15, true));
+    assert_eq!((one("LITECORD_GOLIVE_HOLD", "35").hold_ms, one("LITECORD_GOLIVE_HOLD", "100").hold_ms), (35, 100));
+    // What the send loop is told about the periodic keyframe: 0 leaves its own rule,
+    // the largest number is none at all.
+    assert_eq!((KeyInt::Share.millis(Some(4000)), KeyInt::Seconds(0).millis(None), KeyInt::Seconds(60).millis(Some(4000))), (0, u64::MAX, 60_000));
+    assert_eq!((KeyInt::Server.millis(Some(4000)), KeyInt::Server.millis(None), KeyInt::Server.millis(Some(0))), (4000, 60_000, 60_000));
     assert_eq!(from(&[("LITECORD_GOLIVE_EXT", "none")]).0.ext, ExtProfile::None);
     assert_eq!(from(&[("LITECORD_GOLIVE_GROUP", "server")]).0.group, GroupChoice::Server);
     assert_eq!(from(&[("LITECORD_GOLIVE_GROUP", "1278201813102755893")]).0.group, GroupChoice::Id(1278201813102755893));
@@ -295,9 +330,19 @@ fn golive_switches_are_read_from_the_environment() {
         ("LITECORD_GOLIVE_REGION", "us-east"),
         ("LITECORD_GOLIVE_GROUP", "-1"),
         ("LITECORD_GOLIVE_DAVE_CHECK", ""),
+        ("LITECORD_GOLIVE_AUDIO_EXT", "1"),
+        ("LITECORD_GOLIVE_IDLE_SR", "on"),
+        ("LITECORD_GOLIVE_PLAYOUT", "10,5"),
+        ("LITECORD_GOLIVE_EXT_OMIT", "playout"),
+        ("LITECORD_GOLIVE_KEYINT", "never"),
+        ("LITECORD_GOLIVE_TS", "cfr"),
+        ("LITECORD_GOLIVE_HOLD", "101"),
+        ("LITECORD_GOLIVE_REMB", "follow"),
+        ("LITECORD_GOLIVE_PACE", "0.5"),
+        ("LITECORD_GOLIVE_MAX_KBPS", "9000"),
     ]);
     assert_eq!(odd, Switches::default());
-    assert_eq!(unknown.len(), 7, "{unknown:?} (an empty value is no value)");
+    assert_eq!(unknown.len(), 17, "{unknown:?} (an empty value is no value)");
     assert_eq!(from(&[("LITECORD_GOLIVE_PT", "119")]).0.payload_type, 101, "its RTX type would be Opus's");
     assert_eq!(from(&[("LITECORD_GOLIVE_PT", "200")]).0.payload_type, 101);
 }

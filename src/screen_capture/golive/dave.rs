@@ -39,6 +39,9 @@ pub const OP_INVALID_COMMIT_WELCOME: u8 = 31;
 /// Recoveries (opcode 31 and a new key package) allowed in `RECOVERY_WINDOW`.
 const MAX_RECOVERIES: usize = 3;
 const RECOVERY_WINDOW: Duration = Duration::from_secs(30);
+/// How long the gateway may take to answer a commit (opcode 28) with an announcement (29)
+/// or a welcome (30) before the log says that nothing came.
+const COMMIT_ANSWER_WITHIN: Duration = Duration::from_secs(5);
 
 /// A message for the stream gateway.
 #[derive(Debug, Clone, PartialEq)]
@@ -145,6 +148,8 @@ pub struct Dave {
     pending: HashMap<u16, u16>,
     /// The commit sent last (opcode 28), to tell whether the announced one is ours.
     own_commit: Option<Vec<u8>>,
+    /// When that commit was sent, until the gateway answers it or the log has said it did not.
+    commit_sent_at: Option<Instant>,
     /// Goes up whenever the key frames are encrypted with may have changed.
     key_generation: u64,
     recoveries: VecDeque<Instant>,
@@ -168,6 +173,7 @@ impl Dave {
             external_sender: None,
             pending: HashMap::new(),
             own_commit: None,
+            commit_sent_at: None,
             key_generation: 0,
             recoveries: VecDeque::new(),
             stalled: false,
@@ -184,9 +190,23 @@ impl Dave {
         self.external_sender = None;
         self.pending.clear();
         self.own_commit = None;
+        self.commit_sent_at = None;
         self.key_generation += 1;
         self.recoveries.clear();
         self.stalled = false;
+    }
+
+    /// True once when a commit sent with opcode 28 has gone unanswered for five seconds:
+    /// neither announced (29) nor overtaken by a welcome (30). For the log; nothing is done
+    /// about it (the gateway proposes again when it wants another commit).
+    pub fn commit_unanswered(&mut self, now: Instant) -> bool {
+        match self.commit_sent_at {
+            Some(sent) if now.saturating_duration_since(sent) >= COMMIT_ANSWER_WITHIN => {
+                self.commit_sent_at = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The group ids to try for the stream as the main gateway announced it. Another list
@@ -337,6 +357,7 @@ impl Dave {
                     commit_welcome.welcome.as_ref().map_or(0, Vec::len)
                 );
                 self.own_commit = Some(commit_welcome.commit);
+                self.commit_sent_at = Some(Instant::now());
                 out.push(Out::Binary(message));
             }
             Ok(Ok(None)) => info!("[GO LIVE] DAVE: proposals ({name}, {id_note}): nothing left to commit"),
@@ -355,6 +376,7 @@ impl Dave {
     /// Opcode 29: `[transition id][commit]`, the commit the gateway chose for the group.
     pub fn on_announce_commit(&mut self, transition: u16, commit: &[u8]) -> Vec<Out> {
         let ours = self.own_commit.as_deref() == Some(commit);
+        self.commit_sent_at = None;
         if let Some(named) = group_id_of_message(commit) {
             if named != self.group_id() {
                 warn!("[GO LIVE] DAVE: the announced commit names group {named}, ours is {} ({})", self.group_id(), self.group_label());
@@ -394,6 +416,7 @@ impl Dave {
 
     /// Opcode 30: `[transition id][welcome]`, another member's commit added us.
     pub fn on_welcome(&mut self, transition: u16, welcome: &[u8], recognised: Option<&[u64]>) -> Vec<Out> {
+        self.commit_sent_at = None;
         let version = self.session_version;
         let Some(session) = self.session.as_mut() else {
             warn!("[GO LIVE] DAVE: welcome (op 30, transition {transition}) with no session: ignored");
@@ -494,6 +517,7 @@ impl Dave {
         self.session_version = version;
         self.stalled = false;
         self.own_commit = None;
+        self.commit_sent_at = None;
         self.restart("new group (op 24)")
     }
 
@@ -531,6 +555,7 @@ impl Dave {
             return Vec::new();
         }
         self.pending.insert(transition, version);
+        info!("[GO LIVE] DAVE: ready for transition {transition} (op 23 sent); the new key is used once the gateway executes it (op 22)");
         vec![Out::Json(super::wire::ready_for_transition(transition))]
     }
 

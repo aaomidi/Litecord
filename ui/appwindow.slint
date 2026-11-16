@@ -157,6 +157,10 @@ export component AppWindow inherits Window {
     callback end_screen_share();
     callback toggle_web_share();
     callback copy_web_share_link();
+    // Go Live: starts or stops the Discord stream of the running share.
+    callback toggle_golive();
+    // The "Also stream on Discord" switch of the share dialog (saved).
+    callback toggle_stream_to_discord();
     callback toggle_stream_fullscreen();
     callback focus_stream(string /* user_id */);
     callback start_stream(int /* monitor_id */, string /* resolution */, int /* fps */);
@@ -462,6 +466,40 @@ export component AppWindow inherits Window {
 
     // Why a screen share ended by itself ("" when there is nothing to say).
     in-out property <string> share_notice: "";
+
+    // Go Live: the share as a Discord stream, for people on the official clients.
+    // stream_to_discord: the dialog's switch. golive_state: 0 off, 1 connecting, 2 live on
+    // Discord (watched or not). golive_viewers: how many people Discord says are watching.
+    in-out property <bool> stream_to_discord: false;
+    in-out property <int> golive_state: 0;
+    in-out property <int> golive_viewers: 0;
+    // False while the stream runs without end-to-end encryption (Discord negotiates that
+    // for stage channels): the tooltip says so.
+    in-out property <bool> golive_e2ee: true;
+    out property <string> golive_label: root.golive_state == 0 ? Tr.golive_start : (root.golive_state == 1 ? Tr.golive_connecting : Tr.golive_stop + " (" + root.golive_viewers + " " + Tr.web_share_watching + ")" + (root.golive_e2ee ? "" : " · " + Tr.golive_not_e2ee));
+    // The Go Live button's tooltip. It is drawn here, above everything, because the voice
+    // header clips what hangs below its buttons; the button says where it is.
+    in-out property <bool> golive_tip_shown: false;
+    in-out property <length> golive_tip_right: 0px;
+    in-out property <length> golive_tip_top: 0px;
+    if root.golive_tip_shown && root.is_screen_sharing: Rectangle {
+        z: 101;
+        x: max(8px, root.golive_tip_right - self.width);
+        y: root.golive_tip_top;
+        width: golive_tip.preferred-width + 20px;
+        height: 30px;
+        border-radius: 4px;
+        background: AppTheme.surface-chat;
+        border-width: 1px;
+        border-color: AppTheme.border-subtle;
+        golive_tip := Text {
+            text: root.golive_label;
+            color: AppTheme.text-strong;
+            font-size: TypeScale.small;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
 
     if root.web_share_error != "" || root.share_notice != "": Rectangle {
         z: 100;
@@ -1515,6 +1553,41 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+
+                            // Go Live: the share as a Discord stream (not for a camera, which
+                            // is not a stream on Discord).
+                            if root.is_screen_sharing && root.stream_source_tab != "cameras": VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 32px;
+                                    height: 32px;
+                                    border-radius: 4px;
+                                    background: root.golive_state == 2 ? (golive_ta.has-hover ? AppTheme.accent-hover : AppTheme.accent) : (golive_ta.has-hover ? AppTheme.separator : AppTheme.surface-chat);
+                                    opacity: root.golive_state == 1 ? 0.5 : 1;
+                                    accessible-role: button;
+                                    accessible-label: root.golive_label;
+                                    Image {
+                                        x: 7px;
+                                        y: 7px;
+                                        width: 18px;
+                                        height: 18px;
+                                        source: @image-url("../assets/broadcast.svg");
+                                        colorize: root.golive_state == 2 ? AppTheme.text-on-accent : AppTheme.text-strong;
+                                        image-fit: contain;
+                                    }
+                                    init => { root.golive_tip_shown = false; }
+                                    golive_ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.toggle_golive(); }
+                                        // (The tooltip is drawn at the top level: see golive_tip_shown.)
+                                        changed has-hover => {
+                                            root.golive_tip_right = self.absolute-position.x + self.width;
+                                            root.golive_tip_top = self.absolute-position.y + self.height + 6px;
+                                            root.golive_tip_shown = self.has-hover;
+                                        }
+                                    }
+                                }
+                            }
                             VerticalLayout {
                                 alignment: center;
 
@@ -2222,9 +2295,10 @@ export component AppWindow inherits Window {
 
                                         // Self-Stream Discord-Style Banner Overlay
                                         if (p.is_self && root.is_screen_sharing): Rectangle {
-                                            x: (parent.width - 200px) / 2;
+                                            x: (parent.width - self.width) / 2;
                                             y: parent.height - 34px;
-                                            width: 200px;
+                                            // (Wider while the share is also live on Discord.)
+                                            width: root.golive_state == 2 ? max(200px, min(parent.width - 16px, self_pill_text.preferred-width + 52px)) : 200px;
                                             height: 26px;
                                             background: AppTheme.backdrop-stronger;
                                             border-radius: 13px;
@@ -2244,12 +2318,13 @@ export component AppWindow inherits Window {
                                                         image-fit: contain;
                                                     }
                                                 }
-                                                Text {
-                                                    text: Tr.you_are_streaming;
+                                                self_pill_text := Text {
+                                                    text: root.golive_state == 2 ? Tr.you_are_streaming + " · " + Tr.golive_live + (root.golive_viewers > 0 ? " (" + root.golive_viewers + ")" : "") : Tr.you_are_streaming;
                                                     color: AppTheme.text-on-accent;
                                                     font-size: TypeScale.caption;
                                                     font-weight: 700;
                                                     vertical-alignment: center;
+                                                    overflow: elide;
                                                 }
                                             }
                                         }
@@ -4376,11 +4451,17 @@ export component AppWindow inherits Window {
 
                         // 3. Source Selection Preview Area
                         VerticalBox {
+                            // The Windows tab of Windows has one row more than any other
+                            // (browser stream, and now Go Live above it): with the usual gaps
+                            // the dialog would be taller than the default window (about 647 px
+                            // in 620) and its buttons cut off. Closer rows there keep it
+                            // inside (about 599 px). Not measured on Windows.
+                            property <length> gap: !root.is_linux && root.stream_source_tab == "windows" ? 8px : 14px;
                             padding-left: 20px;
                             padding-right: 20px;
-                            padding-top: 14px;
-                            padding-bottom: 14px;
-                            spacing: 14px;
+                            padding-top: self.gap;
+                            padding-bottom: self.gap;
+                            spacing: self.gap;
 
                             // Source Cards (Telas vs Janelas)
                             if root.stream_source_tab == "screens": Flickable {
@@ -4933,6 +5014,81 @@ export component AppWindow inherits Window {
                                                 clicked => {
                                                     root.stream_include_audio = !root.stream_include_audio;
                                                 }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 5b. Also stream on Discord (Go Live), for people on the official
+                            // clients. Not for cameras: a camera is not a stream on Discord.
+                            if root.stream_source_tab != "cameras": Rectangle {
+                                background: AppTheme.surface-sidebar;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: AppTheme.border-subtle;
+                                height: 52px;
+
+                                HorizontalLayout {
+                                    padding-left: 14px;
+                                    padding-right: 14px;
+                                    spacing: 12px;
+
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Image {
+                                            source: @image-url("../assets/broadcast.svg");
+                                            width: 18px;
+                                            height: 18px;
+                                            colorize: root.stream_to_discord ? AppTheme.accent : AppTheme.text-subtle;
+                                            image-fit: contain;
+                                        }
+                                    }
+
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 2px;
+                                        horizontal-stretch: 1;
+
+                                        Text {
+                                            text: Tr.golive_switch;
+                                            color: AppTheme.text-strong;
+                                            font-size: TypeScale.small;
+                                            font-weight: 700;
+                                            overflow: elide;
+                                        }
+
+                                        Text {
+                                            text: Tr.golive_switch_desc;
+                                            color: AppTheme.text-muted;
+                                            font-size: TypeScale.micro;
+                                            overflow: elide;
+                                        }
+                                    }
+
+                                    // Switch Toggle Button
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Rectangle {
+                                            width: 40px;
+                                            height: 22px;
+                                            border-radius: 11px;
+                                            background: root.stream_to_discord ? AppTheme.success : AppTheme.surface-control;
+
+                                            // Knob
+                                            Rectangle {
+                                                x: root.stream_to_discord ? 20px : 2px;
+                                                y: 2px;
+                                                width: 18px;
+                                                height: 18px;
+                                                border-radius: 9px;
+                                                background: AppTheme.solid-white;
+                                                animate x { duration: 150ms; easing: ease-out; }
+                                            }
+
+                                            TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => { root.toggle_stream_to_discord(); }
                                             }
                                         }
                                     }

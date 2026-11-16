@@ -738,6 +738,7 @@ pub fn start_audio_loopback_tx(
                 let stream_key = super::watch::session_key();
                 for chunk in chunks_to_send {
                     super::web_share::offer_audio(&chunk, active_sample_rate);
+                    super::golive::offer_audio(&chunk, active_sample_rate);
                     let Some(stream_key) = stream_key.filter(|_| !target_addrs.is_empty()) else {
                         opus = None;
                         continue;

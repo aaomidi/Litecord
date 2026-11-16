@@ -53,6 +53,11 @@ pub struct VideoSettings {
     /// default pack.
     #[serde(default, deserialize_with = "lenient")]
     pub ui_sound_pack: Option<String>,
+    /// "Also stream on Discord (Go Live)" in the share dialog: a screen or window share is
+    /// also announced as a Discord stream, for people on the official clients
+    /// (screen_capture::golive). Off unless the file says true.
+    #[serde(default, deserialize_with = "lenient_allow")]
+    pub stream_to_discord: bool,
 }
 
 /// Position in physical pixels (a logical position is ambiguous across monitors with
@@ -199,6 +204,7 @@ impl Default for VideoSettings {
             stream_max_bitrate_mbps: None,
             stream_profile: None,
             ui_sound_pack: None,
+            stream_to_discord: false,
         }
     }
 }
@@ -294,6 +300,26 @@ pub fn toggle_allow_web_link_requests() -> bool {
     let mut store = get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner());
     store.allow_web_link_requests = !store.allow_web_link_requests;
     let new_val = store.allow_web_link_requests;
+    save_video_settings(&store);
+    new_val
+}
+
+pub fn get_stream_to_discord() -> bool {
+    get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner()).stream_to_discord
+}
+
+pub fn set_stream_to_discord(val: bool) {
+    let mut store = get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner());
+    if store.stream_to_discord != val {
+        store.stream_to_discord = val;
+        save_video_settings(&store);
+    }
+}
+
+pub fn toggle_stream_to_discord() -> bool {
+    let mut store = get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner());
+    store.stream_to_discord = !store.stream_to_discord;
+    let new_val = store.stream_to_discord;
     save_video_settings(&store);
     new_val
 }
@@ -546,5 +572,23 @@ mod tests {
             assert_eq!((s.video_encoder.as_str(), s.use_light_theme, s.noise_suppression.as_str(), s.allow_web_link_requests, s.stream_min_qp), ("openh264", true, "standard", false, Some(24)), "{rest}");
         }
         assert_eq!(pack(&VideoSettings::default()), UiSoundPack::SoftMallet);
+    }
+
+    #[test]
+    fn the_golive_switch_is_off_unless_the_file_says_true() {
+        // Missing (every file written before the switch existed), and not true or false.
+        for rest in ["", r#","stream_to_discord":false"#, r#","stream_to_discord":"true""#, r#","stream_to_discord":1"#, r#","stream_to_discord":null"#, r#","stream_to_discord":[true]"#] {
+            let (s, damaged) = load(&format!(r#","stream_min_qp":24{rest}"#));
+            assert!(!damaged, "{rest}");
+            assert!(!s.stream_to_discord, "{rest}");
+            assert_eq!((s.video_encoder.as_str(), s.use_light_theme, s.allow_web_link_requests, s.stream_min_qp), ("openh264", true, true, Some(24)), "{rest}");
+        }
+        let (s, damaged) = load(r#","stream_to_discord":true"#);
+        assert!(!damaged && s.stream_to_discord);
+        assert!(!VideoSettings::default().stream_to_discord);
+        // It is written back, so the choice survives a restart.
+        let saved = serde_json::to_string(&s).unwrap();
+        assert!(saved.contains(r#""stream_to_discord":true"#), "{saved}");
+        assert!(parse_settings(&saved).0.stream_to_discord);
     }
 }

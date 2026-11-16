@@ -1,5 +1,13 @@
 //! A small H.264 stream made on the spot with OpenH264 (software, no device), and its
 //! software decoder to compare pictures.
+//!
+//! OpenH264 writes its SPS the way libwebrtc wants it (libwebrtc encodes with it), so the
+//! stream as it is exercises only the "nothing to change" branch of the SPS normaliser.
+//! `without_vui` makes the other kind of stream of it: the same pictures behind an SPS
+//! that says nothing beyond the picture format, which libwebrtc's receiver rewrites.
+
+use crate::encoder::h264_vui::{escape, unescape, BitReader, BitWriter};
+use crate::screen_capture::golive::h264::nal_units;
 
 use openh264::decoder::Decoder;
 use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod};
@@ -31,6 +39,78 @@ pub fn stream(frames: usize) -> Vec<Vec<u8>> {
             unit
         })
         .collect()
+}
+
+/// The same units with every SPS cut off before its VUI.
+pub fn without_vui(units: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    units
+        .iter()
+        .map(|unit| {
+            let mut out = Vec::with_capacity(unit.len());
+            for nal in nal_units(unit) {
+                out.extend_from_slice(&[0, 0, 0, 1]);
+                if nal[0] & 0x1f == 7 {
+                    out.extend_from_slice(&sps_without_vui(nal));
+                } else {
+                    out.extend_from_slice(nal);
+                }
+            }
+            out
+        })
+        .collect()
+}
+
+/// An SPS NAL of the Baseline, Main or Extended profile with `vui_parameters_present_flag`
+/// cleared and nothing after it. (Read here field by field, not by the normaliser under test;
+/// the tests check the result with `h264-reader`.)
+pub fn sps_without_vui(nal: &[u8]) -> Vec<u8> {
+    let rbsp = unescape(&nal[1..]);
+    let mut r = BitReader::new(&rbsp);
+    let profile = r.bits(8).unwrap();
+    assert!(matches!(profile, 66 | 77 | 88), "profile {profile} has fields this does not read");
+    r.bits(16).unwrap(); // constraint flags, level
+    r.ue().unwrap(); // seq_parameter_set_id
+    r.ue().unwrap(); // log2_max_frame_num_minus4
+    match r.ue().unwrap() {
+        0 => {
+            r.ue().unwrap(); // log2_max_pic_order_cnt_lsb_minus4
+        }
+        1 => {
+            r.bits(1).unwrap();
+            r.se().unwrap();
+            r.se().unwrap();
+            let cycle = r.ue().unwrap();
+            for _ in 0..cycle {
+                r.se().unwrap();
+            }
+        }
+        _ => {}
+    }
+    r.ue().unwrap(); // max_num_ref_frames
+    r.bits(1).unwrap(); // gaps_in_frame_num_value_allowed_flag
+    r.ue().unwrap(); // pic_width_in_mbs_minus1
+    r.ue().unwrap(); // pic_height_in_map_units_minus1
+    if r.bits(1).unwrap() == 0 {
+        r.bits(1).unwrap(); // mb_adaptive_frame_field_flag
+    }
+    r.bits(1).unwrap(); // direct_8x8_inference_flag
+    if r.bits(1).unwrap() == 1 {
+        for _ in 0..4 {
+            r.ue().unwrap(); // frame cropping offsets
+        }
+    }
+    let keep = r.pos;
+    let mut w = BitWriter::default();
+    let mut source = BitReader::new(&rbsp);
+    for _ in 0..keep {
+        w.bit(source.bits(1).unwrap() as u8);
+    }
+    w.bit(0); // vui_parameters_present_flag
+    w.bit(1); // RBSP stop bit
+    while w.n % 8 != 0 {
+        w.bit(0);
+    }
+    [&nal[..1], &escape(&w.bytes)[..]].concat()
 }
 
 fn picture(n: usize) -> YUVBuffer {

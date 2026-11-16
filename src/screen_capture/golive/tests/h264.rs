@@ -63,11 +63,27 @@ fn golive_sps_vectors_of_the_forks_encoders() {
 }
 
 #[test]
-fn golive_openh264_sps_gains_a_vui_with_the_restriction() {
+fn golive_openh264_sps_is_left_as_it_is() {
+    // libwebrtc encodes with OpenH264: its SPS is already what the receiver wants.
     let units = synth::stream(3);
     let sps = nal_units(&units[0]).find(|n| n[0] & 0x1f == NAL_SPS).expect("the first unit has an SPS").to_vec();
+    assert!(webrtc_leaves_it_alone(&sps), "{}", to_hex(&sps));
+    assert_eq!(normalize_sps(&sps), Some(Sps::Unchanged));
+    let mut preparer = Preparer::new();
+    assert_eq!(preparer.prepare(&units[0]).unwrap().sps_rewritten, Some(false));
+}
+
+#[test]
+fn golive_sps_without_a_vui_gains_one_with_the_restriction() {
+    let units = synth::stream(3);
+    let original = nal_units(&units[0]).find(|n| n[0] & 0x1f == NAL_SPS).expect("the first unit has an SPS").to_vec();
+    let sps = synth::sps_without_vui(&original);
     let before = parsed(&sps);
-    assert!(before.vui_parameters.is_none(), "OpenH264's SPS is expected to come without a VUI");
+    assert!(before.vui_parameters.is_none(), "the SPS under test has no VUI");
+    assert_eq!((before.pic_width_in_mbs_minus1, before.pic_height_in_map_units_minus1, before.max_num_ref_frames), {
+        let o = parsed(&original);
+        (o.pic_width_in_mbs_minus1, o.pic_height_in_map_units_minus1, o.max_num_ref_frames)
+    });
     assert!(!webrtc_leaves_it_alone(&sps));
     let out = normalized(&sps);
     assert_ne!(out, sps);
@@ -103,7 +119,7 @@ fn rich_sps(refs: u32, restriction: Option<(u32, u32)>) -> Vec<u8> {
     let mut w = BitWriter::default();
     put(&mut w, 100, 8); // High
     put(&mut w, 0, 8);
-    put(&mut w, 40, 8);
+    put(&mut w, 51, 8); // level 5.1: room for the buffering values below
     ue(&mut w, 0); // sps id
     ue(&mut w, 1); // chroma 4:2:0
     ue(&mut w, 0);
@@ -187,7 +203,7 @@ fn rich_sps(refs: u32, restriction: Option<(u32, u32)>) -> Vec<u8> {
 
 #[test]
 fn golive_sps_with_a_full_vui_keeps_everything_but_the_restriction() {
-    for (refs, restriction, changes) in [(4, None, true), (4, Some((2, 6)), true), (4, Some((0, 5)), true), (4, Some((1, 4)), true), (4, Some((0, 4)), false), (4, Some((0, 2)), false), (1, Some((0, 1)), false)] {
+    for (refs, restriction, changes) in [(4, None, true), (4, Some((2, 6)), true), (4, Some((0, 5)), true), (4, Some((1, 4)), true), (4, Some((0, 4)), false), (1, Some((0, 1)), false)] {
         let sps = rich_sps(refs, restriction);
         let before = parsed(&sps);
         assert_eq!(!webrtc_leaves_it_alone(&sps), changes, "{refs} {restriction:?}");
@@ -233,7 +249,8 @@ fn golive_nal_split_follows_libwebrtc() {
     // 3-byte and 4-byte start codes, a unit ending in zeros, a zero before a start code.
     let buf = hex("000001 6742 00 000001 68ce 0000 00000001 6588 00 0000 000001 41 9a");
     let units: Vec<&[u8]> = nal_units(&buf).collect();
-    assert_eq!(units, vec![&hex("6742")[..], &hex("68ce 00")[..], &hex("6588 00 00")[..], &hex("419a")[..]]);
+    // (A start code takes two zeros, or three when a zero precedes it: any more stay behind.)
+    assert_eq!(units, vec![&hex("6742")[..], &hex("68ce 00 00")[..], &hex("6588 00 00")[..], &hex("419a")[..]]);
     let found = find_nalus(&buf);
     // Each start code is 3 bytes, or 4 when a zero precedes it.
     assert_eq!(found.iter().map(|n| n.payload - n.start).collect::<Vec<_>>(), vec![3, 4, 4, 4]);
@@ -320,12 +337,22 @@ fn golive_keyframe_without_parameter_sets_gets_the_cached_ones() {
 
 #[test]
 fn golive_openh264_stream_prepares_to_units_libwebrtc_leaves_alone() {
-    let units = synth::stream(25);
+    // As the encoder makes it, and behind an SPS without a VUI.
+    for (stripped, units) in [(false, synth::stream(25)), (true, synth::without_vui(&synth::stream(25)))] {
+        prepares_to_units_libwebrtc_leaves_alone(&units, stripped);
+    }
+}
+
+fn prepares_to_units_libwebrtc_leaves_alone(units: &[Vec<u8>], stripped: bool) {
     let mut preparer = Preparer::new();
     let mut keyframes = 0;
+    let (mut before, mut after) = (synth::SoftwareDecoder::new(), synth::SoftwareDecoder::new());
     for (n, au) in units.iter().enumerate() {
         let prepared = preparer.prepare(au).unwrap_or_else(|e| panic!("unit {n}: {e:?}"));
         assert_eq!(prepared.keyframe, n % synth::KEYFRAME_EVERY == 0, "unit {n}");
+        assert_eq!(prepared.sps_rewritten, prepared.keyframe.then_some(stripped), "unit {n}");
+        // The pictures are the same, whatever the SPS says about buffering.
+        assert!(before.decode(au).unwrap() == after.decode(&prepared.data).unwrap(), "unit {n}: the picture changed");
         keyframes += prepared.keyframe as usize;
         for nal in nal_units(&prepared.data) {
             assert!(!matches!(nal[0] & 0x1f, NAL_AUD | NAL_FILLER));

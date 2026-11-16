@@ -195,6 +195,55 @@ fn golive_extension_blocks_match_the_design() {
 }
 
 #[test]
+fn golive_playout_delay_and_omitted_elements() {
+    let block = |playout: Playout, omit: u8, repaired: bool| {
+        let mut out = Vec::new();
+        write_extension(&mut out, Ext { profile: ExtProfile::Full, playout, omit }, 0x123456, 0x0102, repaired);
+        to_hex(&out)
+    };
+    // A profile by itself is the block of the first live runs, byte for byte: 0/0.
+    assert_eq!(Ext::from(ExtProfile::Full), Ext { profile: ExtProfile::Full, playout: Playout::ASAP, omit: 0 });
+    assert_eq!(block(Playout::ASAP, 0, false), "bede000b".to_owned() + "22000000" + "32123456" + "4000" + "510102" + "62000000" + "7001" + "8c00000000000000000000000000" + "a573637265656e" + "b2313030");
+    // The default now: at least 50 ms (5 units), at most 10 s (1000 units), 12 bits each.
+    // Same length, same places: only the three bytes of the element differ.
+    assert_eq!(Playout::SMOOTH, Playout::Limits { min: 5, max: 1000 });
+    assert_eq!(block(Playout::SMOOTH, 0, false), "bede000b".to_owned() + "22000000" + "32123456" + "4000" + "510102" + "620053e8" + "7001" + "8c00000000000000000000000000" + "a573637265656e" + "b2313030");
+    assert_eq!(block(Playout::Limits { min: 0, max: 10 }, 0, false)[34..42], *"6200000a", "0 to 100 ms, as Discord-video-stream sends it");
+    assert_eq!(block(Playout::Limits { min: 0xfff, max: 0xfff }, 0, false)[34..42], *"62ffffff");
+    assert_eq!(block(Playout::Limits { min: 40, max: 400 }, 0, true)[34..42], *"62028190");
+    // No element: 40 bytes, 10 words.
+    assert_eq!(block(Playout::None, 0, false), "bede000a".to_owned() + "22000000" + "32123456" + "4000" + "510102" + "7001" + "8c00000000000000000000000000" + "a573637265656e" + "b2313030");
+    // Elements left out: what stays keeps its order, and the block is padded with zero
+    // bytes to whole words (here 22 bytes of elements, 2 of padding, 6 words).
+    assert_eq!(block(Playout::SMOOTH, OMIT_TOFFSET | OMIT_ORIENTATION | OMIT_CONTENT | OMIT_TIMING, false), "bede0006".to_owned() + "32123456" + "510102" + "620053e8" + "a573637265656e" + "b2313030" + "0000");
+    assert_eq!(block(Playout::SMOOTH, OMIT_TIMING, true), "bede0008".to_owned() + "22000000" + "32123456" + "4000" + "510102" + "620053e8" + "7001" + "a573637265656e" + "c2313030" + "0000");
+    assert_eq!(block(Playout::None, OMIT_TOFFSET, false), "bede0009".to_owned() + "32123456" + "4000" + "510102" + "7001" + "8c00000000000000000000000000" + "a573637265656e" + "b2313030");
+    // The other profiles have no such element.
+    let mut min = Vec::new();
+    write_extension(&mut min, Ext { profile: ExtProfile::Min, playout: Playout::SMOOTH, omit: 0xff }, 1, 2, false);
+    assert_eq!(to_hex(&min), "bede000151000000");
+
+    // The values of LITECORD_GOLIVE_PLAYOUT and LITECORD_GOLIVE_EXT_OMIT.
+    assert_eq!(Playout::from_name("none"), Some(Playout::None));
+    assert_eq!(Playout::from_name("0"), Some(Playout::ASAP));
+    assert_eq!(Playout::from_name("0,0"), Some(Playout::ASAP));
+    assert_eq!(Playout::from_name("5,1000"), Some(Playout::SMOOTH));
+    assert_eq!(Playout::from_name(" 20 , 400 "), Some(Playout::Limits { min: 20, max: 400 }));
+    assert_eq!(Playout::from_name("4095,4095"), Some(Playout::Limits { min: 4095, max: 4095 }));
+    for bad in ["", "1", "10", "10,5", "0,4096", "-1,5", "a,b", "1,2,3", "none,"] {
+        assert_eq!(Playout::from_name(bad), None, "{bad:?}");
+    }
+    assert_eq!((Playout::None.name(), Playout::ASAP.name(), Playout::SMOOTH.name()), ("none".to_string(), "0,0".to_string(), "5,1000".to_string()));
+    assert!(Playout::ASAP.describe().contains("no smoothing") && Playout::Limits { min: 0, max: 10 }.describe().contains("no smoothing"));
+    assert!(Playout::SMOOTH.describe().contains("50 to 10000 ms") && Playout::SMOOTH.describe().contains("smooths"));
+    assert_eq!(omit_from_names("timing"), Some(OMIT_TIMING));
+    assert_eq!(omit_from_names("toffset, orientation,content,timing"), Some(15));
+    assert_eq!(omit_from_names("timing,playout"), None, "the playout delay has its own switch");
+    assert_eq!(omit_from_names(""), None);
+    assert_eq!((omit_names(0), omit_names(OMIT_CONTENT | OMIT_TOFFSET)), ("none".to_string(), "toffset,content".to_string()));
+}
+
+#[test]
 fn golive_packet_layouts() {
     let payload = hex("419a0001020304050607");
     let video = Header { marker: true, payload_type: 101, sequence: 0x1234, timestamp: 90_000, ssrc: 0x1e240 };
@@ -216,6 +265,16 @@ fn golive_packet_layouts() {
     // Audio: no extension.
     let audio = Header { marker: false, payload_type: OPUS_PAYLOAD_TYPE, sequence: 7, timestamp: 960, ssrc: 0x1e23f };
     assert_eq!(to_hex(&audio_packet(&audio, &OPUS_SILENCE)), "80780007000003c00001e23ff8fffe");
+    // With the audio extension of the native clients (off by default): level with the
+    // voice-activity bit, abs-send-time, the speaking element (soundshare is bit 2), mid.
+    assert_eq!(
+        to_hex(&audio_packet_with_extension(&audio, 0xabcdef, 30, 2, &hex("78010203"))),
+        "90780007000003c00001e23f".to_owned() + "bede0004" + "109e" + "32abcdef" + "9004" + "a4617564696f" + "0000" + "78010203"
+    );
+    // A silence packet says so: no voice activity, level 127, no flags.
+    assert_eq!(to_hex(&audio_packet_with_extension(&audio, 0, 127, 0, &OPUS_SILENCE)[12..]), "bede0004".to_owned() + "107f" + "32000000" + "9000" + "a4617564696f" + "0000" + "f8fffe");
+    // Voice is bit 1 and priority bit 0 of the element.
+    assert_eq!(audio_packet_with_extension(&audio, 0, 0, 5, &[])[23], 0b011);
     // The largest datagram: header, preamble, 44 bytes of elements, a full payload.
     let largest = video_packet(&video, ExtProfile::Full, 0, 0, &vec![0x41; MAX_PAYLOAD]);
     assert_eq!(largest.len() + super::super::crypto::OVERHEAD, 1240);

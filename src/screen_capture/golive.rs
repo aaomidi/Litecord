@@ -11,7 +11,8 @@
 //!    not encode for Discord, until somebody watches;
 //! 4. each access unit is prepared (`h264`), end-to-end encrypted, split into RTP packets
 //!    (`rtp`) and sent, paced; the server's RTCP feedback (`rtcp`) asks for keyframes and
-//!    retransmissions and feeds the share's rate control.
+//!    retransmissions and sets how much may be sent (`rate`), which the share's send loop
+//!    reads as a cap on what it asks of its encoder.
 //!
 //! Watching other people's Discord streams is not built yet; `depacketize` and the parsing
 //! halves of `rtcp`, `crypto` and `signal` are where it starts.
@@ -23,6 +24,7 @@ pub mod crypto;
 pub mod dave;
 pub mod depacketize;
 pub mod h264;
+pub mod rate;
 pub mod rtcp;
 pub mod rtp;
 pub mod session;
@@ -38,7 +40,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use log::{error, info, warn};
 
-/// The highest bitrate of a share while it goes to Discord (what a browser viewer gets too).
+/// The highest bitrate announced to Discord for a share, and so the most its packets may
+/// add up to on the wire (what a browser viewer gets too). The media server's own estimate
+/// stopped at 9 Mbit/s in the first live runs, and the community documentation shows an
+/// official client announcing 9 Mbit/s for a 60 FPS stream at source resolution.
 pub const MAX_BITRATE: u32 = 8_000_000;
 
 /// The share being streamed: what opcode 12 announces.
@@ -49,6 +54,19 @@ pub struct Params {
     pub fps: u32,
     /// The share has system or window audio.
     pub audio: bool,
+}
+
+impl Params {
+    /// The parameters of a share started with the dialog's preset (`res`: 1080, 720 or 480
+    /// lines), as `ScreenCaptureManager::start` reads them.
+    pub fn for_share(res: i32, fps: i32, audio: bool) -> Self {
+        let (width, height) = match res {
+            1080 => (1920, 1080),
+            480 => (854, 480),
+            _ => (1280, 720),
+        };
+        Self { width, height, fps: fps.clamp(15, 60) as u32, audio }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -108,6 +126,22 @@ pub enum Failure {
     Ended(String),
 }
 
+impl Failure {
+    /// What the user is told, in the language of the interface. Discord's own words (a
+    /// reason, a close code) are shown as they came, cut to what a reason looks like.
+    pub fn notice(&self) -> String {
+        let text = crate::utils::i18n_ui::ui_text();
+        let shown = |words: &str| words.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ' ')).take(48).collect::<String>();
+        match self {
+            Failure::NotInVoice => text.golive_err_voice.to_string(),
+            Failure::Refused(reason) => text.golive_err_refused.replace("{}", &shown(reason)),
+            Failure::NoAnswer => text.golive_err_no_answer.to_string(),
+            Failure::Lost(what) => text.golive_err_lost.replace("{}", &shown(what)),
+            Failure::Ended(reason) => text.golive_ended.replace("{}", &shown(reason)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Status {
     pub phase: Phase,
@@ -133,6 +167,8 @@ struct Voice {
 static HAS_SESSION: AtomicBool = AtomicBool::new(false);
 static SESSION: Mutex<Option<session::Handle>> = Mutex::new(None);
 static VOICE: Mutex<Option<Voice>> = Mutex::new(None);
+/// The running share a Discord stream can be made of (`None`: no share, or a camera's).
+static SHARE: Mutex<Option<Params>> = Mutex::new(None);
 type StatusCallback = Arc<dyn Fn() + Send + Sync>;
 static STATUS_CALLBACK: Mutex<Option<StatusCallback>> = Mutex::new(None);
 
@@ -165,9 +201,10 @@ pub fn start(params: Params) -> Result<(), Failure> {
         warn!("[GO LIVE] Not started: this account is not in a voice channel (a Discord stream belongs to one)");
         return Err(Failure::NotInVoice);
     };
+    let switches = session::Switches::from_env();
     let tuning = session::Tuning {
-        switches: session::Switches::from_env(),
-        max_bitrate: crate::video_settings::get_stream_max_bitrate_bps().min(MAX_BITRATE),
+        max_bitrate: crate::video_settings::get_stream_max_bitrate_bps().min(MAX_BITRATE).min(switches.max_kbps.map_or(u32::MAX, |kbps| kbps * 1000)),
+        switches,
         ..session::Tuning::default()
     };
     let version = tuning.switches.gateway_version;
@@ -181,6 +218,11 @@ pub fn start(params: Params) -> Result<(), Failure> {
         tuning,
     };
     let context = session::Context { user_id, session_id: voice.session_id, guild_id: voice.guild_id, channel_id: voice.channel_id };
+    // (A stream that ended and still owes Discord its deletion has the key of the one
+    // requested now: that deletion must not be sent any more.)
+    if let Some(old) = session.as_ref() {
+        old.forget();
+    }
     match session::spawn(deps, context, params, session::Shared::new(status_changed)) {
         Ok(handle) => {
             *session = Some(handle);
@@ -192,6 +234,34 @@ pub fn start(params: Params) -> Result<(), Failure> {
         Err(e) => {
             error!("[GO LIVE] Not started: the stream's thread could not be created ({e})");
             Err(Failure::Lost("thread".into()))
+        }
+    }
+}
+
+/// A screen or window share started: the Go Live button can make a Discord stream of it.
+pub fn share_started(share: Params) {
+    *lock(&SHARE) = Some(share);
+}
+
+/// The share ended (or none is running): its Discord stream ends with it.
+pub fn share_ended() {
+    *lock(&SHARE) = None;
+    stop();
+}
+
+/// The Go Live button: ends the Discord stream when there is one (or one is on its way),
+/// and makes one of the running share otherwise.
+pub fn toggle() -> Result<(), Failure> {
+    if status().phase != Phase::Off {
+        stop();
+        return Ok(());
+    }
+    let share = *lock(&SHARE);
+    match share {
+        Some(share) => start(share),
+        None => {
+            info!("[GO LIVE] Not started: no screen or window share is running");
+            Ok(())
         }
     }
 }
@@ -210,7 +280,8 @@ pub fn stop() {
 }
 
 pub fn status() -> Status {
-    lock(&SESSION).as_ref().map_or_else(Status::default, |s| s.shared.status())
+    // (With no stream there is nothing unencrypted either.)
+    lock(&SESSION).as_ref().map_or_else(|| Status { e2ee: true, ..Status::default() }, |s| s.shared.status())
 }
 
 /// The failure that ended the stream, for the user to be told once.
@@ -230,6 +301,26 @@ pub fn capture_ready() {
 /// Somebody watches on Discord: the share encodes for them and offers its access units.
 pub fn wanted() -> bool {
     HAS_SESSION.load(Ordering::Relaxed) && lock(&SESSION).as_ref().is_some_and(|s| s.shared.wanted())
+}
+
+/// What the share's encoder may be asked for at most while somebody watches on Discord, in
+/// bits per second: what was announced to Discord and what its media server estimates it
+/// can take (REMB), less what packets add to the encoder's bytes.
+pub fn rate_cap() -> u32 {
+    if !HAS_SESSION.load(Ordering::Relaxed) {
+        return MAX_BITRATE;
+    }
+    lock(&SESSION).as_ref().map_or(MAX_BITRATE, |s| s.shared.encoder_cap())
+}
+
+/// How often the share makes a keyframe by itself while somebody watches on Discord.
+/// `None`: its own rule (every 2 s). Official senders make about one a minute and answer
+/// requests, which this stream gets too (`LITECORD_GOLIVE_KEYINT`).
+pub fn keyframe_interval() -> Option<std::time::Duration> {
+    if !HAS_SESSION.load(Ordering::Relaxed) {
+        return None;
+    }
+    lock(&SESSION).as_ref().and_then(|s| s.shared.keyframe_interval())
 }
 
 /// One access unit of the share, as the encoder made it (Annex B).
@@ -266,8 +357,21 @@ pub fn on_gateway_event(t: &str, d: &serde_json::Value) {
         }
         return;
     };
-    if let Some(s) = lock(&SESSION).as_ref() {
-        s.event(event);
+    let session = lock(&SESSION);
+    match session.as_ref().filter(|s| !s.finished()) {
+        Some(s) => s.event(event),
+        // (What Discord says about a stream after it ended here, such as its answer to the
+        // delete request: for the log only. Never the token of a server update.)
+        None => info!(
+            "[GO LIVE] {t} for {} with no Discord stream running here{}",
+            event.stream_key(),
+            match &event {
+                signal::Event::Delete { reason, unavailable, .. } => format!(": reason={reason}{}", if *unavailable { ", unavailable" } else { "" }),
+                signal::Event::Create { rtc_server_id, viewer_ids, paused, .. } => format!(": rtc_server_id={rtc_server_id} viewers={} paused={paused}", viewer_ids.len()),
+                signal::Event::Update { viewer_ids, paused, .. } => format!(": viewers={} paused={paused}", viewer_ids.len()),
+                signal::Event::ServerUpdate { endpoint, .. } => format!(": endpoint={}", endpoint.as_deref().unwrap_or("null")),
+            }
+        ),
     }
 }
 

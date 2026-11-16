@@ -9,6 +9,11 @@
 //! RTX    90 | M<<7 | rtx pt | rtx seq:2 | original timestamp:4 | rtx ssrc:4 | BE DE 00 0B | elements
 //!           | original seq:2 | original payload
 //! ```
+//!
+//! The 44 bytes are the full set of elements as it was first sent to Discord (and shown by
+//! official clients). What the playout-delay element says, and whether the elements that
+//! only carry a constant are sent at all, can be changed (`Ext`): the block is then shorter
+//! and padded to whole words.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -56,6 +61,102 @@ impl ExtProfile {
     }
 }
 
+/// What the playout-delay element (id 6) of the full profile tells receivers. libwebrtc
+/// reads it as limits on the delay between capture and display, in units of 10 ms:
+/// - min 0 and max 0: no smoothing at all, every picture is shown as it arrives (meant for
+///   remote desktops and cloud gaming without sound). A picture that arrives late is shown
+///   late, and a large one (a keyframe) is a hitch.
+/// - min 0 and max up to 500 ms: still shown as it arrives, decoded at most every 8 ms.
+/// - anything else: the receiver's own jitter buffer smooths the pictures and keeps its
+///   delay within the limits; lip sync may raise the minimum.
+/// - no element: the receiver's defaults (0 to 10 s, the same as the last case).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Playout {
+    /// The element is left out.
+    None,
+    /// Minimum and maximum delay, each 0 to 4095 units of 10 ms.
+    Limits { min: u16, max: u16 },
+}
+
+impl Playout {
+    /// What the first live runs sent: show every picture as it arrives.
+    pub const ASAP: Self = Self::Limits { min: 0, max: 0 };
+    /// At least 50 ms and at most 10 s: the receiver's jitter buffer decides, as it does for
+    /// a stream without the element (libwebrtc's own limits are 0 and 10 s). The floor keeps
+    /// every receiver out of its show-at-once paths and covers, from the first picture on,
+    /// what a screen capture's uneven rhythm adds (pictures up to 19 ms off their even
+    /// timestamps in the fourth live run).
+    pub const SMOOTH: Self = Self::Limits { min: 5, max: 1000 };
+
+    /// `none`, `0` (min 0, max 0), or `<min>,<max>` in units of 10 ms with min <= max <= 4095.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "none" => Some(Self::None),
+            "0" => Some(Self::ASAP),
+            _ => {
+                let (min, max) = name.split_once(',')?;
+                let (min, max) = (min.trim().parse::<u16>().ok()?, max.trim().parse::<u16>().ok()?);
+                (min <= max && max <= 0xfff).then_some(Self::Limits { min, max })
+            }
+        }
+    }
+
+    pub fn name(self) -> String {
+        match self {
+            Self::None => "none".to_string(),
+            Self::Limits { min, max } => format!("{min},{max}"),
+        }
+    }
+
+    /// For the log: the limits in milliseconds and what a libwebrtc receiver makes of them.
+    pub fn describe(self) -> String {
+        match self {
+            Self::None => "no playout-delay element (the receiver's defaults)".to_string(),
+            Self::Limits { min: 0, max: 0 } => "playout delay 0 to 0 ms (shown as it arrives, no smoothing)".to_string(),
+            Self::Limits { min: 0, max } if max <= 50 => format!("playout delay 0 to {} ms (shown as it arrives, no smoothing)", max as u32 * 10),
+            Self::Limits { min, max } => format!("playout delay {} to {} ms (the receiver's jitter buffer smooths)", min as u32 * 10, max as u32 * 10),
+        }
+    }
+}
+
+/// Elements of the full profile that only ever carry a constant, and can be left out
+/// (`LITECORD_GOLIVE_EXT_OMIT`): what libwebrtc does with each is statistics and logging.
+pub const OMIT_TOFFSET: u8 = 1;
+pub const OMIT_ORIENTATION: u8 = 2;
+pub const OMIT_CONTENT: u8 = 4;
+pub const OMIT_TIMING: u8 = 8;
+const OMIT_NAMES: [(&str, u8); 4] = [("toffset", OMIT_TOFFSET), ("orientation", OMIT_ORIENTATION), ("content", OMIT_CONTENT), ("timing", OMIT_TIMING)];
+
+/// The elements a comma-separated list names (`toffset`, `orientation`, `content`, `timing`).
+pub fn omit_from_names(list: &str) -> Option<u8> {
+    list.split(',').map(str::trim).try_fold(0u8, |mask, name| OMIT_NAMES.iter().find(|n| n.0 == name).map(|n| mask | n.1))
+}
+
+pub fn omit_names(mask: u8) -> String {
+    let names: Vec<&str> = OMIT_NAMES.iter().filter(|n| mask & n.1 != 0).map(|n| n.0).collect();
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join(",")
+    }
+}
+
+/// The header extension of video and RTX packets: the profile and, for the full one, what
+/// its playout-delay element says and which constant elements are left out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ext {
+    pub profile: ExtProfile,
+    pub playout: Playout,
+    pub omit: u8,
+}
+
+/// A profile by itself is the block as it was first sent: playout delay 0/0, nothing left out.
+impl From<ExtProfile> for Ext {
+    fn from(profile: ExtProfile) -> Self {
+        Self { profile, playout: Playout::ASAP, omit: 0 }
+    }
+}
+
 /// The fixed part of an RTP header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
@@ -85,36 +186,57 @@ pub fn abs_send_time(since_unix_epoch: Duration) -> u32 {
 
 /// Appends the extension block (4-byte preamble and elements) of a video packet, or of a
 /// retransmission when `repaired`. Nothing for `ExtProfile::None`.
-pub fn write_extension(out: &mut Vec<u8>, profile: ExtProfile, abs_send_time: u32, transport_sequence: u16, repaired: bool) {
-    match profile {
+pub fn write_extension(out: &mut Vec<u8>, ext: impl Into<Ext>, abs_send_time: u32, transport_sequence: u16, repaired: bool) {
+    let ext = ext.into();
+    match ext.profile {
         ExtProfile::None => {}
         ExtProfile::Min => out.extend_from_slice(&[0xbe, 0xde, 0x00, 0x01, 0x51, 0x00, 0x00, 0x00]),
         ExtProfile::Full => {
-            // One-byte elements: (id << 4) | (length - 1), then the data. 44 bytes, 11 words.
-            out.extend_from_slice(&[0xbe, 0xde, 0x00, 0x0b]);
-            out.extend_from_slice(&[0x22, 0, 0, 0]); // 2: transmission offset 0
+            // One-byte elements: (id << 4) | (length - 1), then the data. With everything in
+            // it: 44 bytes, 11 words. The word count is written once the elements are.
+            let preamble = out.len();
+            out.extend_from_slice(&[0xbe, 0xde, 0x00, 0x00]);
+            if ext.omit & OMIT_TOFFSET == 0 {
+                out.extend_from_slice(&[0x22, 0, 0, 0]); // 2: transmission offset 0
+            }
             let t = abs_send_time.to_be_bytes();
             out.extend_from_slice(&[0x32, t[1], t[2], t[3]]); // 3: abs-send-time
-            out.extend_from_slice(&[0x40, 0]); // 4: video orientation 0
+            if ext.omit & OMIT_ORIENTATION == 0 {
+                out.extend_from_slice(&[0x40, 0]); // 4: video orientation 0
+            }
             let s = transport_sequence.to_be_bytes();
             out.extend_from_slice(&[0x51, s[0], s[1]]); // 5: transport-wide sequence
-            out.extend_from_slice(&[0x62, 0, 0, 0]); // 6: playout delay, min 0 max 0
-            out.extend_from_slice(&[0x70, 1]); // 7: video content type, 1 = screen
-            out.push(0x8c); // 8: video timing, 13 zero bytes
-            out.extend_from_slice(&[0; 13]);
+            if let Playout::Limits { min, max } = ext.playout {
+                // 6: playout delay, 12 bits of minimum and 12 of maximum, in units of 10 ms.
+                let limits = ((min as u32 & 0xfff) << 12 | (max as u32 & 0xfff)).to_be_bytes();
+                out.extend_from_slice(&[0x62, limits[1], limits[2], limits[3]]);
+            }
+            if ext.omit & OMIT_CONTENT == 0 {
+                out.extend_from_slice(&[0x70, 1]); // 7: video content type, 1 = screen
+            }
+            if ext.omit & OMIT_TIMING == 0 {
+                out.push(0x8c); // 8: video timing, 13 zero bytes
+                out.extend_from_slice(&[0; 13]);
+            }
             out.extend_from_slice(&[0xa5]); // 10: mid
             out.extend_from_slice(b"screen");
             out.push(if repaired { 0xc2 } else { 0xb2 }); // 11: rid, 12: repaired rid
             out.extend_from_slice(b"100");
+            // Padding (zero bytes) to whole words; none when nothing is left out.
+            while (out.len() - preamble) % 4 != 0 {
+                out.push(0);
+            }
+            out[preamble + 3] = ((out.len() - preamble - 4) / 4) as u8;
         }
     }
 }
 
 /// A video packet as it is before transport encryption.
-pub fn video_packet(header: &Header, profile: ExtProfile, abs_send_time: u32, transport_sequence: u16, payload: &[u8]) -> Vec<u8> {
+pub fn video_packet(header: &Header, ext: impl Into<Ext>, abs_send_time: u32, transport_sequence: u16, payload: &[u8]) -> Vec<u8> {
+    let ext = ext.into();
     let mut out = Vec::with_capacity(12 + 48 + payload.len());
-    header.write(&mut out, profile != ExtProfile::None);
-    write_extension(&mut out, profile, abs_send_time, transport_sequence, false);
+    header.write(&mut out, ext.profile != ExtProfile::None);
+    write_extension(&mut out, ext, abs_send_time, transport_sequence, false);
     out.extend_from_slice(payload);
     out
 }
@@ -122,10 +244,11 @@ pub fn video_packet(header: &Header, profile: ExtProfile, abs_send_time: u32, tr
 /// The retransmission of a video packet: `header` is the RTX stream's (its payload type,
 /// SSRC and own sequence, with the original's timestamp and marker), and the payload starts
 /// with the original sequence number.
-pub fn rtx_packet(header: &Header, profile: ExtProfile, abs_send_time: u32, transport_sequence: u16, original_sequence: u16, payload: &[u8]) -> Vec<u8> {
+pub fn rtx_packet(header: &Header, ext: impl Into<Ext>, abs_send_time: u32, transport_sequence: u16, original_sequence: u16, payload: &[u8]) -> Vec<u8> {
+    let ext = ext.into();
     let mut out = Vec::with_capacity(12 + 50 + payload.len());
-    header.write(&mut out, profile != ExtProfile::None);
-    write_extension(&mut out, profile, abs_send_time, transport_sequence, true);
+    header.write(&mut out, ext.profile != ExtProfile::None);
+    write_extension(&mut out, ext, abs_send_time, transport_sequence, true);
     out.extend_from_slice(&original_sequence.to_be_bytes());
     out.extend_from_slice(payload);
     out
@@ -135,6 +258,27 @@ pub fn rtx_packet(header: &Header, profile: ExtProfile, abs_send_time: u32, tran
 pub fn audio_packet(header: &Header, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + payload.len());
     header.write(&mut out, false);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// An Opus packet with the elements Discord's native clients put on audio (ids of the
+/// native table): the audio level with the voice-activity bit (1), abs-send-time (3),
+/// Discord's speaking element (9: bit 0 priority, bit 1 voice, bit 2 soundshare) and the
+/// mid "audio" (10). Not sent by default; `LITECORD_GOLIVE_AUDIO_EXT=full` turns it on.
+/// `level`: 0 (loudest) to 127 (silence), in -dBov. `speaking`: the flags of opcode 5.
+pub fn audio_packet_with_extension(header: &Header, abs_send_time: u32, level: u8, speaking: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + 20 + payload.len());
+    header.write(&mut out, true);
+    // 14 bytes of elements and two of padding: 4 words.
+    out.extend_from_slice(&[0xbe, 0xde, 0x00, 0x04]);
+    out.extend_from_slice(&[0x10, if speaking != 0 { 0x80 } else { 0 } | level.min(127)]);
+    let t = abs_send_time.to_be_bytes();
+    out.extend_from_slice(&[0x32, t[1], t[2], t[3]]);
+    out.extend_from_slice(&[0x90, (speaking >> 2 & 1) | (speaking & 1) << 1 | (speaking >> 1 & 1) << 2]);
+    out.push(0xa4);
+    out.extend_from_slice(b"audio");
+    out.extend_from_slice(&[0, 0]);
     out.extend_from_slice(payload);
     out
 }
