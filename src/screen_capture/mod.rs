@@ -21,6 +21,8 @@ pub mod gpu_tx;
 pub mod gpu_capture;
 #[cfg(all(target_os = "linux", feature = "vaapi"))]
 pub mod linux_gpu_tx;
+#[cfg(any(test, all(target_os = "linux", feature = "vaapi")))]
+pub mod cadence;
 
 pub use types::*;
 pub use crypto::*;
