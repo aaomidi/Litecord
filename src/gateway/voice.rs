@@ -11,11 +11,11 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use log::{info, error, warn};
-use opus_rs::{OpusEncoder, Application};
 use davey::{DaveSession, ProposalsOperationType, MediaType};
 
 use super::types::*;
 
+use super::voice_tx::{take_mic_frame, TxInput, TxSettings, VoiceTx};
 use super::voice_rx::{
     VoiceCipher, VoiceMixer, VoiceRxDecoder, RtpOpenError, push_voice_frame, select_voice_mode, smart_ducking,
     VOICE_MODE_AES256_GCM, VOICE_MODE_XCHACHA20, VOICE_QUEUE_LIMIT, VOICE_UNDERRUNS,
@@ -273,9 +273,6 @@ pub async fn connect_voice_gateway(
                                                     let _ = w.send(Message::Text(select_proto.to_string().into())).await;
                                                 }
 
-                                                // 3. Initialize Pure Rust OpusEncoder (48000Hz, Stereo 2 channels, Application::Voip)
-                                                let mut opus_encoder = OpusEncoder::new(48000, 2, Application::Voip)
-                                                    .expect("Falha ao inicializar o OpusEncoder nativo em Rust");
 
                                                 // 4. Spawn incoming UDP voice receive loop
                                                 let socket_rx = Arc::clone(&socket);
@@ -793,12 +790,12 @@ pub async fn connect_voice_gateway(
 
                                                 tokio::spawn(async move {
                                                 let pcm_queue = get_mic_pcm_queue();
-                                                let mut voice_proc = crate::audio::dsp::VoiceProcessor::new();
+                                                let mut voice_tx = VoiceTx::new();
                                                 let mut seq: u16 = 0;
                                                 let mut timestamp: u32 = 0;
                                                 let mut nonce_cnt: u32 = 0;
                                                 let mut tx_cipher: Option<(Vec<u8>, VoiceCipher)> = None;
-                                                let mut opus_out = vec![0u8; 1000];
+                                                let mut tx_turns: u32 = 0;
                                                 let mut speaking_loop_counter: u32 = 0;
 
                                                 // Wait for the secret key (received in op=4) before starting audio
@@ -835,10 +832,8 @@ pub async fn connect_voice_gateway(
                                                         }
                                                     }
                                                 };
-                                                // Send initial 10 silence frames (200ms) to immediately punch UDP NAT hole and activate SFU downstream routing
-                                                let mut remaining_silence_frames: usize = 10;
-                                                let mut speech_hangover_frames: usize = 0;
-                                                let mut silence_keepalive_counter: u32 = 0;
+                                                // (The ten silence frames that open the route at the start of a call, the hangover and
+                                                // the keepalives are in voice_tx.)
 
                                                 // Test builds can switch back to the old timer pacing for A/B runs.
                                                 #[cfg(feature = "automation")]
@@ -862,171 +857,117 @@ pub async fn connect_voice_gateway(
                                                         break;
                                                     }
 
-                                                    // Monotonically advance media timestamp on every 20ms tick (RFC 3550 & WebRTC standard)
-                                                    timestamp = timestamp.wrapping_add(960);
-
+                                                    // One turn of the sender (voice_tx): processing, automatic gain, the voice
+                                                    // gate and the encoder. It says which packets to send and whether the turn
+                                                    // took a packet slot (it does not while waiting out a late microphone in the
+                                                    // middle of speech).
                                                     let is_muted = *self_mute_rx.lock().unwrap();
-
-                                                    // Extract full 960 f32 PCM samples (20ms of audio at 48000Hz) from microphone buffer
-                                                    let mut pcm_frame = [0.0f32; 960];
-                                                    let mut has_audio = false;
-                                                    {
-                                                        if let Ok(mut q) = pcm_queue.lock() {
+                                                    let (mic_frame, trimmed) = match pcm_queue.lock() {
+                                                        Ok(mut q) => {
                                                             if is_muted {
                                                                 q.clear();
+                                                                (None, 0)
                                                             } else {
-                                                                // Keep queue latency ultra-low (cap at <= 200ms max backlog)
-                                                                if q.len() > 960 * 10 {
-                                                                    let drop_count = q.len() - 960 * 2;
-                                                                    q.drain(0..drop_count);
-                                                                }
-                                                                // Extract 20ms (960 samples) or use elastic padding if brief jitter occurs
-                                                                if q.len() >= 960 {
-                                                                    for i in 0..960 {
-                                                                        pcm_frame[i] = q.pop_front().unwrap_or(0.0);
-                                                                    }
-                                                                } else if q.len() >= 480 {
-                                                                    let avail = q.len();
-                                                                    for i in 0..avail {
-                                                                        pcm_frame[i] = q.pop_front().unwrap_or(0.0);
-                                                                    }
-                                                                    let last = pcm_frame[avail - 1];
-                                                                    for i in avail..960 {
-                                                                        let decay = (960 - i) as f32 / (960 - avail) as f32;
-                                                                        pcm_frame[i] = last * decay;
-                                                                    }
-                                                                }
+                                                                take_mic_frame(&mut q)
                                                             }
                                                         }
-                                                    }
-
-                                                    if !is_muted {
-                                                        // Process audio with VoiceProcessor (AEC, Krisp/Standard Denoising, AGC)
-                                                        let suppression_mode = crate::utils::video_settings::get_noise_suppression();
-                                                        let enable_aec = crate::utils::video_settings::get_echo_cancellation();
-                                                        let enable_agc = crate::utils::video_settings::get_automatic_gain_control();
-
-                                                        voice_proc.process_frame(&mut pcm_frame, &suppression_mode, enable_aec, enable_agc);
-
-                                                        // Enforce VAD threshold gating on processed audio
-                                                        let mut sum_sq = 0.0f32;
-                                                        for &s in pcm_frame.iter() {
-                                                            sum_sq += s * s;
-                                                        }
-                                                        let rms = (sum_sq / 960.0).sqrt();
-                                                        let level = (rms * 6.0).min(1.0);
-                                                        if level >= get_vad_threshold() {
-                                                            has_audio = true;
-                                                        }
-                                                    }
-
-                                                    let is_silence_packet = if has_audio {
-                                                        speech_hangover_frames = 12; // 240ms hangover
-                                                        remaining_silence_frames = 5;
-                                                        silence_keepalive_counter = 0;
-                                                        false
-                                                    } else if speech_hangover_frames > 0 {
-                                                        speech_hangover_frames -= 1;
-                                                        false
-                                                    } else if remaining_silence_frames > 0 {
-                                                        remaining_silence_frames -= 1;
-                                                        true
-                                                    } else {
-                                                        silence_keepalive_counter = silence_keepalive_counter.wrapping_add(1);
-                                                        // Send a keepalive silence packet every 2.5 seconds (125 frames) to keep NAT route open
-                                                        if silence_keepalive_counter >= 125 {
-                                                            silence_keepalive_counter = 0;
-                                                            true
-                                                        } else {
-                                                            continue;
-                                                        }
+                                                        Err(_) => (None, 0),
                                                     };
+                                                    voice_tx.note_trim(trimmed);
+                                                    let suppression_mode = crate::utils::video_settings::get_noise_suppression();
+                                                    let tx_settings = TxSettings {
+                                                        noise_suppression: &suppression_mode,
+                                                        echo_cancellation: crate::utils::video_settings::get_echo_cancellation(),
+                                                        auto_gain: crate::utils::video_settings::get_automatic_gain_control(),
+                                                        gate_threshold: get_vad_threshold(),
+                                                    };
+                                                    let tx_input = if is_muted {
+                                                        TxInput::Muted
+                                                    } else if let Some(frame) = mic_frame.as_ref() {
+                                                        TxInput::Frame(frame)
+                                                    } else {
+                                                        TxInput::Stall
+                                                    };
+                                                    let turn = voice_tx.turn(tx_input, &tx_settings);
 
-                                                    seq = seq.wrapping_add(1);
-                                                    nonce_cnt = nonce_cnt.wrapping_add(1);
-
-                                                    let mut audio_header = [0u8; 12];
-                                                    audio_header[0] = 0x80; // RTP Version 2
-                                                    audio_header[1] = 0x78; // Opus Payload 120
-                                                    audio_header[2..4].copy_from_slice(&seq.to_be_bytes());
-                                                    audio_header[4..8].copy_from_slice(&timestamp.to_be_bytes());
-                                                    audio_header[8..12].copy_from_slice(&ssrc.to_be_bytes());
-
-                                                    // Prepare 1920 interleaved stereo samples for 48kHz Stereo Opus encoding
-                                                    let mut pcm_stereo = [0.0f32; 1920];
-                                                    for (i, &s) in pcm_frame.iter().enumerate() {
-                                                        pcm_stereo[i * 2] = s;
-                                                        pcm_stereo[i * 2 + 1] = s;
+                                                    // The media timestamp moves on by one frame per packet slot (RFC 3550).
+                                                    if turn.advance {
+                                                        timestamp = timestamp.wrapping_add(960);
                                                     }
 
-                                                    let opus_bytes: &[u8] = if !is_silence_packet {
-                                                        if let Ok(encoded_len) = opus_encoder.encode(&pcm_stereo, 960, &mut opus_out) {
-                                                            &opus_out[..encoded_len]
-                                                        } else {
-                                                            &[0xF8, 0xFF, 0xFE] // Silence frame fallback
-                                                        }
-                                                    } else {
-                                                        &[0xF8, 0xFF, 0xFE] // 5x Silence frame trailing pulse
-                                                    };
+                                                    tx_turns = tx_turns.wrapping_add(1);
+                                                    if tx_turns % 500 == 0 {
+                                                        info!("Voice TX (10 s): {} | {}", voice_tx.take_report(), crate::audio::engine::take_capture_report());
+                                                    }
 
                                                     let key_opt = secret_key_udp.lock().unwrap().clone();
+                                                    let mut send_failed = false;
+                                                    for packet in &turn.packets {
+                                                        seq = seq.wrapping_add(1);
+                                                        nonce_cnt = nonce_cnt.wrapping_add(1);
 
-                                                    // Apply DAVE frame encryption if session is ready
-                                                    let mut dave_enc_ok = false;
-                                                    let dave_encrypted: Option<Vec<u8>> = {
-                                                        let mut sess = dave_session_audio.lock().unwrap();
-                                                        if let Some(ref mut s) = *sess {
-                                                            if s.is_ready() {
-                                                                match s.encrypt_opus(opus_bytes) {
-                                                                    Ok(cow) => {
-                                                                        dave_enc_ok = true;
-                                                                        Some(cow.into_owned())
-                                                                    }
-                                                                    Err(e) => {
-                                                                        if speaking_loop_counter % 250 == 0 {
-                                                                            warn!("DAVE: Falha em encrypt_opus: {:?}", e);
+                                                        // Frames from before the gate opened go out with the timestamp of
+                                                        // the slot they were captured in.
+                                                        let packet_timestamp = timestamp.wrapping_sub(960 * packet.slots_back);
+                                                        let mut audio_header = [0u8; 12];
+                                                        audio_header[0] = 0x80; // RTP Version 2
+                                                        audio_header[1] = 0x78; // Opus Payload 120
+                                                        audio_header[2..4].copy_from_slice(&seq.to_be_bytes());
+                                                        audio_header[4..8].copy_from_slice(&packet_timestamp.to_be_bytes());
+                                                        audio_header[8..12].copy_from_slice(&ssrc.to_be_bytes());
+
+                                                        let opus_bytes: &[u8] = &packet.opus;
+
+                                                        // Apply DAVE frame encryption if session is ready
+                                                        let dave_encrypted: Option<Vec<u8>> = {
+                                                            let mut sess = dave_session_audio.lock().unwrap();
+                                                            if let Some(ref mut s) = *sess {
+                                                                if s.is_ready() {
+                                                                    match s.encrypt_opus(opus_bytes) {
+                                                                        Ok(cow) => Some(cow.into_owned()),
+                                                                        Err(e) => {
+                                                                            if speaking_loop_counter % 250 == 0 {
+                                                                                warn!("DAVE: Falha em encrypt_opus: {:?}", e);
+                                                                            }
+                                                                            None
                                                                         }
-                                                                        None
                                                                     }
-                                                                }
+                                                                } else { None }
                                                             } else { None }
-                                                        } else { None }
-                                                    };
-                                                    let opus_payload: &[u8] = if let Some(ref v) = dave_encrypted { v } else { opus_bytes };
+                                                        };
+                                                        let opus_payload: &[u8] = if let Some(ref v) = dave_encrypted { v } else { opus_bytes };
 
-                                                    if let Some(key_bytes) = key_opt {
-                                                        if tx_cipher.as_ref().map_or(true, |(k, _)| *k != key_bytes) {
-                                                            tx_cipher = VoiceCipher::new(&tx_mode, &key_bytes).map(|c| (key_bytes.clone(), c));
+                                                        let Some(key_bytes) = key_opt.as_ref() else { continue };
+                                                        if tx_cipher.as_ref().map_or(true, |(k, _)| k != key_bytes) {
+                                                            tx_cipher = VoiceCipher::new(&tx_mode, key_bytes).map(|c| (key_bytes.clone(), c));
                                                             if tx_cipher.is_none() {
                                                                 warn!("Voice TX: no cipher for mode '{}' with a {}-byte key: nothing can be sent.", tx_mode, key_bytes.len());
                                                             }
                                                         }
-                                                        if let Some((_, cipher)) = tx_cipher.as_ref() {
-                                                            // Transport encryption of the (DAVE-encrypted) Opus payload: the
-                                                            // header is authenticated, the 4-byte nonce counter is appended.
-                                                            if let Some(rtp_pkt) = cipher.seal(&audio_header, opus_payload, nonce_cnt) {
-                                                                if let Err(_) = socket.send_to(&rtp_pkt, &target_addr).await {
-                                                                    break;
-                                                                }
-                                                                #[cfg(feature = "automation")]
-                                                                crate::utils::test_hooks::voice_sent(!is_silence_packet, !had_mic_frame);
-
-                                                                // Resend OP 5 Speaking and log audio stats every ~5 seconds (every 250 frames)
-                                                                speaking_loop_counter = speaking_loop_counter.wrapping_add(1);
-                                                                if speaking_loop_counter % 250 == 0 {
-                                                                    let q_len = pcm_queue.lock().map(|q| q.len()).unwrap_or(0);
-                                                                    info!("TransmissÃ£o de Ãudio: frames_enviados={}, pcm_queue_buffer={}, has_audio={}, dave_encrypted={}",
-                                                                        speaking_loop_counter, q_len, has_audio, dave_enc_ok);
-
-                                                                    let speaking_pkt = serde_json::json!({
-                                                                        "op": 5,
-                                                                        "d": { "speaking": 1, "delay": 0, "ssrc": ssrc }
-                                                                    });
-                                                                    let mut w = write_arc_proto.lock().await;
-                                                                    let _ = w.send(Message::Text(speaking_pkt.to_string().into())).await;
-                                                                }
-                                                            }
+                                                        let Some((_, cipher)) = tx_cipher.as_ref() else { continue };
+                                                        // Transport encryption of the (DAVE-encrypted) Opus payload: the
+                                                        // header is authenticated, the 4-byte nonce counter is appended.
+                                                        let Some(rtp_pkt) = cipher.seal(&audio_header, opus_payload, nonce_cnt) else { continue };
+                                                        if socket.send_to(&rtp_pkt, &target_addr).await.is_err() {
+                                                            send_failed = true;
+                                                            break;
                                                         }
+                                                        #[cfg(feature = "automation")]
+                                                        crate::utils::test_hooks::voice_sent(packet.audio, !had_mic_frame);
+
+                                                        // Resend OP 5 Speaking every 250 packets (about 5 s of speech)
+                                                        speaking_loop_counter = speaking_loop_counter.wrapping_add(1);
+                                                        if speaking_loop_counter % 250 == 0 {
+                                                            let speaking_pkt = serde_json::json!({
+                                                                "op": 5,
+                                                                "d": { "speaking": 1, "delay": 0, "ssrc": ssrc }
+                                                            });
+                                                            let mut w = write_arc_proto.lock().await;
+                                                            let _ = w.send(Message::Text(speaking_pkt.to_string().into())).await;
+                                                        }
+                                                    }
+                                                    if send_failed {
+                                                        break;
                                                     }
                                                 }
                                             });

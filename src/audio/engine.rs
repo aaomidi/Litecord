@@ -214,6 +214,106 @@ pub fn push_to_mic_queues(pcm_q: &mut VecDeque<f32>, pcm_samples: &[f32], loop_s
     }
 }
 
+/// Which capture may feed the call: the one started last. A capture that has been
+/// replaced keeps running for a moment (its device is closed by its own thread) but its
+/// samples are dropped.
+static CAPTURE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// What the capture did since the last report (see `take_capture_report`).
+static CAPTURE_OPENS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CAPTURE_BLOCKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CAPTURE_LATE_BLOCKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CAPTURE_WORST_GAP_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CAPTURE_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// One line about the microphone capture since the last call, for the periodic send log:
+/// blocks delivered, blocks that came more than half a block late, the longest wait
+/// between two blocks, and how often the device was opened.
+pub fn take_capture_report() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    format!(
+        "capture: rate={} Hz blocks={} late_blocks={} longest_gap={} ms opens={}",
+        CAPTURE_RATE.load(Relaxed), CAPTURE_BLOCKS.swap(0, Relaxed), CAPTURE_LATE_BLOCKS.swap(0, Relaxed),
+        CAPTURE_WORST_GAP_MS.swap(0, Relaxed), CAPTURE_OPENS.swap(0, Relaxed),
+    )
+}
+
+/// What a capture callback does with a block once it is mono: microphone gain, the level
+/// for the meter, 48 kHz, and into the queue of the call.
+struct CaptureSink {
+    generation: u64,
+    sample_rate: u32,
+    level_tx: mpsc::Sender<f32>,
+    queue: Arc<std::sync::Mutex<VecDeque<f32>>>,
+    resampler: crate::audio::dsp::PhaseResampler,
+    mono: Vec<f32>,
+    resampled: Vec<f32>,
+    last_block: Option<std::time::Instant>,
+}
+
+impl CaptureSink {
+    fn new(generation: u64, sample_rate: u32, level_tx: mpsc::Sender<f32>) -> Self {
+        CAPTURE_RATE.store(sample_rate, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            generation,
+            sample_rate,
+            level_tx,
+            queue: gateway::get_mic_pcm_queue(),
+            resampler: crate::audio::dsp::PhaseResampler::new(),
+            mono: Vec::with_capacity(2048),
+            resampled: Vec::with_capacity(2048),
+            last_block: None,
+        }
+    }
+
+    fn push(&mut self, samples: impl Iterator<Item = f32>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if CAPTURE_GENERATION.load(Relaxed) != self.generation {
+            return;
+        }
+        let mic_gain = gateway::get_mic_volume();
+        self.mono.clear();
+        let mut sum_sq = 0.0f32;
+        for s in samples {
+            let s = s * mic_gain;
+            sum_sq += s * s;
+            self.mono.push(s);
+        }
+        let frames = self.mono.len();
+        if frames == 0 {
+            return;
+        }
+
+        // Timing of the blocks, for the report.
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_block.replace(now) {
+            let gap_ms = now.duration_since(last).as_secs_f32() * 1000.0;
+            let block_ms = frames as f32 * 1000.0 / self.sample_rate.max(1) as f32;
+            if gap_ms > block_ms * 1.5 {
+                CAPTURE_LATE_BLOCKS.fetch_add(1, Relaxed);
+            }
+            CAPTURE_WORST_GAP_MS.fetch_max(gap_ms as u32, Relaxed);
+        }
+        CAPTURE_BLOCKS.fetch_add(1, Relaxed);
+
+        // The meter and the gate mark on the settings page are on one scale: the gate
+        // looks at the voice after the automatic gain, so the meter shows it with that
+        // gain too (1.0 while the automatic gain is off).
+        let rms = (sum_sq / frames as f32).sqrt() * crate::audio::mic_gain::current_gain();
+        let level = (rms * 6.0).min(1.0);
+        report_mic_level(&self.level_tx, level);
+
+        if let Ok(mut q) = self.queue.lock() {
+            if self.sample_rate == 48000 {
+                push_to_mic_queues(&mut q, &self.mono, &self.mono, level);
+            } else {
+                self.resampled.clear();
+                self.resampler.resample(&self.mono, self.sample_rate, 48000, &mut self.resampled);
+                push_to_mic_queues(&mut q, &self.resampled, &self.resampled, level);
+            }
+        }
+    }
+}
+
 /// Microphone capture running on a thread of its own. Opening a WASAPI device enumerates
 /// every endpoint and initializes the audio client, which can take seconds (wireless
 /// headsets) and froze the UI when it ran on the UI thread. Dropping the handle stops the
@@ -237,8 +337,13 @@ pub fn start_mic_capture(device_name: String, level_tx: mpsc::Sender<f32>) -> Mi
         });
         return MicCapture { _stop: stop_tx };
     }
+    // From here on the capture that was running (if any) no longer feeds the call, even
+    // though its device is closed a little later by its own thread: two captures never
+    // write into the one queue at the same time.
+    let generation = CAPTURE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    CAPTURE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let spawned = std::thread::Builder::new().name("mic-capture-owner".into()).spawn(move || {
-        let stream = open_mic_stream(device_name, level_tx);
+        let stream = open_mic_stream(device_name, level_tx, generation);
         if stream.is_none() {
             log::warn!("🎙️ Não foi possível abrir o microfone.");
         }
@@ -255,6 +360,7 @@ pub fn start_mic_capture(device_name: String, level_tx: mpsc::Sender<f32>) -> Mi
 fn open_mic_stream(
     device_name: String,
     level_tx: mpsc::Sender<f32>,
+    generation: u64,
 ) -> Option<cpal::Stream> {
     let host = cpal::default_host();
 
@@ -279,12 +385,19 @@ fn open_mic_stream(
                 d.name().map(|n| n == device_name).unwrap_or(false)
             }).or_else(|| host.default_input_device())?
         };
-        let cfg = dev.default_input_config().ok()?;
+        let default = dev.default_input_config().ok()?;
+        // Opus runs at 48 kHz. The device's default format is often 44.1 kHz even when the
+        // hardware runs at 48 (PipeWire's ALSA device says so): asking for 48 kHz saves two
+        // conversions, the second of which (PhaseResampler, straight-line interpolation)
+        // left images of the high frequencies in the voice.
+        let cfg = voice_output_config_at_48k(default.clone(), dev.supported_input_configs().into_iter().flatten());
+        if cfg.sample_rate() != default.sample_rate() {
+            info!("Microphone: asked the device for 48000 Hz instead of its default {} Hz, so the voice is not resampled.", default.sample_rate().0);
+        }
         (dev, cfg)
     };
     let sample_rate = config.sample_rate().0;
     let channels = config.channels() as usize;
-    let pcm_queue = gateway::get_mic_pcm_queue();
 
     info!("Capturando microfone: {}Hz, {} canal(is), formato={:?}", sample_rate, channels, config.sample_format());
 
@@ -293,40 +406,15 @@ fn open_mic_stream(
     #[cfg(target_os = "linux")]
     let stream_config = linux_voice_stream_config(&target_dev, &config, true);
 
+    // Each sample format only differs in how a frame becomes one mono sample.
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => {
-            let q_arc = Arc::clone(&pcm_queue);
-            let mut resampler = crate::audio::dsp::PhaseResampler::new();
+            let mut sink = CaptureSink::new(generation, sample_rate, level_tx);
             target_dev.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _: &_| {
-                    let num_channels = channels.max(1);
-                    let frames = data.len() / num_channels;
-                    if frames == 0 { return; }
-
-                    let mic_gain = gateway::get_mic_volume();
-                    let mut mono_samples = Vec::with_capacity(frames);
-                    let mut sum_sq = 0.0f32;
-
-                    for frame in data.chunks_exact(num_channels) {
-                        let s = (frame.iter().sum::<f32>() / num_channels as f32) * mic_gain;
-                        sum_sq += s * s;
-                        mono_samples.push(s);
-                    }
-
-                    let rms = (sum_sq / frames as f32).sqrt();
-                    let level = (rms * 6.0).min(1.0);
-                    report_mic_level(&level_tx, level);
-
-                    if let Ok(mut q) = q_arc.lock() {
-                        if sample_rate == 48000 {
-                            push_to_mic_queues(&mut q, &mono_samples, &mono_samples, level);
-                        } else {
-                            let mut resampled_buf = Vec::with_capacity(frames * 48000 / sample_rate as usize + 32);
-                            resampler.resample(&mono_samples, sample_rate, 48000, &mut resampled_buf);
-                            push_to_mic_queues(&mut q, &resampled_buf, &mono_samples, level);
-                        }
-                    }
+                    let n = channels.max(1);
+                    sink.push(data.chunks_exact(n).map(|f| f.iter().sum::<f32>() / n as f32));
                 },
                 move |err| {
                     log::error!("Erro no Stream de Microfone: {:?}", err);
@@ -335,38 +423,12 @@ fn open_mic_stream(
             ).ok()?
         }
         cpal::SampleFormat::I16 => {
-            let q_arc = Arc::clone(&pcm_queue);
-            let mut resampler = crate::audio::dsp::PhaseResampler::new();
+            let mut sink = CaptureSink::new(generation, sample_rate, level_tx);
             target_dev.build_input_stream(
                 &stream_config,
                 move |data: &[i16], _: &_| {
-                    let num_channels = channels.max(1);
-                    let frames = data.len() / num_channels;
-                    if frames == 0 { return; }
-
-                    let mic_gain = gateway::get_mic_volume();
-                    let mut mono_samples = Vec::with_capacity(frames);
-                    let mut sum_sq = 0.0f32;
-
-                    for frame in data.chunks_exact(num_channels) {
-                        let s = (frame.iter().map(|&x| x as f32 / 32768.0).sum::<f32>() / num_channels as f32) * mic_gain;
-                        sum_sq += s * s;
-                        mono_samples.push(s);
-                    }
-
-                    let rms = (sum_sq / frames as f32).sqrt();
-                    let level = (rms * 6.0).min(1.0);
-                    report_mic_level(&level_tx, level);
-
-                    if let Ok(mut q) = q_arc.lock() {
-                        if sample_rate == 48000 {
-                            push_to_mic_queues(&mut q, &mono_samples, &mono_samples, level);
-                        } else {
-                            let mut resampled_buf = Vec::with_capacity(frames * 48000 / sample_rate as usize + 32);
-                            resampler.resample(&mono_samples, sample_rate, 48000, &mut resampled_buf);
-                            push_to_mic_queues(&mut q, &resampled_buf, &mono_samples, level);
-                        }
-                    }
+                    let n = channels.max(1);
+                    sink.push(data.chunks_exact(n).map(|f| f.iter().map(|&x| x as f32 / 32768.0).sum::<f32>() / n as f32));
                 },
                 move |err| {
                     log::error!("Erro no Stream de Microfone I16: {:?}", err);
@@ -375,38 +437,12 @@ fn open_mic_stream(
             ).ok()?
         }
         cpal::SampleFormat::I32 => {
-            let q_arc = Arc::clone(&pcm_queue);
-            let mut resampler = crate::audio::dsp::PhaseResampler::new();
+            let mut sink = CaptureSink::new(generation, sample_rate, level_tx);
             target_dev.build_input_stream(
                 &stream_config,
                 move |data: &[i32], _: &_| {
-                    let num_channels = channels.max(1);
-                    let frames = data.len() / num_channels;
-                    if frames == 0 { return; }
-
-                    let mic_gain = gateway::get_mic_volume();
-                    let mut mono_samples = Vec::with_capacity(frames);
-                    let mut sum_sq = 0.0f32;
-
-                    for frame in data.chunks_exact(num_channels) {
-                        let s = (frame.iter().map(|&x| x as f32 / 2147483648.0).sum::<f32>() / num_channels as f32) * mic_gain;
-                        sum_sq += s * s;
-                        mono_samples.push(s);
-                    }
-
-                    let rms = (sum_sq / frames as f32).sqrt();
-                    let level = (rms * 6.0).min(1.0);
-                    report_mic_level(&level_tx, level);
-
-                    if let Ok(mut q) = q_arc.lock() {
-                        if sample_rate == 48000 {
-                            push_to_mic_queues(&mut q, &mono_samples, &mono_samples, level);
-                        } else {
-                            let mut resampled_buf = Vec::with_capacity(frames * 48000 / sample_rate as usize + 32);
-                            resampler.resample(&mono_samples, sample_rate, 48000, &mut resampled_buf);
-                            push_to_mic_queues(&mut q, &resampled_buf, &mono_samples, level);
-                        }
-                    }
+                    let n = channels.max(1);
+                    sink.push(data.chunks_exact(n).map(|f| f.iter().map(|&x| x as f32 / 2147483648.0).sum::<f32>() / n as f32));
                 },
                 move |err| {
                     log::error!("Erro no Stream de Microfone I32: {:?}", err);
@@ -440,7 +476,8 @@ pub fn start_mic_loopback_stream(device_name: String) -> Option<cpal::Stream> {
 
     let target_dev_name = target_dev.name().unwrap_or_else(|_| "desconhecido".to_string());
     let config = match target_dev.default_output_config() {
-        Ok(c) => c,
+        // The microphone test plays the samples of the call's queue, which are at 48 kHz.
+        Ok(c) => voice_output_config_at_48k(c, target_dev.supported_output_configs().into_iter().flatten()),
         Err(e) => {
             log::error!("❌ [LOOPBACK] Erro ao obter default_output_config para '{}': {:?}", target_dev_name, e);
             return None;

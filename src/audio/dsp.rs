@@ -200,17 +200,23 @@ pub struct BiquadHpf {
 
 impl BiquadHpf {
     pub fn new_80hz_48khz() -> Self {
-        // Precomputed Butterworth 2nd-order HPF @ 80Hz, fs=48000Hz (Q = 0.7071)
+        // Butterworth 2nd-order high-pass at 80 Hz, fs = 48000 Hz (Q = 0.7071), computed
+        // here. The table that used to be written out was -3 dB at 191 Hz and -9 dB at
+        // 80 Hz: it took the body out of low voices whenever any processing was on.
+        let w0 = 2.0 * std::f64::consts::PI * 80.0 / 48000.0;
+        let alpha = w0.sin() / (2.0 * std::f64::consts::FRAC_1_SQRT_2);
+        let a0 = 1.0 + alpha;
+        let b0 = (1.0 + w0.cos()) / 2.0 / a0;
         Self {
             x1: 0.0,
             x2: 0.0,
             y1: 0.0,
             y2: 0.0,
-            b0: 0.985287,
-            b1: -1.970574,
-            b2: 0.985287,
-            a1: -1.970500,
-            a2: 0.970648,
+            b0: b0 as f32,
+            b1: (-2.0 * b0) as f32,
+            b2: b0 as f32,
+            a1: (-2.0 * w0.cos() / a0) as f32,
+            a2: ((1.0 - alpha) / a0) as f32,
         }
     }
 
@@ -240,9 +246,8 @@ pub struct VoiceProcessor {
     aec_filter: [f32; 48],
     aec_delay_buffer: [f32; 1024],
     aec_delay_idx: usize,
-    // Automatic Gain Control state
-    agc_envelope: f32,
-    agc_current_gain: f32,
+    // Automatic microphone gain and its limiter (audio::mic_gain)
+    auto_gain: crate::audio::mic_gain::AutoGain,
     // Transient suppression state
     transient_env: f32,
     noise_floor: f32,
@@ -264,8 +269,7 @@ impl VoiceProcessor {
             aec_filter: [0.0; 48],
             aec_delay_buffer: [0.0; 1024],
             aec_delay_idx: 0,
-            agc_envelope: 0.08, // Natural speech level starting envelope (prevents 6x initial surge)
-            agc_current_gain: 1.0,
+            auto_gain: crate::audio::mic_gain::AutoGain::new(),
             transient_env: 0.0,
             noise_floor: 0.005,
         }
@@ -281,6 +285,9 @@ impl VoiceProcessor {
     ) {
         // Fast-path bypass if all filters are turned off
         let is_bypass = (suppression_mode == "none" || suppression_mode.is_empty()) && !enable_aec && !enable_agc;
+        if !enable_agc {
+            crate::audio::mic_gain::publish_gain_off();
+        }
         if is_bypass {
             return;
         }
@@ -306,9 +313,9 @@ impl VoiceProcessor {
             }
         }
 
-        // 4. Automatic Gain Control (AGC) & Soft Limiter
+        // 4. Automatic microphone gain and limiter
         if enable_agc {
-            self.apply_agc(frame);
+            self.auto_gain.process(frame);
         }
 
         // 5. Hard safety clamp
@@ -406,50 +413,9 @@ impl VoiceProcessor {
         }
     }
 
-    /// Automatic Gain Control (AGC) with smooth speech targeting and transparent soft knee
-    fn apply_agc(&mut self, frame: &mut [f32; FRAME_SIZE_SAMPLES]) {
-        // Calculate frame RMS
-        let mut sum_sq = 0.0f32;
-        for &s in frame.iter() {
-            sum_sq += s * s;
-        }
-        let frame_rms = (sum_sq / frame.len() as f32).sqrt();
-
-        // Smoothly track voice envelope (ignore absolute silence)
-        if frame_rms > 0.005 {
-            let attack = 0.08f32;
-            let release = 0.015f32;
-            if frame_rms > self.agc_envelope {
-                self.agc_envelope = (1.0 - attack) * self.agc_envelope + attack * frame_rms;
-            } else {
-                self.agc_envelope = (1.0 - release) * self.agc_envelope + release * frame_rms;
-            }
-        }
-
-        // Target speech level is ~ -16 dBFS (approx 0.16 RMS)
-        let target_rms = 0.16f32;
-        let desired_gain = if self.agc_envelope > 0.008 {
-            (target_rms / self.agc_envelope).clamp(0.6, 2.5)
-        } else {
-            1.0
-        };
-
-        // Smooth gain transition
-        self.agc_current_gain = self.agc_current_gain * 0.97 + desired_gain * 0.03;
-
-        // Apply gain with tanh-based soft-knee saturation
-        for s in frame.iter_mut() {
-            let amplified = *s * self.agc_current_gain;
-            if amplified.abs() > 0.75 {
-                // Soft saturation curve: prevents harsh digital clipping
-                let sign = amplified.signum();
-                let x = amplified.abs() - 0.75;
-                let saturated = 0.75 + (0.25 * (x / 0.25).tanh());
-                *s = sign * saturated;
-            } else {
-                *s = amplified;
-            }
-        }
+    /// What the automatic gain did since the last call (for the periodic send log).
+    pub fn take_gain_report(&mut self) -> crate::audio::mic_gain::GainReport {
+        self.auto_gain.take_report()
     }
 }
 
