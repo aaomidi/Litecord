@@ -5,13 +5,12 @@
 //! (often 44.1 or 48 kHz); Opus needs 48 kHz, so the encoder resamples linearly. Each
 //! packet is one 20 ms frame; a lost one is concealed by the decoder.
 //!
-//! The mono mix is encoded as two equal channels: opus-rs (0.1.26) encodes mono wrongly
-//! (checked against libopus: a tone came out at 22% of its level, a chord at 458%),
-//! while its stereo encoder and its decoder are right.
-
-use opus_rs::{Application, OpusEncoder};
+//! Encoded and decoded by libopus. The mono mix goes out as two equal channels, which is
+//! what viewers (other clients, and browsers through the web share) are set up to decode;
+//! it once had to, because opus-rs, used here before, encodes mono wrongly.
 
 use crate::audio::opus_decoder::OpusDecoder;
+use crate::audio::opus_encoder::OpusEncoder;
 
 /// Samples per packet: 20 ms at 48 kHz.
 pub const FRAME: usize = 960;
@@ -34,8 +33,7 @@ pub struct StreamAudioEncoder {
 
 impl StreamAudioEncoder {
     pub fn new() -> Option<Self> {
-        let mut encoder = OpusEncoder::new(RATE as i32, 2, Application::Audio).ok()?;
-        encoder.bitrate_bps = BITRATE;
+        let encoder = OpusEncoder::audio(2, BITRATE as i32).ok()?;
         Some(Self { encoder, pending: Vec::with_capacity(FRAME * 2), rate: 0, pos: 0.0, last: 0.0 })
     }
 
@@ -72,7 +70,7 @@ impl StreamAudioEncoder {
         while self.pending.len() >= FRAME {
             let stereo: Vec<f32> = self.pending[..FRAME].iter().flat_map(|&s| [s, s]).collect();
             let mut packet = vec![0u8; 1500];
-            if let Ok(len) = self.encoder.encode(&stereo, FRAME, &mut packet) {
+            if let Ok(len) = self.encoder.encode(&stereo, &mut packet) {
                 packet.truncate(len);
                 out.push(packet);
             }

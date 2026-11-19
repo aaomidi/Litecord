@@ -913,9 +913,7 @@ pub async fn connect_voice_gateway(
                                                         seq = seq.wrapping_add(1);
                                                         nonce_cnt = nonce_cnt.wrapping_add(1);
 
-                                                        // Frames from before the gate opened go out with the timestamp of
-                                                        // the slot they were captured in.
-                                                        let packet_timestamp = timestamp.wrapping_sub(960 * packet.slots_back);
+                                                        let packet_timestamp = timestamp;
                                                         let mut audio_header = [0u8; 12];
                                                         audio_header[0] = 0x80; // RTP Version 2
                                                         audio_header[1] = 0x78; // Opus Payload 120

@@ -1,7 +1,7 @@
 //! Opus decoding by libopus itself (through `audiopus_sys`: the system's library where
 //! pkg-config finds one, as on Linux; otherwise the copy that crate builds).
 //!
-//! The decoder of `opus-rs` (still used for encoding) is not exact. Measured against
+//! The decoder of `opus-rs`, used before, is not exact. Measured against
 //! libopus on speech: 10 to 16 % of the frames of mono hybrid packets with FEC (what the
 //! official client sends) came out wrong, with errors around the 8 kHz crossover up to
 //! full scale, and 7 to 14 % of CELT-only frames (what this client sends). That was heard
@@ -94,8 +94,9 @@ impl Drop for OpusDecoder {
     }
 }
 
-/// Packets from libopus' own encoder, for tests. (The encoder of `opus-rs` is only right
-/// for two channels: its mono packets play about 13 dB too quiet in libopus.)
+/// Packets from libopus' encoder with chosen settings, for tests. (The encoder of `opus-rs`,
+/// which older tests use, is only right for two channels: its mono packets play about
+/// 13 dB too quiet in libopus.)
 #[cfg(test)]
 pub mod test_packets {
     /// A voiced sound (150 Hz and its harmonics) at 0.2 RMS, `packets` frames of 20 ms,
