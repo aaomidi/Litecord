@@ -26,8 +26,15 @@ pub struct VideoSettings {
     pub noise_suppression: String,        // "advanced", "standard", "none" (default "none")
     #[serde(default)]
     pub echo_cancellation: bool,         // default false
+    /// Upstream's switch for its old gain stage, off by default and written into every
+    /// settings file whether or not anyone chose it. Kept so such files still load; the
+    /// switch on the settings page is `mic_auto_gain` now.
     #[serde(default)]
-    pub automatic_gain_control: bool,    // default false
+    pub automatic_gain_control: bool,
+    /// Automatic microphone gain (audio::mic_gain). None (never switched in this version,
+    /// or not true/false in the file) is the default: on.
+    #[serde(default, deserialize_with = "lenient")]
+    pub mic_auto_gain: Option<bool>,
     /// Where the main window was when it last moved or resized. None until it does.
     #[serde(default)]
     pub window: Option<WindowGeometry>,
@@ -201,6 +208,7 @@ impl Default for VideoSettings {
             noise_suppression: "none".to_string(),
             echo_cancellation: false,
             automatic_gain_control: false,
+            mic_auto_gain: None,
             window: None,
             ui_scale_percent: 0,
             allow_web_link_requests: true,
@@ -456,14 +464,15 @@ pub fn toggle_echo_cancellation() -> bool {
     new_val
 }
 
+/// Automatic microphone gain: on unless it was switched off on the settings page.
 pub fn get_automatic_gain_control() -> bool {
-    get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner()).automatic_gain_control
+    get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner()).mic_auto_gain.unwrap_or(true)
 }
 
 pub fn toggle_automatic_gain_control() -> bool {
     let mut store = get_video_settings_store().lock().unwrap_or_else(|e| e.into_inner());
-    store.automatic_gain_control = !store.automatic_gain_control;
-    let new_val = store.automatic_gain_control;
+    let new_val = !store.mic_auto_gain.unwrap_or(true);
+    store.mic_auto_gain = Some(new_val);
     save_video_settings(&store);
     new_val
 }
@@ -607,6 +616,21 @@ mod tests {
         let saved = serde_json::to_string(&s).unwrap();
         assert!(saved.contains(r#""stream_to_discord":true"#), "{saved}");
         assert!(parse_settings(&saved).0.stream_to_discord);
+    }
+
+    #[test]
+    fn automatic_microphone_gain_is_on_until_switched_off_here() {
+        let gain = |s: &VideoSettings| s.mic_auto_gain.unwrap_or(true);
+        assert!(gain(&VideoSettings::default()));
+        // Upstream's old switch, written as false into every file, decides nothing.
+        for rest in ["", r#","automatic_gain_control":false"#, r#","automatic_gain_control":true"#, r#","mic_auto_gain":null"#, r#","mic_auto_gain":"no""#] {
+            let (s, damaged) = load(rest);
+            assert!(!damaged && gain(&s), "{rest}");
+        }
+        let (s, damaged) = load(r#","mic_auto_gain":false"#);
+        assert!(!damaged && !gain(&s), "an explicit off sticks");
+        let written = serde_json::to_string(&VideoSettings { mic_auto_gain: Some(false), ..VideoSettings::default() }).unwrap();
+        assert!(!gain(&parse_settings(&written).0));
     }
 
     #[test]

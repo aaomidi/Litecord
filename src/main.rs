@@ -2328,9 +2328,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui.set_output_devices(std::rc::Rc::new(slint::VecModel::from(ui_outputs)).into());
             }
 
-            // 3. Start mic capture for volume meter
-            let mic_name = cur_input.clone();
-            *active_stream_open.lock().unwrap() = Some(start_mic_capture(mic_name, level_tx_open.clone()));
+            // 3. Start mic capture for volume meter, unless one is running: a call's
+            // capture also feeds the meter, and replacing it here put a hole (and for a
+            // moment a second stream) into what the call was sending every time the
+            // settings were opened.
+            let mut active_mic = active_stream_open.lock().unwrap();
+            if active_mic.is_none() {
+                *active_mic = Some(start_mic_capture(cur_input.clone(), level_tx_open.clone()));
+            }
+            drop(active_mic);
 
             // 4. Asynchronously refresh hardware devices in background without lag
             let app_w_async = app_weak_open_settings.clone();
