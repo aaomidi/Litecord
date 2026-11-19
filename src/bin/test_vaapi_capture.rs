@@ -428,7 +428,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         // changed its format or sent nothing for a while (here on a new duplicate of the
         // connection, or the default remote).
         let mut silence = Duration::from_secs(3);
-        let mut restarted_silent = false;
+        let (mut restarted_silent, mut restarted_for_format) = (false, false);
         let mut next_frame = |frame: &mut [u8]| -> bool {
             loop {
                 let read = window_capture.as_ref().map(|capture| capture.read(frame, &|| running.load(Ordering::Relaxed), silence));
@@ -443,7 +443,8 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                         return true;
                     }
                     Some(WindowRead::Ended) => return false,
-                    Some(WindowRead::Silent(_)) if restarted_silent => {
+                    // (linux_portal.rs: only after a change of format does silence mean gone.)
+                    Some(WindowRead::Silent(_)) if restarted_silent && restarted_for_format => {
                         println!("  window capture: started again and silent since: the source is gone");
                         return false;
                     }
@@ -461,6 +462,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                             source.insert(0, format!("fd={dup}"));
                         }
                         restarted_silent = true;
+                        restarted_for_format = why == WindowRead::Changed;
                         match WindowCapture::start(&source, dst_w, dst_h, fps as u64) {
                             Ok(capture) => window_capture = Some(capture),
                             Err(e) => {

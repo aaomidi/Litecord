@@ -856,11 +856,15 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
             // without a picture before it gets a new capture.
             #[cfg(feature = "vaapi")]
             let (mut window_fd, mut _window_remote, mut window_silence) = (raw_fd, None, WINDOW_SILENCE);
-            // The window capture now running was started again and has not delivered yet: the
-            // compositor sends a new consumer a picture at once, so silence then is a source
-            // that is gone (the capture ends, and the share with it).
+            // The window capture now running was started again and has not delivered yet, and
+            // whether that was for a change of format. After a change of format (only
+            // xdg-desktop-portal-hyprland makes one) the compositor sends the new consumer a
+            // picture at once, so silence then is a source that is gone (the capture ends, and
+            // the share with it). After a silence it is not: Mutter (GNOME 51) sends a new
+            // consumer of a window that is still nothing either, and such a share ended 9 s
+            // after its window stopped changing.
             #[cfg(feature = "vaapi")]
-            let mut window_restarted_silent = false;
+            let (mut window_restarted_silent, mut window_restarted_for_format) = (false, false);
 
             let mut raw_buf = vec![0u8; frame_size];
             let mut pw_frame_count = 0u64;
@@ -895,7 +899,7 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
                         true
                     }
                     #[cfg(feature = "vaapi")]
-                    Some(WindowRead::Silent(waited)) if window_restarted_silent => {
+                    Some(WindowRead::Silent(waited)) if window_restarted_silent && window_restarted_for_format => {
                         log::warn!("⚠️ A captura da janela iniciada de novo não recebeu nenhum quadro em {:.1} s: a fonte deixou de existir", waited.as_secs_f64());
                         false
                     }
@@ -923,6 +927,7 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
                             Err(e) => log::warn!("⚠️ A captura nova da janela não iniciou ({})", e),
                         }
                         window_restarted_silent = true;
+                        window_restarted_for_format = why == WindowRead::Changed;
                         if window_capture.is_some() {
                             continue;
                         }
