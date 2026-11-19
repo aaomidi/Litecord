@@ -5,11 +5,12 @@
 //! (often 44.1 or 48 kHz); Opus needs 48 kHz, so the encoder resamples linearly. Each
 //! packet is one 20 ms frame; a lost one is concealed by the decoder.
 //!
-//! The mono mix is encoded as two equal channels: opus-rs (0.1.26) encodes mono wrongly
-//! (checked against libopus: a tone came out at 22% of its level, a chord at 458%),
-//! while its stereo encoder and its decoder are right.
+//! Encoded and decoded by libopus. The mono mix goes out as two equal channels, which is
+//! what viewers (other clients, and browsers through the web share) are set up to decode;
+//! it once had to, because opus-rs, used here before, encodes mono wrongly.
 
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use crate::audio::opus_decoder::OpusDecoder;
+use crate::audio::opus_encoder::OpusEncoder;
 
 /// Samples per packet: 20 ms at 48 kHz.
 pub const FRAME: usize = 960;
@@ -32,8 +33,7 @@ pub struct StreamAudioEncoder {
 
 impl StreamAudioEncoder {
     pub fn new() -> Option<Self> {
-        let mut encoder = OpusEncoder::new(RATE as i32, 2, Application::Audio).ok()?;
-        encoder.bitrate_bps = BITRATE;
+        let encoder = OpusEncoder::audio(2, BITRATE as i32).ok()?;
         Some(Self { encoder, pending: Vec::with_capacity(FRAME * 2), rate: 0, pos: 0.0, last: 0.0 })
     }
 
@@ -70,7 +70,7 @@ impl StreamAudioEncoder {
         while self.pending.len() >= FRAME {
             let stereo: Vec<f32> = self.pending[..FRAME].iter().flat_map(|&s| [s, s]).collect();
             let mut packet = vec![0u8; 1500];
-            if let Ok(len) = self.encoder.encode(&stereo, FRAME, &mut packet) {
+            if let Ok(len) = self.encoder.encode(&stereo, &mut packet) {
                 packet.truncate(len);
                 out.push(packet);
             }
@@ -83,24 +83,24 @@ impl StreamAudioEncoder {
 pub struct StreamAudioDecoder {
     decoder: OpusDecoder,
     last_seq: Option<u32>,
-    last_toc: Option<u8>,
 }
 
 impl StreamAudioDecoder {
     pub fn new() -> Option<Self> {
-        // Stereo, like the packets (opus-rs cannot decode them into mono).
-        Some(Self { decoder: OpusDecoder::new(RATE as i32, 2).ok()?, last_seq: None, last_toc: None })
+        // Stereo, like the packets.
+        Some(Self { decoder: OpusDecoder::new(RATE as i32, 2).ok()?, last_seq: None })
     }
 
     /// The 48 kHz samples of packet `seq`, after concealing up to a few lost ones before it.
     pub fn decode(&mut self, seq: u32, packet: &[u8]) -> Vec<i16> {
         let mut out = Vec::new();
-        if let (Some(last), Some(toc)) = (self.last_seq, self.last_toc) {
+        if let Some(last) = self.last_seq {
             let missing = seq.wrapping_sub(last).wrapping_sub(1);
             if missing > 0 && missing <= MAX_CONCEALED {
                 for _ in 0..missing {
-                    // A packet of only its ToC byte asks the decoder to conceal a lost frame.
-                    self.decode_into(&[toc], &mut out);
+                    let mut pcm = [0f32; FRAME * 2];
+                    let made = self.decoder.conceal(FRAME, &mut pcm);
+                    Self::keep(&pcm, made, &mut out);
                 }
             }
         }
@@ -117,8 +117,7 @@ impl StreamAudioDecoder {
             }
         }
         self.last_seq = Some(seq);
-        if let Some(&toc) = packet.first() {
-            self.last_toc = Some(toc);
+        if !packet.is_empty() {
             self.decode_into(packet, &mut out);
         }
         out
@@ -126,9 +125,14 @@ impl StreamAudioDecoder {
 
     fn decode_into(&mut self, packet: &[u8], out: &mut Vec<i16>) {
         let mut pcm = [0f32; FRAME * 2];
-        if let Ok(n) = self.decoder.decode(packet, FRAME, &mut pcm) {
+        let decoded = self.decoder.decode(packet, FRAME, &mut pcm);
+        Self::keep(&pcm, decoded, out);
+    }
+
+    fn keep(pcm: &[f32], decoded: Result<usize, &'static str>, out: &mut Vec<i16>) {
+        if let Ok(n) = decoded {
             // Both channels carry the same mix: keep the left one.
-            out.extend(pcm[..n.min(FRAME) * 2].iter().step_by(2).map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16));
+            out.extend(pcm[..n.min(FRAME) * 2].iter().step_by(2).map(|&s| if s.is_finite() { (s.clamp(-1.0, 1.0) * 32767.0) as i16 } else { 0 }));
         }
     }
 }

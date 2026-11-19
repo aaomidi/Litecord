@@ -4,15 +4,21 @@
 //! one place that can be run without a call (src/bin/mic_tx_study.rs drives it from files):
 //! voice processing and automatic gain, the voice gate, and the Opus encoder.
 //!
-//! What it does at the edges of speech, and why (measured against libopus as the receiver,
-//! on recordings at the level of a quiet microphone):
-//! - The start of a word is not lost. The frames from just before the gate opened are sent
-//!   too (60 ms of look-back), in the packet slots that were left empty.
-//! - The encoder agrees with the receiver when speech resumes. A receiver decodes the
-//!   trailing silence frames and its decoder state decays; an encoder that was simply not
-//!   fed kept the state of the last loud frame, and the first 20 to 60 ms of the next word
-//!   came out 9 to 15 dB too quiet at about half of all starts. The encoder is now given
-//!   two frames of silence when an utterance ends.
+//! What it does, and why:
+//! - The packets are libopus' (`audio::opus_encoder`), coded as the official client codes
+//!   a voice. The encoder of opus-rs, used before, smeared sharp word starts into a burst
+//!   of noise just ahead of them.
+//! - Every packet comes from the encoder, in order, the silence frames after an utterance
+//!   and the keepalives included (the encoder is given zeros for them). A receiver that
+//!   decodes what it gets is therefore always in the state the encoder assumes. With
+//!   canned silence frames it was not, and the first 20 to 60 ms of a word could come out
+//!   9 to 15 dB too quiet.
+//! - The start of a word is not lost: what is sent runs 60 ms behind the microphone, so
+//!   when the gate opens the frames from just before it are still to come. They go out as
+//!   ordinary packets, one per 20 ms. (They used to be sent at once together with the
+//!   frame that opened the gate. To a receiver that is three packets arriving 60, 40 and
+//!   20 ms late at the start of every utterance: its playout buffer drops the ones it has
+//!   already played past, or grows and shrinks around them by stretching the audio.)
 //! - The last frame of an utterance fades out over 5 ms instead of being cut.
 //! - The gate closes 6 dB below where it opens and holds for 300 ms, so speech hovering
 //!   around the threshold is not chopped.
@@ -22,17 +28,18 @@
 use std::collections::VecDeque;
 use std::io::Write;
 
-use opus_rs::{Application, OpusEncoder};
-
 use crate::audio::dsp::VoiceProcessor;
 use crate::audio::mic_gain::GainReport;
+use crate::audio::opus_encoder::OpusEncoder;
 
 pub const FRAME: usize = 960;
-/// The Opus silence frame Discord asks for when speech stops.
+/// What libopus makes of a mono frame of silence in its music coding, and what Discord
+/// documents as the silence frame. Only sent here if the encoder fails.
 pub const SILENCE_FRAME: [u8; 3] = [0xF8, 0xFF, 0xFE];
 
-/// Frames from before the gate opened that are still sent (60 ms).
-const PREROLL_FRAMES: usize = 3;
+/// How far what is sent runs behind the microphone, in frames (60 ms): the look-back of
+/// the gate.
+const DELAY_FRAMES: usize = 3;
 /// Frames sent after the last one above the gate (300 ms).
 const HANGOVER_FRAMES: u32 = 15;
 /// Silence frames after an utterance, and at the start of a call (opens the route).
@@ -40,8 +47,6 @@ const TRAILING_SILENCE: u32 = 5;
 const INITIAL_SILENCE: u32 = 10;
 /// One silence frame every 2.5 s while nothing is sent keeps the route open.
 const KEEPALIVE_TURNS: u32 = 125;
-/// Frames of zeros the encoder is given (output thrown away) when an utterance ends.
-const ZERO_FEED_FRAMES: usize = 2;
 /// Fade at the end of the last frame of an utterance (5 ms).
 const FADE_OUT_SAMPLES: usize = 240;
 /// While open, the gate stays open down to this fraction of its threshold (-6 dB).
@@ -72,22 +77,23 @@ pub enum TxInput<'a> {
 }
 
 pub struct TxPacket {
-    /// 0: this turn's packet slot; n: the slot n turns ago (look-back frames).
-    pub slots_back: u32,
     pub opus: Vec<u8>,
     /// False for silence frames.
     pub audio: bool,
 }
 
 pub struct TxTurn {
+    /// At most one: this turn's packet.
     pub packets: Vec<TxPacket>,
     /// Whether this turn took a packet slot (the RTP timestamp moves on by one frame).
     /// False while waiting out a microphone hiccup in the middle of speech.
     pub advance: bool,
-    /// The level of the processed frame (rms * 6, 0..1), 0 without a frame.
+    /// The level of the frame that just came from the microphone, after processing
+    /// (rms * 6, 0..1), 0 without a frame.
     pub level: f32,
     pub speaking: bool,
-    /// The frame after processing, as the encoder gets it (None without a frame).
+    /// The processed frame this turn's packet slot belongs to: the one that came from the
+    /// microphone `DELAY_FRAMES` turns ago. None until that many have come in.
     pub processed: Option<Box<[f32; FRAME]>>,
 }
 
@@ -109,44 +115,50 @@ struct Counters {
     longest_turn_gap_ms: u32,
 }
 
+/// A processed frame waiting for its turn to be sent.
+struct Held {
+    frame: Box<[f32; FRAME]>,
+    /// Above the gate, or within its hangover.
+    wanted: bool,
+}
+
 pub struct VoiceTx {
     processor: VoiceProcessor,
     encoder: OpusEncoder,
     scratch: Vec<u8>,
-    /// Frames to keep sending after the last one above the gate; above 0 = in an utterance.
+    /// The gate at the microphone: frames it stays open for after the last one above it.
     hang: u32,
+    /// The latest `DELAY_FRAMES` frames, oldest first.
+    held: VecDeque<Held>,
+    /// What is being sent is inside an utterance.
+    sending: bool,
     tail: u32,
     keepalive: u32,
     stalls: u32,
-    /// The latest processed frames whose packet slots were left empty, oldest first.
-    unsent: VecDeque<Box<[f32; FRAME]>>,
     counters: Counters,
     dump: Option<Dump>,
 }
 
 impl VoiceTx {
     pub fn new() -> Self {
-        // As voice.rs always created it: 48 kHz, two channels (the mono microphone on
-        // both), voice application.
-        let encoder = OpusEncoder::new(48000, 2, Application::Voip).expect("Opus encoder for 48 kHz stereo");
-        let mut tx = Self {
+        Self {
             processor: VoiceProcessor::new(),
-            encoder,
+            encoder: OpusEncoder::voice().expect("Opus encoder for 48 kHz speech"),
             scratch: vec![0u8; 1500],
             hang: 0,
+            held: VecDeque::with_capacity(DELAY_FRAMES + 1),
+            sending: false,
             tail: INITIAL_SILENCE,
             keepalive: 0,
             stalls: 0,
-            unsent: VecDeque::with_capacity(PREROLL_FRAMES + 1),
             counters: Counters::default(),
             dump: Dump::from_env(),
-        };
-        tx.feed_silence();
-        tx
+        }
     }
 
+    /// Speech is on its way out: the gate is open, or frames it let through are still held.
     pub fn in_utterance(&self) -> bool {
-        self.hang > 0
+        self.sending || self.hang > 0 || self.held.iter().any(|h| h.wanted)
     }
 
     /// One 20 ms turn of the send loop.
@@ -156,10 +168,7 @@ impl VoiceTx {
         match input {
             TxInput::Muted => {
                 self.stalls = 0;
-                self.unsent.clear();
-                if self.in_utterance() {
-                    self.end_utterance();
-                }
+                self.end_utterance();
                 self.idle(&mut out);
                 self.dump_turn(None, 'M', &out);
             }
@@ -172,14 +181,14 @@ impl VoiceTx {
                         // Wait for the real samples: nothing is sent and no slot is used,
                         // so what follows joins on without a seam.
                         out.advance = false;
-                        out.speaking = true;
+                        out.speaking = self.sending;
                         self.dump_turn(None, 'W', &out);
                         return out;
                     }
                     self.counters.forced_ends += 1;
-                    self.end_utterance();
                 }
-                self.unsent.clear();
+                // What is held is no longer next to what the microphone delivers next.
+                self.end_utterance();
                 self.idle(&mut out);
                 self.dump_turn(None, 'S', &out);
             }
@@ -189,49 +198,54 @@ impl VoiceTx {
                 self.processor.process_frame(&mut frame, settings.noise_suppression, settings.echo_cancellation, settings.auto_gain);
                 let rms = (frame.iter().map(|s| s * s).sum::<f32>() / FRAME as f32).sqrt();
                 out.level = (rms * 6.0).min(1.0);
-                let threshold = if self.in_utterance() { settings.gate_threshold * CLOSE_RATIO } else { settings.gate_threshold };
-                if out.level >= threshold {
-                    if !self.in_utterance() {
-                        self.counters.utterances += 1;
-                        // Look-back: the frames from just before the gate opened.
-                        let held = self.unsent.len() as u32;
-                        for (i, earlier) in std::mem::take(&mut self.unsent).into_iter().enumerate() {
-                            let opus = self.encode(&earlier);
-                            out.packets.push(TxPacket { slots_back: held - i as u32, opus, audio: true });
+                // The gate, on the frame that just came in.
+                let threshold = if self.hang > 0 { settings.gate_threshold * CLOSE_RATIO } else { settings.gate_threshold };
+                let wanted = if out.level >= threshold {
+                    self.hang = HANGOVER_FRAMES;
+                    true
+                } else if self.hang > 0 {
+                    self.hang -= 1;
+                    true
+                } else {
+                    false
+                };
+                self.held.push_back(Held { frame, wanted });
+                // What is sent, from the frame of DELAY_FRAMES turns ago: speech, and the
+                // frames just before speech.
+                let due = if self.held.len() > DELAY_FRAMES { self.held.pop_front() } else { None };
+                match due {
+                    Some(mut due) if due.wanted || self.held.iter().any(|h| h.wanted) => {
+                        if !self.sending {
+                            self.sending = true;
+                            self.counters.utterances += 1;
+                        }
+                        if !due.wanted {
                             self.counters.lookback_frames += 1;
                         }
-                    }
-                    self.hang = HANGOVER_FRAMES;
-                    self.tail = TRAILING_SILENCE;
-                    self.keepalive = 0;
-                    let opus = self.encode(&frame);
-                    out.packets.push(TxPacket { slots_back: 0, opus, audio: true });
-                    out.speaking = true;
-                } else if self.in_utterance() {
-                    self.hang -= 1;
-                    if self.hang == 0 {
-                        // The last frame of the utterance.
-                        for (i, s) in frame[FRAME - FADE_OUT_SAMPLES..].iter_mut().enumerate() {
-                            *s *= 1.0 - (i + 1) as f32 / FADE_OUT_SAMPLES as f32;
+                        let last = !self.held.iter().any(|h| h.wanted);
+                        if last {
+                            for (i, s) in due.frame[FRAME - FADE_OUT_SAMPLES..].iter_mut().enumerate() {
+                                *s *= 1.0 - (i + 1) as f32 / FADE_OUT_SAMPLES as f32;
+                            }
                         }
-                    }
-                    let opus = self.encode(&frame);
-                    out.packets.push(TxPacket { slots_back: 0, opus, audio: true });
-                    out.speaking = true;
-                    if self.hang == 0 {
-                        self.end_utterance();
-                    }
-                } else {
-                    self.idle(&mut out);
-                    if out.packets.is_empty() {
-                        if self.unsent.len() == PREROLL_FRAMES {
-                            self.unsent.pop_front();
+                        let opus = self.encode(&due.frame);
+                        out.packets.push(TxPacket { opus, audio: true });
+                        out.speaking = true;
+                        self.keepalive = 0;
+                        if last {
+                            self.sending = false;
+                            self.tail = TRAILING_SILENCE;
                         }
-                        self.unsent.push_back(frame.clone());
+                        self.dump_turn(Some(&due.frame), 'F', &out);
+                        out.processed = Some(due.frame);
+                    }
+                    due => {
+                        self.idle(&mut out);
+                        let frame = due.map(|d| d.frame);
+                        self.dump_turn(frame.as_deref(), 'F', &out);
+                        out.processed = frame;
                     }
                 }
-                self.dump_turn(Some(&frame), 'F', &out);
-                out.processed = Some(frame);
             }
         }
         for packet in &out.packets {
@@ -254,34 +268,24 @@ impl VoiceTx {
         };
         if send {
             self.keepalive = 0;
-            // The slot is taken: frames from before it cannot be sent later.
-            self.unsent.clear();
-            out.packets.push(TxPacket { slots_back: 0, opus: SILENCE_FRAME.to_vec(), audio: false });
+            let opus = self.encode(&[0.0; FRAME]);
+            out.packets.push(TxPacket { opus, audio: false });
         }
     }
 
+    /// Stops what is being sent here and now (muted, or the microphone is gone): the held
+    /// frames are dropped, and silence frames follow if speech was on its way out.
     fn end_utterance(&mut self) {
-        self.hang = 0;
-        self.tail = TRAILING_SILENCE;
-        self.unsent.clear();
-        self.feed_silence();
-    }
-
-    /// The encoder hears the silence the receiver is about to decode.
-    fn feed_silence(&mut self) {
-        let zeros = [0.0f32; FRAME * 2];
-        for _ in 0..ZERO_FEED_FRAMES {
-            let _ = self.encoder.encode(&zeros, FRAME, &mut self.scratch);
+        if self.in_utterance() {
+            self.tail = TRAILING_SILENCE;
         }
+        self.sending = false;
+        self.hang = 0;
+        self.held.clear();
     }
 
     fn encode(&mut self, frame: &[f32; FRAME]) -> Vec<u8> {
-        let mut stereo = [0.0f32; FRAME * 2];
-        for (i, &s) in frame.iter().enumerate() {
-            stereo[i * 2] = s;
-            stereo[i * 2 + 1] = s;
-        }
-        match self.encoder.encode(&stereo, FRAME, &mut self.scratch) {
+        match self.encoder.encode(frame, &mut self.scratch) {
             Ok(len) => self.scratch[..len].to_vec(),
             Err(_) => {
                 self.counters.encoder_errors += 1;
@@ -412,10 +416,14 @@ mod tests {
         f
     }
 
-    /// Runs frames through a sender and returns, per turn, the kinds of packets sent
-    /// ('A' audio, 'S' silence) with their slot offsets.
-    fn kinds(tx: &mut VoiceTx, frames: &[[f32; FRAME]]) -> Vec<Vec<(char, u32)>> {
-        frames.iter().map(|f| tx.turn(TxInput::Frame(f), &OFF).packets.iter().map(|p| (if p.audio { 'A' } else { 'S' }, p.slots_back)).collect()).collect()
+    /// Runs frames through a sender and returns, per turn, what was sent: 'A' audio,
+    /// 'S' a silence frame, '-' nothing.
+    fn kinds(tx: &mut VoiceTx, frames: &[[f32; FRAME]]) -> String {
+        frames.iter().map(|f| {
+            let turn = tx.turn(TxInput::Frame(f), &OFF);
+            assert!(turn.packets.len() <= 1, "one packet per turn at most");
+            match turn.packets.first() { Some(p) if p.audio => 'A', Some(_) => 'S', None => '-' }
+        }).collect()
     }
 
     fn after_start(tx: &mut VoiceTx) {
@@ -426,33 +434,96 @@ mod tests {
     }
 
     #[test]
-    fn the_frames_before_the_gate_opened_are_sent_in_their_own_slots() {
+    fn the_frames_before_the_gate_opened_are_sent_first_one_per_turn() {
         let mut tx = VoiceTx::new();
         after_start(&mut tx);
         let quiet = tone(0.001);
         let loud = tone(0.1);
-        let sent = kinds(&mut tx, &[quiet, quiet, quiet, quiet, quiet, loud, loud]);
-        assert!(sent[..5].iter().all(|turn| turn.is_empty()));
-        assert_eq!(sent[5], vec![('A', 3), ('A', 2), ('A', 1), ('A', 0)]);
-        assert_eq!(sent[6], vec![('A', 0)]);
+        // The gate opens on the sixth frame. What goes out then is the frame of three
+        // turns earlier, so three quiet frames are sent ahead of the loud ones.
+        let sent = kinds(&mut tx, &[quiet, quiet, quiet, quiet, quiet, loud, loud, loud, loud, loud]);
+        assert_eq!(sent, "-----AAAAA");
+        // The audio of the first packet is the quiet frame, of the fourth the loud one.
+        let mut tx = VoiceTx::new();
+        after_start(&mut tx);
+        let mut levels = Vec::new();
+        for f in [quiet, quiet, quiet, quiet, quiet, loud, loud, loud, loud] {
+            let turn = tx.turn(TxInput::Frame(&f), &OFF);
+            if turn.speaking {
+                let p = turn.processed.unwrap();
+                levels.push((p.iter().map(|s| s * s).sum::<f32>() / FRAME as f32).sqrt());
+            }
+        }
+        assert_eq!(levels.len(), 4);
+        assert!(levels[..3].iter().all(|l| *l < 0.002) && levels[3] > 0.05, "{levels:?}");
     }
 
     #[test]
-    fn a_slot_that_carried_a_silence_frame_is_not_sent_twice() {
+    fn an_utterance_ends_with_its_hangover_and_five_silence_frames() {
+        let mut tx = VoiceTx::new();
+        after_start(&mut tx);
+        let quiet = tone(0.001);
+        let mut frames = vec![quiet; 4];
+        frames.push(tone(0.1));
+        frames.extend(std::iter::repeat(quiet).take(40));
+        let sent = kinds(&mut tx, &frames);
+        // Three frames of look-back, the loud frame, fifteen of hangover, five silence frames.
+        let expected = format!("----{}{}{}", "A".repeat(3 + 1 + HANGOVER_FRAMES as usize), "S".repeat(TRAILING_SILENCE as usize), "-".repeat(17));
+        assert_eq!(sent, expected);
+    }
+
+    #[test]
+    fn speech_that_resumes_right_after_an_utterance_joins_on_without_a_gap() {
         let mut tx = VoiceTx::new();
         after_start(&mut tx);
         let quiet = tone(0.001);
         let loud = tone(0.1);
-        // One utterance, then its hangover and trailing silence frames, then two empty
-        // turns and speech again: only the two empty slots can carry look-back frames.
+        // The gate closes after the hangover and opens again two frames later: those two
+        // frames are look-back of the second utterance, so audio never stops.
         let mut frames = vec![loud];
-        frames.extend(std::iter::repeat(quiet).take((HANGOVER_FRAMES + TRAILING_SILENCE) as usize + 2));
-        frames.push(loud);
+        frames.extend(std::iter::repeat(quiet).take(HANGOVER_FRAMES as usize + 2));
+        frames.extend([loud; 4]);
+        // (The first packets are the three frames held from before the first loud one.)
         let sent = kinds(&mut tx, &frames);
-        let hang_end = HANGOVER_FRAMES as usize;
-        assert!(sent[1..=hang_end].iter().all(|t| t == &vec![('A', 0)]), "hangover frames are audio");
-        assert!(sent[hang_end + 1..hang_end + 1 + TRAILING_SILENCE as usize].iter().all(|t| t == &vec![('S', 0)]));
-        assert_eq!(sent.last().unwrap(), &vec![('A', 2), ('A', 1), ('A', 0)]);
+        assert_eq!(sent, "A".repeat(frames.len()));
+    }
+
+    #[test]
+    fn every_packet_decodes_in_order_and_a_word_starts_at_its_level() {
+        use crate::audio::opus_decoder::{OpusDecoder, MAX_FRAME};
+        let mut tx = VoiceTx::new();
+        let mut dec = OpusDecoder::new(48_000, 1).unwrap();
+        let mut pcm = vec![0f32; MAX_FRAME];
+        let voiced = |n: usize| -> [f32; FRAME] {
+            let mut f = [0.0f32; FRAME];
+            for (i, s) in f.iter_mut().enumerate() {
+                let t = (n * FRAME + i) as f32 / 48_000.0;
+                *s = 0.2 * (1..=6).map(|h| (t * 140.0 * h as f32 * std::f32::consts::TAU).sin() / h as f32).sum::<f32>();
+            }
+            f
+        };
+        let rms = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt();
+        // Three words with pauses long enough for the silence frames and a keepalive gap.
+        let mut starts = Vec::new();
+        let mut n = 0;
+        for _word in 0..3 {
+            for k in 0..60 {
+                let frame = if k < 25 { voiced(n) } else { [0.0; FRAME] };
+                n += 1;
+                let turn = tx.turn(TxInput::Frame(&frame), &OFF);
+                for p in &turn.packets {
+                    let got = dec.decode(&p.opus, MAX_FRAME, &mut pcm).unwrap();
+                    assert_eq!(got, FRAME);
+                    if p.audio && k == 3 + DELAY_FRAMES {
+                        // The fourth frame of the word, as a listener gets it.
+                        starts.push(rms(&pcm[..got]) / rms(&frame));
+                    }
+                    if !p.audio { assert!(rms(&pcm[..got]) < 0.02, "a silence frame decodes to silence"); }
+                }
+            }
+        }
+        assert_eq!(starts.len(), 3);
+        assert!(starts.iter().all(|r| (0.7..1.4).contains(r)), "word starts against the original: {starts:?}");
     }
 
     #[test]
@@ -461,7 +532,7 @@ mod tests {
         after_start(&mut tx);
         // Threshold 0.05 on rms * 6: a sine of amplitude a has rms a / 1.414.
         let below_open = tone(0.05 / 6.0 * 1.414 * 0.7);
-        assert!(kinds(&mut tx, &[below_open, below_open]).iter().all(|t| t.is_empty()), "0.7 of the threshold does not open the gate");
+        assert_eq!(kinds(&mut tx, &[below_open; 6]), "------", "0.7 of the threshold does not open the gate");
         let loud = tone(0.1);
         tx.turn(TxInput::Frame(&loud), &OFF);
         for _ in 0..HANGOVER_FRAMES * 3 {
@@ -476,7 +547,9 @@ mod tests {
         let mut tx = VoiceTx::new();
         after_start(&mut tx);
         let loud = tone(0.1);
-        tx.turn(TxInput::Frame(&loud), &OFF);
+        for _ in 0..5 {
+            tx.turn(TxInput::Frame(&loud), &OFF);
+        }
         for _ in 0..MAX_STALLS_IN_SPEECH - 1 {
             let turn = tx.turn(TxInput::Stall, &OFF);
             assert!(turn.packets.is_empty() && !turn.advance);
@@ -496,7 +569,9 @@ mod tests {
     fn muting_ends_the_utterance_at_once() {
         let mut tx = VoiceTx::new();
         after_start(&mut tx);
-        tx.turn(TxInput::Frame(&tone(0.1)), &OFF);
+        for _ in 0..5 {
+            tx.turn(TxInput::Frame(&tone(0.1)), &OFF);
+        }
         let turn = tx.turn(TxInput::Muted, &OFF);
         assert!(!tx.in_utterance() && turn.packets.len() == 1 && !turn.packets[0].audio);
     }
@@ -505,9 +580,10 @@ mod tests {
     fn a_threshold_of_zero_sends_everything() {
         let mut tx = VoiceTx::new();
         let open = TxSettings { gate_threshold: 0.0, ..OFF };
-        for _ in 0..50 {
+        for i in 0..50 {
             let turn = tx.turn(TxInput::Frame(&[0.0; FRAME]), &open);
-            assert!(turn.packets.len() == 1 && turn.packets[0].audio);
+            // The first three turns fill the 60 ms that sending runs behind.
+            assert!(turn.packets.len() == 1 && turn.packets[0].audio == (i >= DELAY_FRAMES), "turn {i}");
         }
     }
 

@@ -31,7 +31,9 @@
 //!   impl=old        old: the copy of the former send loop below, with the keys above.
 //!                   new: the app's sender itself (gateway::voice_tx): only gain, ns, aec, agc,
 //!                   vad, cb, gate and stall apply. A turn that waits for a late microphone
-//!                   takes no packet slot and gives no record.
+//!                   takes no packet slot and gives no record. Its packets are libopus'
+//!                   (mono, speech coding), and <prefix>.proc.f32 holds the frames in the
+//!                   order they are sent, 60 ms behind <prefix>.pre.f32.
 //!
 //! Output: <prefix>.pkts.bin (one record per 20 ms loop turn, the format of
 //! voice_rx_harness: u32 LE length + bytes, 0xFFFF_FFFE = nothing sent), <prefix>.pre.f32
@@ -246,15 +248,8 @@ fn main() {
         let mut action = 'N';
         let mut packet = None;
         for p in t.packets {
-            if p.slots_back == 0 {
-                action = if p.audio { 'A' } else { 'S' };
-                packet = Some(p.opus);
-            } else {
-                let at = new_ticks.len() - p.slots_back as usize;
-                assert!(new_ticks[at].action == 'N', "a look-back frame went into a slot that was used");
-                new_ticks[at].action = 'A';
-                new_ticks[at].packet = Some(p.opus);
-            }
+            action = if p.audio { 'A' } else { 'S' };
+            packet = Some(p.opus);
         }
         new_ticks.push(Tick { pre: frame.unwrap_or([0.0; 960]), proc_: t.processed.map(|b| *b).unwrap_or([0.0; 960]), level: t.level, has_audio: t.speaking,
             action, packet, hang: 0, padded: if frame.is_some() { '-' } else { 'Z' }, timeout });

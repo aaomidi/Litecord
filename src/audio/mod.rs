@@ -3,6 +3,8 @@
 pub mod engine;
 pub mod dsp;
 pub mod mic_gain;
+pub mod opus_decoder;
+pub mod opus_encoder;
 pub mod sound_effects;
 pub mod call_sounds;
 #[cfg(target_os = "windows")]
