@@ -435,7 +435,10 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 match read {
                     None => return stdout.as_mut().is_some_and(|s| s.read_exact(frame).is_ok()),
                     Some(WindowRead::Frame) => {
-                        silence = Duration::from_secs(3);
+                        // (linux_portal.rs: the first picture after a restart keeps the wait.)
+                        if !restarted_silent {
+                            silence = Duration::from_secs(3);
+                        }
                         restarted_silent = false;
                         return true;
                     }

@@ -885,7 +885,12 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
                     None => stdout.as_mut().is_some_and(|s| s.read_exact(&mut raw_buf).is_ok()),
                     #[cfg(feature = "vaapi")]
                     Some(WindowRead::Frame) => {
-                        window_silence = WINDOW_SILENCE;
+                        // The first picture of a capture started again is the one every new
+                        // consumer gets, not a window that moves again: the wait stays as long
+                        // as it had become, or a still window got a new capture every 3 s.
+                        if !window_restarted_silent {
+                            window_silence = WINDOW_SILENCE;
+                        }
                         window_restarted_silent = false;
                         true
                     }
