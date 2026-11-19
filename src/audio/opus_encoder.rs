@@ -1,8 +1,8 @@
 //! Opus encoding by libopus (see `opus_decoder` for how it is linked).
 //!
 //! The encoder of `opus-rs` codes two-channel audio so that libopus plays it at the right
-//! level, but it is a bare one: it almost never switches to short blocks (4 to 12 frames in
-//! a minute of speech where libopus does it for 72 to 226) and never uses the pitch
+//! level, but it is a bare one: it almost never switches to short blocks (4 to 12 of the
+//! 1000 frames of 20 s of speech where libopus does it for 72 to 226) and never uses the pitch
 //! filter. Without short blocks the sound of a sharp word start is smeared over the 20 ms
 //! before it: decoded by libopus, the 10 ms before an onset came out 5 to 9 dB louder than
 //! the original at the median and 17 to 25 dB louder in the worst tenth (libopus' own
