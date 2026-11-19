@@ -7,6 +7,25 @@ use super::super::types::{CapturableWindowItem, MonitorItemInfo};
 
 #[cfg(not(windows))]
 pub static PORTAL_FRAME: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+/// Frames put in `PORTAL_FRAME` so far, and the count `capture_screen_rgb` last handed on: it
+/// hands on new frames only, so a capture that stopped delivering is not taken for one that
+/// delivers the same picture.
+static PORTAL_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PORTAL_FRAMES_TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A shared window that sent no picture for this long gets a new capture (a still window
+/// sends none either: the wait doubles each time, up to `WINDOW_SILENCE_MAX`).
+#[cfg(feature = "vaapi")]
+const WINDOW_SILENCE: std::time::Duration = std::time::Duration::from_secs(3);
+#[cfg(feature = "vaapi")]
+const WINDOW_SILENCE_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+/// A GPU capture started again after its source renegotiated: tries, and the wait between them.
+#[cfg(feature = "vaapi")]
+const GPU_RESTART_TRIES: u32 = 3;
+#[cfg(feature = "vaapi")]
+const GPU_RESTART_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long a restart waits for the capture before it to be taken down.
+#[cfg(feature = "vaapi")]
+const GPU_RESTART_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(not(windows))]
 pub static PORTAL_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(not(windows))]
@@ -211,7 +230,7 @@ fn capture_pipeline(source: &[String], dst_w: u32, dst_h: u32, target_fps: u64, 
     let whole = (0, 0, dst_w, dst_h);
     let fill = monitor.is_some_and(|size| letterbox(size, (dst_w, dst_h)) != whole && picture_rect(size, (dst_w, dst_h)) == whole);
     let (square, scale): (&str, &[&str]) = if fill { ("", &["videoscale"]) } else { (",pixel-aspect-ratio=1/1", &["videoscale", "add-borders=true"]) };
-    let mut args = if window { vec!["pipewiresrc".to_string()] } else { vec!["-q".to_string(), "pipewiresrc".to_string()] };
+    let mut args = if window { vec!["pipewiresrc".to_string(), "name=win_src".to_string()] } else { vec!["-q".to_string(), "pipewiresrc".to_string()] };
     args.extend(source.iter().cloned());
     args.extend(["do-timestamp=true", "!"].map(String::from));
     if !fill {
@@ -246,10 +265,32 @@ fn capture_pipeline(source: &[String], dst_w: u32, dst_h: u32, target_fps: u64, 
 /// and sets it on a videocrop in front of the conversion, which renegotiates behind itself
 /// for that very buffer; videoscale then puts the window where the GPU capture puts it
 /// (`letterbox`). A source without the rectangle passes whole.
+///
+/// xdg-desktop-portal-hyprland gives a window's stream the window's own size and renegotiates
+/// it at every resize; pipewiresrc gets no picture any more after a renegotiation by its
+/// source (the source runs out of buffers, nothing reports an error). `read` therefore says
+/// when the format changed or no picture came for a while, and the caller starts a new
+/// capture on a new connection (`init_wayland_portal_screencast`).
 #[cfg(all(target_os = "linux", feature = "vaapi"))]
 pub struct WindowCapture {
     pipeline: gstreamer::Pipeline,
     sink: gstreamer_app::AppSink,
+    /// The source negotiated another format after its first one.
+    changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// What `WindowCapture::read` found.
+#[cfg(all(target_os = "linux", feature = "vaapi"))]
+#[derive(Debug, PartialEq)]
+pub enum WindowRead {
+    /// A picture is in the frame.
+    Frame,
+    /// The capture has ended (the window was closed, the pipeline failed) or the share has.
+    Ended,
+    /// The source changed its format (a window resized on Hyprland): no more pictures come.
+    Changed,
+    /// No picture for this long. A still window sends none either.
+    Silent(std::time::Duration),
 }
 
 #[cfg(all(target_os = "linux", feature = "vaapi"))]
@@ -264,6 +305,23 @@ impl WindowCapture {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let pipeline = gst::parse::launchv(&args).map_err(|e| format!("pipeline: {e}"))?.downcast::<gst::Pipeline>().map_err(|_| "não é um pipeline")?;
         let crop = pipeline.by_name("win_crop").ok_or("sem videocrop")?;
+        let changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let format = std::sync::Mutex::new(None::<gst::Structure>);
+        let on_format = changed.clone();
+        pipeline.by_name("win_src").and_then(|src| src.static_pad("src")).ok_or("sem pipewiresrc")?.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+            if let Some(gst::PadProbeData::Event(event)) = &info.data {
+                if let gst::EventView::Caps(caps) = event.view() {
+                    let now = caps.caps().structure(0).map(|s| s.to_owned());
+                    let mut format = format.lock().unwrap_or_else(|e| e.into_inner());
+                    if format.is_some() && *format != now {
+                        on_format.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    *format = now;
+                }
+            }
+            gst::PadProbeReturn::Ok
+        })
+        .ok_or("probe não instalado")?;
         let sink = pipeline.by_name("win_sink").and_then(|e| e.downcast::<gstreamer_app::AppSink>().ok()).ok_or("sem appsink")?;
         let pad = crop.static_pad("sink").ok_or("sem pad")?;
         // (left, top, right, bottom) as videocrop has them.
@@ -296,33 +354,39 @@ impl WindowCapture {
         })
         .ok_or("probe não instalado")?;
         pipeline.set_state(gst::State::Playing).map_err(|e| format!("o pipeline não iniciou: {e}"))?;
-        Ok(Self { pipeline, sink })
+        Ok(Self { pipeline, sink, changed })
     }
 
-    /// The next frame, BGRA and opaque, into `frame`. False when the capture has ended (the
-    /// window was closed, the pipeline failed) or `wanted` says that the share has.
-    pub fn read(&self, frame: &mut [u8], wanted: &dyn Fn() -> bool) -> bool {
+    /// The next frame, BGRA and opaque, into `frame`, waiting at most `silence` for it.
+    pub fn read(&self, frame: &mut [u8], wanted: &dyn Fn() -> bool, silence: std::time::Duration) -> WindowRead {
         use gstreamer as gst;
         use gstreamer::prelude::*;
+        let since = std::time::Instant::now();
         loop {
             if !wanted() {
-                return false;
+                return WindowRead::Ended;
+            }
+            if self.changed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return WindowRead::Changed;
             }
             let Some(sample) = self.sink.try_pull_sample(gst::ClockTime::from_mseconds(100)) else {
                 if self.sink.is_eos() {
-                    return false;
+                    return WindowRead::Ended;
                 }
                 if let Some(error) = self.pipeline.bus().and_then(|bus| bus.pop_filtered(&[gst::MessageType::Error])) {
                     if let gst::MessageView::Error(e) = error.view() {
                         log::warn!("🎬 [GStreamer] captura da janela encerrada: {}", e.error());
                     }
-                    return false;
+                    return WindowRead::Ended;
+                }
+                if since.elapsed() >= silence {
+                    return WindowRead::Silent(since.elapsed());
                 }
                 continue;
             };
-            let Some(Ok(map)) = sample.buffer().map(|b| b.map_readable()) else { return false };
+            let Some(Ok(map)) = sample.buffer().map(|b| b.map_readable()) else { return WindowRead::Ended };
             if map.len() != frame.len() {
-                return false;
+                return WindowRead::Ended;
             }
             frame.copy_from_slice(&map);
             // (Around the window Mutter leaves the buffer transparent, and a window has
@@ -330,7 +394,7 @@ impl WindowCapture {
             for pixel in frame.chunks_exact_mut(4) {
                 pixel[3] = 255;
             }
-            return true;
+            return WindowRead::Frame;
         }
     }
 }
@@ -475,6 +539,35 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
                     }
                 };
             }
+            // A new PipeWire connection of the session for a capture that takes over, and the
+            // connection `$old` shut: two clients on one connection break it. `None` when
+            // there is no portal (a test source: each capture connects to the default remote)
+            // or it refused (the old connection stays).
+            #[cfg(feature = "vaapi")]
+            macro_rules! reopen_remote {
+                ($old:expr) => {
+                    match (&proxy, &session, $old) {
+                        (Some(proxy), Some(session), Some(old)) => match proxy.open_pipe_wire_remote(session, OpenPipeWireRemoteOptions::default()).await {
+                            Ok(fd) => {
+                                let new_fd = fd.as_raw_fd();
+                                unsafe {
+                                    libc::shutdown(old, libc::SHUT_RDWR);
+                                    let flags = libc::fcntl(new_fd, libc::F_GETFD);
+                                    if flags >= 0 {
+                                        libc::fcntl(new_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                                    }
+                                }
+                                Some(fd)
+                            }
+                            Err(e) => {
+                                log::warn!("⚠️ Falha ao abrir um segundo PipeWire Remote ({:?}); a captura seguinte usa a conexão anterior", e);
+                                None
+                            }
+                        },
+                        _ => None,
+                    }
+                };
+            }
 
             let response = if let (Some(proxy), Some(session)) = (&proxy, &session) {
             let select_opts = SelectSourcesOptions::default()
@@ -597,11 +690,43 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
                 use crate::screen_capture::linux_gpu_tx as gpu;
                 let mut fallback = (raw_fd, None, false);
                 if gpu::allowed(is_window) {
-                    let begun = gpu::begin(raw_fd, node_id, target_w, target_h, target_fps as u32, &mine);
-                    let ended = match begun {
-                        Some(id) => gpu::run_until_end(id, &mine),
-                        None => gpu::Ended::Failed,
+                    // The connection the GPU capture uses, and the one opened for it.
+                    let (mut gpu_fd, mut gpu_remote) = (raw_fd, None);
+                    let mut gpu_ran = false;
+                    let mut restarting = false;
+                    let ended = loop {
+                        let mut begun = gpu::begin(gpu_fd, node_id, target_w, target_h, target_fps as u32, &mine);
+                        // Right after a renegotiation the source may not take a new consumer yet
+                        // ("no more input formats"): a few more tries before the fallback.
+                        let mut tries = 1;
+                        while restarting && begun.is_none() && tries < GPU_RESTART_TRIES && mine() {
+                            tokio::time::sleep(GPU_RESTART_WAIT).await;
+                            begun = gpu::begin(gpu_fd, node_id, target_w, target_h, target_fps as u32, &mine);
+                            tries += 1;
+                        }
+                        gpu_ran |= begun.is_some();
+                        let ended = match begun {
+                            Some(id) => gpu::run_until_end(id, &mine),
+                            None => gpu::Ended::Failed,
+                        };
+                        if ended != gpu::Ended::SourceChanged || !mine() {
+                            break ended;
+                        }
+                        // A window resized on Hyprland: a new GPU capture on a new connection
+                        // takes the new format (the old connection gets no more pictures).
+                        // (Not while the old capture is still being taken down: two consumers
+                        // of the node at once and the new one is refused.)
+                        let deadline = std::time::Instant::now() + GPU_RESTART_STOP_WAIT;
+                        while gpu::live_pipelines() > 0 && std::time::Instant::now() < deadline {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        if let Some(fd) = reopen_remote!(gpu_fd) {
+                            gpu_fd = Some(fd.as_raw_fd());
+                            gpu_remote = Some(fd);
+                        }
+                        restarting = true;
                     };
+                    let ended = if ended == gpu::Ended::SourceChanged { gpu::Ended::Stopped } else { ended };
                     if ended != gpu::Ended::Failed || !mine() {
                         // The share was stopped, or the compositor ended the session (the
                         // window was closed): in the second case the share is over too.
@@ -617,27 +742,10 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
                     // gst-launch gets a PipeWire connection of its own. The pipeline that
                     // failed stops in the background and may never finish (a driver that
                     // hangs); two clients on one connection break it, so the old one is shut.
-                    match (&proxy, &session, raw_fd) {
-                        (Some(proxy), Some(session), Some(raw_fd)) => match proxy.open_pipe_wire_remote(session, OpenPipeWireRemoteOptions::default()).await {
-                            Ok(fd) => {
-                                let new_fd = fd.as_raw_fd();
-                                unsafe {
-                                    libc::shutdown(raw_fd, libc::SHUT_RDWR);
-                                    let flags = libc::fcntl(new_fd, libc::F_GETFD);
-                                    if flags >= 0 {
-                                        libc::fcntl(new_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-                                    }
-                                }
-                                fallback = (Some(new_fd), Some(fd), begun.is_some());
-                            }
-                            Err(e) => {
-                                log::warn!("⚠️ Falha ao abrir um segundo PipeWire Remote ({:?}); a captura por gst-launch usa a conexão anterior", e);
-                                fallback.2 = begun.is_some();
-                            }
-                        },
-                        // (A test source: each capture connects to the default remote itself.)
-                        _ => fallback.2 = begun.is_some(),
-                    }
+                    fallback = match reopen_remote!(gpu_fd) {
+                        Some(fd) => (Some(fd.as_raw_fd()), Some(fd), gpu_ran),
+                        None => (gpu_fd, gpu_remote, gpu_ran),
+                    };
                 }
                 fallback
             };
@@ -653,7 +761,7 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
             // window out of the monitor-sized buffer (`WindowCapture`); gst-launch when
             // that does not start.
             #[cfg(feature = "vaapi")]
-            let window_capture = if is_window {
+            let mut window_capture = if is_window {
                 // (pipewiresrc closes the connection it is given: a copy of it.)
                 let own_fd = raw_fd.map(|fd| unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) });
                 match WindowCapture::start(&source_props(own_fd), dst_w, dst_h, target_fps) {
@@ -744,13 +852,15 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
                 return;
             }
             }
-            let mut next_frame = |frame: &mut [u8]| -> bool {
-                #[cfg(feature = "vaapi")]
-                if let Some(capture) = &window_capture {
-                    return capture.read(frame, &mine);
-                }
-                stdout.as_mut().is_some_and(|s| s.read_exact(frame).is_ok())
-            };
+            // The window capture's connection, the one opened for it, and how long it may stay
+            // without a picture before it gets a new capture.
+            #[cfg(feature = "vaapi")]
+            let (mut window_fd, mut _window_remote, mut window_silence) = (raw_fd, None, WINDOW_SILENCE);
+            // The window capture now running was started again and has not delivered yet: the
+            // compositor sends a new consumer a picture at once, so silence then is a source
+            // that is gone (the capture ends, and the share with it).
+            #[cfg(feature = "vaapi")]
+            let mut window_restarted_silent = false;
 
             let mut raw_buf = vec![0u8; frame_size];
             let mut pw_frame_count = 0u64;
@@ -767,7 +877,54 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
                 if !mine() {
                     break;
                 }
-                if !next_frame(&mut raw_buf) {
+                #[cfg(feature = "vaapi")]
+                let read = window_capture.as_ref().map(|capture| capture.read(&mut raw_buf, &mine, window_silence));
+                #[cfg(not(feature = "vaapi"))]
+                let read: Option<()> = None;
+                let got = match read {
+                    None => stdout.as_mut().is_some_and(|s| s.read_exact(&mut raw_buf).is_ok()),
+                    #[cfg(feature = "vaapi")]
+                    Some(WindowRead::Frame) => {
+                        window_silence = WINDOW_SILENCE;
+                        window_restarted_silent = false;
+                        true
+                    }
+                    #[cfg(feature = "vaapi")]
+                    Some(WindowRead::Silent(waited)) if window_restarted_silent => {
+                        log::warn!("⚠️ A captura da janela iniciada de novo não recebeu nenhum quadro em {:.1} s: a fonte deixou de existir", waited.as_secs_f64());
+                        false
+                    }
+                    #[cfg(feature = "vaapi")]
+                    Some(WindowRead::Ended) => false,
+                    #[cfg(feature = "vaapi")]
+                    Some(why @ (WindowRead::Changed | WindowRead::Silent(_))) => {
+                        // Not papered over with the last picture: a new capture on a new
+                        // connection (see `WindowCapture`). A window that is only still gets
+                        // the same, ever less often.
+                        if let WindowRead::Silent(waited) = why {
+                            log::warn!("⚠️ Captura da janela sem quadros há {:.1} s; uma captura nova é iniciada", waited.as_secs_f64());
+                            window_silence = (window_silence * 2).min(WINDOW_SILENCE_MAX);
+                        } else {
+                            log::warn!("⚠️ A janela mudou de formato (redimensionada); uma captura nova é iniciada");
+                        }
+                        window_capture = None;
+                        if let Some(fd) = reopen_remote!(window_fd) {
+                            window_fd = Some(fd.as_raw_fd());
+                            _window_remote = Some(fd);
+                        }
+                        let own_fd = window_fd.map(|fd| unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) });
+                        match WindowCapture::start(&source_props(own_fd), dst_w, dst_h, target_fps) {
+                            Ok(capture) => window_capture = Some(capture),
+                            Err(e) => log::warn!("⚠️ A captura nova da janela não iniciou ({})", e),
+                        }
+                        window_restarted_silent = true;
+                        if window_capture.is_some() {
+                            continue;
+                        }
+                        false
+                    }
+                };
+                if !got {
                     capture_ended = mine();
                     break;
                 }
@@ -813,6 +970,7 @@ pub fn init_wayland_portal_screencast(target_w: u32, target_h: u32, target_fps: 
                     } else {
                         *slot = Some(raw_buf.clone());
                     }
+                    PORTAL_FRAMES.fetch_add(1, Ordering::SeqCst);
                 }
             }
 
@@ -914,6 +1072,11 @@ pub fn capture_screen_rgb(_target_hwnd: isize, target_w: u32, target_h: u32, tar
             init_wayland_portal_screencast(target_w, target_h, target_fps);
 
             if let Ok(slot) = PORTAL_FRAME.lock() {
+                // (Only a frame the reader put there since the last call: see `PORTAL_FRAMES`.)
+                let frames = PORTAL_FRAMES.load(std::sync::atomic::Ordering::SeqCst);
+                if PORTAL_FRAMES_TAKEN.swap(frames, std::sync::atomic::Ordering::SeqCst) == frames {
+                    return None;
+                }
                 if let Some(ref frame) = *slot {
                     let total = (target_w * target_h * 4) as usize;
                     if frame.len() == total {

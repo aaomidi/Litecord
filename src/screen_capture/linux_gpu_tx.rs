@@ -52,8 +52,11 @@
 //!   into, and the keepalive goes on pushing the last one: a crash in vapostproc's upload.
 //!   `on-disconnect=error` makes pipewiresrc send flush-start first (which waits for the
 //!   picture being converted) and then report an error; from that flush on nothing more is
-//!   taken from the source and the stream is given up. The gst-launch capture follows such
-//!   changes, so the share goes on there.
+//!   taken from the source and the stream is given up. pipewiresrc gets no picture any more
+//!   once its source has renegotiated (the source runs out of buffers; no error comes), the
+//!   gst-launch capture's included, so the share goes on in a new GPU capture on a new
+//!   connection to the same node (`Ended::SourceChanged`). xdg-desktop-portal-hyprland does
+//!   this at every resize of a shared window.
 //! - A shared window is not such a source. Mutter (GNOME 51, RecordWindow, what the portal
 //!   uses) gives a window's stream the size of the window's monitor once and for all and
 //!   never renegotiates: each buffer carries the window's rectangle in it (PipeWire's crop
@@ -2213,11 +2216,16 @@ pub enum Ended {
     Failed,
     /// PipeWire reported the source gone (the compositor ended the session).
     SourceGone,
+    /// The source took its buffers back for a new format and is still there: a window
+    /// resized on Hyprland (xdg-desktop-portal-hyprland renegotiates the stream at each
+    /// resize). pipewiresrc does not get pictures again after a renegotiation by the source,
+    /// so a new capture is started on a new connection to the same node (`linux_portal`).
+    SourceChanged,
 }
 
 /// Blocks while stream `id` runs, watching its health, and tells how it ended: stopped
 /// (`wanted` turned false, or `end` was called), failed with the source still there (the
-/// caller takes the capture over), or its source gone.
+/// caller takes the capture over), its source gone, or its source in a new format.
 pub fn run_until_end(id: u64, wanted: impl Fn() -> bool) -> Ended {
     let Some(stream) = current().filter(|s| s.id == id) else { return Ended::Stopped };
     let reason = loop {
@@ -2250,6 +2258,9 @@ pub fn run_until_end(id: u64, wanted: impl Fn() -> bool) -> Ended {
     if stream.gone.load(Ordering::SeqCst) {
         warn!("⚠️ [VAAPI] A fonte da captura na GPU deixou de existir ({}); a captura deste compartilhamento terminou", reason);
         Ended::SourceGone
+    } else if stream.buffers_removed.load(Ordering::SeqCst) {
+        warn!("⚠️ [VAAPI] A fonte da captura na GPU mudou de formato ({}); a captura na GPU recomeça numa conexão nova", reason);
+        Ended::SourceChanged
     } else {
         warn!("⚠️ [VAAPI] Captura na GPU falhou ({}); a transmissão continua pela captura por gst-launch", reason);
         Ended::Failed
