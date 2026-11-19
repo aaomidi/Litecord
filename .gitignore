@@ -76,3 +76,6 @@ desktop.ini
 
 # Configuracao local de build (caminhos da maquina de cada pessoa)
 .cargo/config.toml
+
+# nix build output
+/result

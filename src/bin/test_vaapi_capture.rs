@@ -24,7 +24,7 @@ mod harness {
     use litecord::screen_capture::hw_decode::h264_state::nal_ranges;
     use litecord::screen_capture::linux_gpu_tx as gpu;
     use litecord::screen_capture::live_controls;
-    use litecord::screen_capture::sources::linux_portal::{gst_launch_capture_args, WindowCapture, PORTAL_LOCAL_CB};
+    use litecord::screen_capture::sources::linux_portal::{gst_launch_capture_args, WindowCapture, WindowRead, PORTAL_LOCAL_CB};
     use litecord::screen_capture::video_pipeline::{decode_video_frame, Decoded, StreamDecoders};
     use litecord::screen_capture::watch::{ProfileChoice, RateControl, Verdict as WatchVerdict, Viewers, CAP_H264_MAIN};
     use litecord::utils::video_settings::StreamProfile;
@@ -382,6 +382,8 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         first_frame_at: Mutex<Option<Instant>>,
         child_pid: AtomicU32,
         previews: AtomicU64,
+        /// New window captures started after a change of format or a silence.
+        window_restarts: AtomicU64,
     }
 
     /// linux_portal.rs's gst-launch pipeline and reader loop, on `node`.
@@ -395,7 +397,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         // only its node) a node that is gone must not be replaced by another video source.
         source.extend(["stream-properties=props,node.dont-fallback=(string)true".to_string(), format!("path={node}")]);
         // What linux_portal.rs does for a shared window: the pipeline inside this process.
-        let window_capture = if window {
+        let mut window_capture = if window {
             match WindowCapture::start(&source, dst_w, dst_h, fps as u64) {
                 Ok(capture) => {
                     println!("  the window is captured inside this process (videocrop by each buffer's rectangle), no gst-launch");
@@ -422,11 +424,50 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                 return;
             }
         }
+        // What linux_portal.rs does with the window capture: a new one when the source
+        // changed its format or sent nothing for a while (here on a new duplicate of the
+        // connection, or the default remote).
+        let mut silence = Duration::from_secs(3);
+        let mut restarted_silent = false;
         let mut next_frame = |frame: &mut [u8]| -> bool {
-            if let Some(capture) = &window_capture {
-                return capture.read(frame, &|| running.load(Ordering::Relaxed));
+            loop {
+                let read = window_capture.as_ref().map(|capture| capture.read(frame, &|| running.load(Ordering::Relaxed), silence));
+                match read {
+                    None => return stdout.as_mut().is_some_and(|s| s.read_exact(frame).is_ok()),
+                    Some(WindowRead::Frame) => {
+                        silence = Duration::from_secs(3);
+                        restarted_silent = false;
+                        return true;
+                    }
+                    Some(WindowRead::Ended) => return false,
+                    Some(WindowRead::Silent(_)) if restarted_silent => {
+                        println!("  window capture: started again and silent since: the source is gone");
+                        return false;
+                    }
+                    Some(why) => {
+                        println!("  RESTART: window capture: {why:?}; a new capture is started");
+                        shared.window_restarts.fetch_add(1, Ordering::SeqCst);
+                        if matches!(why, WindowRead::Silent(_)) {
+                            silence = (silence * 2).min(Duration::from_secs(60));
+                        }
+                        window_capture = None;
+                        let mut source = source.clone();
+                        if let Some(fd) = fd {
+                            let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+                            source.retain(|arg| !arg.starts_with("fd="));
+                            source.insert(0, format!("fd={dup}"));
+                        }
+                        restarted_silent = true;
+                        match WindowCapture::start(&source, dst_w, dst_h, fps as u64) {
+                            Ok(capture) => window_capture = Some(capture),
+                            Err(e) => {
+                                eprintln!("legacy: the new window capture did not start: {e}");
+                                return false;
+                            }
+                        }
+                    }
+                }
             }
-            stdout.as_mut().is_some_and(|s| s.read_exact(frame).is_ok())
         };
         let mut raw_buf = vec![0u8; frame_size];
         let mut last_preview = Instant::now() - Duration::from_secs(1);
@@ -867,7 +908,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         let live_start = setup.live.as_ref().map(|_| live_controls::begin_share());
         let live_start_qp = live_controls::status().min_qp;
         let running = Arc::new(AtomicBool::new(true));
-        let legacy = Arc::new(LegacyShared { frame: Mutex::new(None), frames_read: AtomicU64::new(0), first_frame_at: Mutex::new(None), child_pid: AtomicU32::new(0), previews: AtomicU64::new(0) });
+        let legacy = Arc::new(LegacyShared { frame: Mutex::new(None), frames_read: AtomicU64::new(0), first_frame_at: Mutex::new(None), child_pid: AtomicU32::new(0), previews: AtomicU64::new(0), window_restarts: AtomicU64::new(0) });
         let preview_count = Arc::new(AtomicU64::new(0));
         let preview_bad = Arc::new(AtomicU64::new(0));
         let preview_geometry_bad = Arc::new(AtomicU64::new(0));
@@ -906,6 +947,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         // The portal thread of linux_portal.rs from the point where it has the fd and node.
         let gpu_gave_up_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let gpu_started = Arc::new(AtomicBool::new(false));
+        let gpu_restarts = Arc::new(AtomicU64::new(0));
         let gpu_ended: Arc<Mutex<Option<gpu::Ended>>> = Arc::new(Mutex::new(None));
         let own_fd = match setup.own_fd.then(open_remote).transpose() {
             Ok(fd) => fd,
@@ -919,6 +961,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         }
         let portal = {
             let (running, legacy, gave_up, gpu_started, gpu_ended) = (running.clone(), legacy.clone(), gpu_gave_up_at.clone(), gpu_started.clone(), gpu_ended.clone());
+            let gpu_restarts = gpu_restarts.clone();
             let (node, size, fps, legacy_only, memory, max_fps, as_window, monitor) = (setup.node, setup.size, setup.fps, setup.legacy_only, setup.memory, setup.max_fps, setup.as_window, setup.monitor);
             std::thread::Builder::new().name("portal".into()).spawn(move || {
                 // Both connections are closed when this thread ends, like the portal's.
@@ -934,15 +977,50 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
                         gpu::begin_with(&gpu::Config { fd: raw(&fd), node, width: size.0, height: size.1, fps, memory, max_fps, min_qp: 30 }, &wanted).map_err(|e| println!("  GPU capture did not start: {e}")).ok()
                     };
                     println!("  begin() returned after {} ms: {}", began.elapsed().as_millis(), if begun.is_some() { "started" } else { "not started" });
-                    let ended = match begun {
-                        Some(id) => {
-                            gpu_started.store(true, Ordering::SeqCst);
-                            let ended = gpu::run_until_end(id, wanted);
-                            *gpu_ended.lock().unwrap() = Some(ended);
-                            ended
+                    let mut begun = begun;
+                    // What linux_portal.rs does when the source renegotiates (a window resized on
+                    // Hyprland): a new GPU capture on a new connection.
+                    let ended = loop {
+                        let ended = match begun {
+                            Some(id) => {
+                                gpu_started.store(true, Ordering::SeqCst);
+                                let ended = gpu::run_until_end(id, wanted);
+                                *gpu_ended.lock().unwrap() = Some(ended);
+                                ended
+                            }
+                            None => gpu::Ended::Failed,
+                        };
+                        if ended != gpu::Ended::SourceChanged || !wanted() {
+                            break ended;
                         }
-                        None => gpu::Ended::Failed,
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        while gpu::live_pipelines() > 0 && Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        println!("  RESTART: the old GPU capture was taken down ({} pipelines left)", gpu::live_pipelines());
+                        if let Some(old) = fd.take() {
+                            match open_remote() {
+                                Ok(new) => {
+                                    unsafe { libc::shutdown(old.as_raw_fd(), libc::SHUT_RDWR) };
+                                    fd = Some(new);
+                                }
+                                Err(_) => fd = Some(old),
+                            }
+                        }
+                        let again = Instant::now();
+                        begun = gpu::begin(raw(&fd), node, size.0, size.1, fps, &wanted);
+                        // (linux_portal.rs: up to 3 tries, 250 ms apart.)
+                        for _ in 1..3 {
+                            if begun.is_some() || !wanted() {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(250));
+                            begun = gpu::begin(raw(&fd), node, size.0, size.1, fps, &wanted);
+                        }
+                        println!("  RESTART: the source changed its format; a new GPU capture {} after {} ms", if begun.is_some() { "started" } else { "did not start" }, again.elapsed().as_millis());
+                        gpu_restarts.fetch_add(1, Ordering::SeqCst);
                     };
+                    let ended = if ended == gpu::Ended::SourceChanged { gpu::Ended::Stopped } else { ended };
                     if ended != gpu::Ended::Failed || !wanted() {
                         return;
                     }
@@ -1899,6 +1977,7 @@ Exit status 1 when a check fails, 2 when the source cannot be opened.";
         let ended = *gpu_ended.lock().unwrap();
         if let Some(ended) = ended {
             println!("the GPU capture ended as: {ended:?}");
+            println!("restarts after a change of format or a silence: GPU capture {}, window capture {}", gpu_restarts.load(Ordering::SeqCst), legacy.window_restarts.load(Ordering::SeqCst));
         }
         if setup.end_source.is_some() || setup.source_must_end {
             if ended != Some(gpu::Ended::SourceGone) {

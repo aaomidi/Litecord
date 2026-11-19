@@ -18,6 +18,13 @@
 //!
 //! When the GPU path stops answering mid-stream, the encoder switches itself to OpenH264
 //! (nothing else would replace it) and tries the GPU again later.
+//!
+//! NVIDIA's VA driver only decodes: there `nvh264enc` takes vah264enc's place (`Backend`),
+//! with the same rules. Frames from memory reach it through `videoconvert` (NV12 on the CPU),
+//! not GL: on NVIDIA's EGL (driver 615, GLES 3.2) glupload from system memory gave black
+//! pictures. The capture's DMABuf does go through GL (`description_scaled`). nvh264enc writes
+//! the colour description itself, from the NV12 caps (`2:4:5:1`: BT.601 matrix with BT.709
+//! primaries and transfer, what `declare_colour` gives the VA stream).
 
 use super::{OpenH264Encoder, VideoEncoder};
 use crate::screen_capture::hw_decode::h264_state::nal_ranges;
@@ -32,7 +39,58 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Preferred first; `vah264lpenc` is the only one Intel's low-power encoders register.
-pub(crate) const ENCODER_ELEMENTS: [&str; 2] = ["vah264enc", "vah264lpenc"];
+pub(crate) const ENCODER_ELEMENTS: [&str; 3] = ["vah264enc", "vah264lpenc", "nvh264enc"];
+
+/// What carries the pictures to an encoder element and how it is driven.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Backend {
+    Va,
+    Nvenc,
+}
+
+impl Backend {
+    pub(crate) fn of(element: &str) -> Self {
+        if element.starts_with("nv") {
+            Self::Nvenc
+        } else {
+            Self::Va
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Va => "VA-API",
+            Self::Nvenc => "NVENC",
+        }
+    }
+
+    /// The elements in front of the encoder: for frames from memory, or for the capture's
+    /// pictures of any size (`scaled`).
+    fn helpers(self, scaled: bool) -> &'static [&'static str] {
+        match (self, scaled) {
+            (Self::Va, _) => &["vapostproc"],
+            (Self::Nvenc, false) => &["videoconvert"],
+            (Self::Nvenc, true) => &["glupload", "glcolorconvert", "gltransformation"],
+        }
+    }
+}
+
+/// The encoder elements whose whole chain this machine has, preferred first.
+pub(crate) fn usable_encoders(scaled: bool) -> Result<Vec<&'static str>, String> {
+    let mut usable = Vec::new();
+    let mut absent = Vec::new();
+    for element in ENCODER_ELEMENTS {
+        let needed = std::iter::once(element).chain(Backend::of(element).helpers(scaled).iter().copied());
+        match needed.into_iter().find(|e| gst::ElementFactory::find(e).is_none()) {
+            None => usable.push(element),
+            Some(missing) => absent.push(format!("{element}: sem {missing}")),
+        }
+    }
+    if usable.is_empty() {
+        return Err(format!("nenhum codificador H.264 na GPU via GStreamer ({})", absent.join("; ")));
+    }
+    Ok(usable)
+}
 /// Streams start at this rate (types::REQUESTED_BITRATE_BPS).
 pub(crate) const INITIAL_BITRATE_BPS: u32 = 8_000_000;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
@@ -236,13 +294,38 @@ impl EncodeChain {
     /// kept and centred (`linux_portal::letterbox` says where). With square pixels named on both sides,
     /// `add-borders` leaves the rest of the frame to "borders" that some drivers never write
     /// (radeonsi: whatever the surface held, green when new): the caller paints them.
+    /// NVENC: gltransformation (named `POSTPROC`) draws the whole picture over the frame and
+    /// clears the rest to black; `add_gate` shrinks it to the picture's rectangle with its
+    /// `scale-x`/`scale-y`. glcolorscale has no borders, and both only take RGBA.
     pub(crate) fn description_scaled(element: &str, width: u32, height: u32, bitrate_bps: u32, min_qp: u32, main: bool) -> String {
-        Self::description_with(element, width, height, bitrate_bps, min_qp, main, &format!(" name={POSTPROC} add-borders=true"), ",pixel-aspect-ratio=1/1")
+        match Backend::of(element) {
+            Backend::Va => {
+                Self::description_with(element, width, height, bitrate_bps, min_qp, main, &format!("vapostproc name={POSTPROC} add-borders=true"), ",pixel-aspect-ratio=1/1")
+            }
+            Backend::Nvenc => Self::description_with(
+                element,
+                width,
+                height,
+                bitrate_bps,
+                min_qp,
+                main,
+                &format!(
+                    "glupload ! glcolorconvert ! video/x-raw(memory:GLMemory),format=RGBA ! gltransformation name={POSTPROC} ortho=true \
+                     ! video/x-raw(memory:GLMemory),format=RGBA,width={width},height={height},pixel-aspect-ratio=1/1 ! glcolorconvert"
+                ),
+                ",pixel-aspect-ratio=1/1",
+            ),
+        }
     }
 
-    fn description_with(element: &str, width: u32, height: u32, bitrate_bps: u32, min_qp: u32, main: bool, postproc_props: &str, more_caps: &str) -> String {
+    fn description_with(element: &str, width: u32, height: u32, bitrate_bps: u32, min_qp: u32, main: bool, postproc: &str, more_caps: &str) -> String {
+        let (postproc, input) = match Backend::of(element) {
+            Backend::Va => (if postproc.is_empty() { "vapostproc" } else { postproc }, "video/x-raw(memory:VAMemory),format=NV12,colorimetry=(string)2:4:7:1"),
+            Backend::Nvenc if postproc.is_empty() => ("videoconvert", "video/x-raw,format=NV12,colorimetry=(string)2:4:5:1"),
+            Backend::Nvenc => (postproc, "video/x-raw(memory:GLMemory),format=NV12,colorimetry=(string)2:4:5:1"),
+        };
         format!(
-            "vapostproc{postproc_props} ! capsfilter name={ENCODER_INPUT} caps=\"video/x-raw(memory:VAMemory),format=NV12,width={width},height={height},colorimetry=(string)2:4:7:1{more_caps}\" \
+            "{postproc} ! capsfilter name={ENCODER_INPUT} caps=\"{input},width={width},height={height}{more_caps}\" \
              ! {}",
             Self::encoder_description(element, bitrate_bps, min_qp, main)
         )
@@ -251,13 +334,19 @@ impl EncodeChain {
     /// The chain from the encoder on: what is replaced, behind the element named
     /// `ENCODER_INPUT`, when a running pipeline changes its profile (`EncoderSection`).
     pub(crate) fn encoder_description(element: &str, bitrate_bps: u32, min_qp: u32, main: bool) -> String {
+        let max_qp = MAX_QP.max(min_qp);
+        let settings = match Backend::of(element) {
+            Backend::Va => format!("{ENCODER_PROPS} min-qp={min_qp} max-qp={max_qp} bitrate={} cpb-size={}", bitrate_bps / 1000, cpb_size_kbit(bitrate_bps)),
+            Backend::Nvenc => format!(
+                "{NVENC_PROPS} qp-min-i={min_qp} qp-min-p={min_qp} qp-max-i={max_qp} bitrate={} vbv-buffer-size={}",
+                bitrate_bps / 1000,
+                vbv_size_kbit(bitrate_bps)
+            ),
+        };
         format!(
-            "{element} name=enc {ENCODER_PROPS} min-qp={min_qp} max-qp={} bitrate={} cpb-size={} \
+            "{element} name=enc {settings} \
              ! video/x-h264,profile={},stream-format=byte-stream,alignment=au \
              ! appsink name=sink sync=false async=false max-buffers=4 drop=false emit-signals=false enable-last-sample=false",
-            MAX_QP.max(min_qp),
-            bitrate_bps / 1000,
-            cpb_size_kbit(bitrate_bps),
             if main { "main" } else { "constrained-baseline" }
         )
     }
@@ -361,9 +450,10 @@ impl Drop for EncodeChain {
 }
 
 /// Sets the rate of a running encoder element; it takes effect on the next frame, which the
-/// encoder turns into an IDR.
+/// encoder turns into an IDR (nvh264enc as well as vah264enc).
 pub(crate) fn set_encoder_bitrate(encoder: &gst::Element, bitrate_bps: u32) {
-    for (name, value) in [("bitrate", bitrate_bps / 1000), ("cpb-size", cpb_size_kbit(bitrate_bps))] {
+    // cpb-size is vah264enc's, vbv-buffer-size nvh264enc's.
+    for (name, value) in [("bitrate", bitrate_bps / 1000), ("cpb-size", cpb_size_kbit(bitrate_bps)), ("vbv-buffer-size", vbv_size_kbit(bitrate_bps))] {
         // set_property panics on a missing property, another type or a value out of range.
         if let Some(spec) = encoder.find_property(name) {
             if let Some(range) = spec.downcast_ref::<gst::glib::ParamSpecUInt>() {
@@ -492,6 +582,19 @@ const MAX_QP: u32 = 44;
 /// than it, 12% where `max-qp` holds the quality up.
 fn cpb_size_kbit(bitrate_bps: u32) -> u32 {
     (bitrate_bps / 1000).div_ceil(2)
+}
+
+/// nvh264enc settings shared by every stream; the caller asks for its own keyframes (each
+/// with SPS and PPS), as with vah264enc. Measured on an RTX 2080 Ti (4K desktop to 1080p60,
+/// 8 Mbit/s): `p1` with `ultra-low-latency` encodes a picture in ~2.5 ms.
+const NVENC_PROPS: &str =
+    "preset=p1 tune=ultra-low-latency rc-mode=cbr gop-size=-1 bframes=0 zerolatency=true rc-lookahead=0 aud=false repeat-sequence-header=true";
+
+/// nvh264enc's VBV: 100 ms of the bitrate (6 pictures at 60 FPS) bounds a keyframe at about
+/// half the size it takes without one. One picture's worth (~15 KB at 8 Mbit/s 60 FPS) made
+/// text unreadable for ~5 pictures after every keyframe.
+fn vbv_size_kbit(bitrate_bps: u32) -> u32 {
+    (bitrate_bps / 1000).div_ceil(10)
 }
 
 /// Frames copied from memory into the pipeline (appsrc).
@@ -633,18 +736,12 @@ impl VaapiEncoder {
             return Err("falha simulada (LITECORD_VAAPI_TEST_FAIL=init)".into());
         }
         gst::init().map_err(|e| format!("GStreamer: {e}"))?;
-        if gst::ElementFactory::find("vapostproc").is_none() {
-            return Err("plugin VA-API do GStreamer ausente (gst-plugin-va)".into());
-        }
         let min_qp = crate::screen_capture::live_controls::min_qp_for_new_encoder();
-        let mut last_error = String::from("nenhum codificador H.264 VA-API registrado");
-        for element in ENCODER_ELEMENTS {
-            if gst::ElementFactory::find(element).is_none() {
-                continue;
-            }
+        let mut last_error = String::new();
+        for element in usable_encoders(false)? {
             match Self::probe(element, target_fps, min_qp) {
                 Ok(took) => {
-                    info!("🚀 [VAAPI] {} respondeu ao teste em {:.0} ms (Constrained Baseline)", element, took.as_secs_f64() * 1000.0);
+                    info!("🚀 [VAAPI] {} ({}) respondeu ao teste em {:.0} ms (Constrained Baseline)", element, Backend::of(element).name(), took.as_secs_f64() * 1000.0);
                     return Ok(Self {
                         element,
                         target_fps,
@@ -676,7 +773,10 @@ impl VaapiEncoder {
                         test,
                     });
                 }
-                Err(e) => last_error = format!("{element}: {e}"),
+                Err(e) => {
+                    warn!("⚠️ [VAAPI] {} ({}) falhou no teste: {}", element, Backend::of(element).name(), e);
+                    last_error = format!("{element}: {e}");
+                }
             }
         }
         Err(last_error)
@@ -867,7 +967,7 @@ impl VaapiEncoder {
         self.lost_picture = false;
         // The highest rate of the stream so far, so the level does not follow every change.
         self.level_bitrate_bps = self.level_bitrate_bps.max(session.bitrate_bps);
-        let mut au = super::h264_vui::declare_colour(&au, 1, 1, 6);
+        let mut au = super::h264_vui::declare_no_reordering(&super::h264_vui::declare_colour(&au, 1, 1, 6));
         raise_level(&mut au, self.level_bitrate_bps);
         Ok(au)
     }
@@ -925,7 +1025,7 @@ impl VaapiEncoder {
         self.gpu_retry_after = (self.gpu_retry_after * 2).min(GPU_RETRY_MAX);
         match self.encode_on_gpu(bgra, w, h, stride) {
             Ok(au) => {
-                info!("🚀 [VAAPI] A GPU voltou a responder; a transmissão volta para o VA-API");
+                info!("🚀 [VAAPI] A GPU voltou a responder; a transmissão volta para o {}", Backend::of(self.element).name());
                 self.software = None;
                 Some(au)
             }
@@ -1045,10 +1145,11 @@ impl VideoEncoder for VaapiEncoder {
     }
 
     fn name(&self) -> &'static str {
-        if self.software.is_some() {
-            "OpenH264 (CPU, após falha do VA-API)"
-        } else {
-            "VA-API H.264 (GPU)"
+        match (self.software.is_some(), Backend::of(self.element)) {
+            (true, Backend::Va) => "OpenH264 (CPU, após falha do VA-API)",
+            (true, Backend::Nvenc) => "OpenH264 (CPU, após falha do NVENC)",
+            (false, Backend::Va) => "VA-API H.264 (GPU)",
+            (false, Backend::Nvenc) => "NVENC H.264 (GPU, GStreamer)",
         }
     }
 
