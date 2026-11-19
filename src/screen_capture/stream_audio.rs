@@ -9,7 +9,9 @@
 //! (checked against libopus: a tone came out at 22% of its level, a chord at 458%),
 //! while its stereo encoder and its decoder are right.
 
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use opus_rs::{Application, OpusEncoder};
+
+use crate::audio::opus_decoder::OpusDecoder;
 
 /// Samples per packet: 20 ms at 48 kHz.
 pub const FRAME: usize = 960;
@@ -83,24 +85,24 @@ impl StreamAudioEncoder {
 pub struct StreamAudioDecoder {
     decoder: OpusDecoder,
     last_seq: Option<u32>,
-    last_toc: Option<u8>,
 }
 
 impl StreamAudioDecoder {
     pub fn new() -> Option<Self> {
-        // Stereo, like the packets (opus-rs cannot decode them into mono).
-        Some(Self { decoder: OpusDecoder::new(RATE as i32, 2).ok()?, last_seq: None, last_toc: None })
+        // Stereo, like the packets.
+        Some(Self { decoder: OpusDecoder::new(RATE as i32, 2).ok()?, last_seq: None })
     }
 
     /// The 48 kHz samples of packet `seq`, after concealing up to a few lost ones before it.
     pub fn decode(&mut self, seq: u32, packet: &[u8]) -> Vec<i16> {
         let mut out = Vec::new();
-        if let (Some(last), Some(toc)) = (self.last_seq, self.last_toc) {
+        if let Some(last) = self.last_seq {
             let missing = seq.wrapping_sub(last).wrapping_sub(1);
             if missing > 0 && missing <= MAX_CONCEALED {
                 for _ in 0..missing {
-                    // A packet of only its ToC byte asks the decoder to conceal a lost frame.
-                    self.decode_into(&[toc], &mut out);
+                    let mut pcm = [0f32; FRAME * 2];
+                    let made = self.decoder.conceal(FRAME, &mut pcm);
+                    Self::keep(&pcm, made, &mut out);
                 }
             }
         }
@@ -117,8 +119,7 @@ impl StreamAudioDecoder {
             }
         }
         self.last_seq = Some(seq);
-        if let Some(&toc) = packet.first() {
-            self.last_toc = Some(toc);
+        if !packet.is_empty() {
             self.decode_into(packet, &mut out);
         }
         out
@@ -126,9 +127,14 @@ impl StreamAudioDecoder {
 
     fn decode_into(&mut self, packet: &[u8], out: &mut Vec<i16>) {
         let mut pcm = [0f32; FRAME * 2];
-        if let Ok(n) = self.decoder.decode(packet, FRAME, &mut pcm) {
+        let decoded = self.decoder.decode(packet, FRAME, &mut pcm);
+        Self::keep(&pcm, decoded, out);
+    }
+
+    fn keep(pcm: &[f32], decoded: Result<usize, &'static str>, out: &mut Vec<i16>) {
+        if let Ok(n) = decoded {
             // Both channels carry the same mix: keep the left one.
-            out.extend(pcm[..n.min(FRAME) * 2].iter().step_by(2).map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16));
+            out.extend(pcm[..n.min(FRAME) * 2].iter().step_by(2).map(|&s| if s.is_finite() { (s.clamp(-1.0, 1.0) * 32767.0) as i16 } else { 0 }));
         }
     }
 }

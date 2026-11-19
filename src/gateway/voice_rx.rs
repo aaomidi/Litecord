@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::Aes256Gcm;
 use chacha20poly1305::XChaCha20Poly1305;
-use opus_rs::OpusDecoder;
+use crate::audio::opus_decoder::{OpusDecoder, MAX_FRAME};
 
 // 48 kHz stereo pairs. Cap after admission, including concealed Opus frames.
 pub const VOICE_QUEUE_LIMIT: usize = 28800;
@@ -195,13 +195,6 @@ const MAX_CONCEALED_PACKETS: u16 = 4;
 /// duplicate. Anything else that is not a small step forward is the sender starting its
 /// numbering again: it is played, and nothing is concealed for it.
 const LATE_WINDOW_PACKETS: u16 = 64;
-/// A decoder for the other channel count that sat unused for more packets than this is
-/// started afresh when the sender switches back to it, instead of resuming old state.
-const STALE_DECODER_PACKETS: u64 = 5;
-/// What is kept of the decoded audio to extrapolate from when the decoder cannot (40 ms).
-const TAIL_PAIRS: usize = 1920;
-/// The start of the first real frame after made-up audio is faded in over this (2.5 ms).
-const REJOIN_FADE_PAIRS: usize = 120;
 /// From its third decoder panic on, a member is not decoded for this long after each one:
 /// every panic is written to the panic log, and a sender whose packets keep causing them
 /// (50 a second) must not be able to fill it.
@@ -219,12 +212,11 @@ pub struct RxStats {
     /// Packets that carry a low-bitrate copy of the previous frame (in-band FEC).
     pub with_fec: u64,
     pub silence_frames: u64,
-    /// Lost frames replaced by extrapolated audio (by the decoder for SILK and hybrid
-    /// packets, by `extrapolate` for CELT-only ones), or by silence next to silence.
+    /// Lost frames replaced by the decoder: continued from what it played last, or decoded
+    /// from the copy in the next packet (those are also counted in `fec_recovered`).
     pub concealed: u64,
-    /// Lost frames that could only be replaced by silence although the member was not
-    /// silent: the second and later frames of a run of lost CELT-only packets.
-    pub concealed_as_silence: u64,
+    /// Lost frames decoded from the copy that the packet after them carried (in-band FEC).
+    pub fec_recovered: u64,
     pub conceal_failed: u64,
     /// Lost frames left out because the hole had already played (the queue was empty).
     pub conceal_skipped: u64,
@@ -252,10 +244,7 @@ struct LastPacket {
     next_seq: u16,
     timestamp: u32,
     at_ms: u64,
-    toc: u8,
-    channels: usize,
     samples: usize,
-    silence: bool,
 }
 
 /// True if a SILK or hybrid packet carries a redundant copy of the previous frame
@@ -275,80 +264,23 @@ pub fn opus_packet_has_fec(packet: &[u8]) -> bool {
     fec
 }
 
-/// One call into opus-rs. It indexes out of bounds on some malformed SILK payloads; a panic
-/// must not end the task that receives everyone's audio. `Err(())` = it panicked.
-fn guarded_decode(dec: &mut OpusDecoder, packet: &[u8], pcm: &mut [f32]) -> Result<Result<usize, &'static str>, ()> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dec.decode(packet, 5760, pcm))) {
-        Ok(Ok(n)) if n > 5760 => Ok(Err("decoder returned more samples than fit")),
+/// One call into the decoder. A panic in it must not end the task that receives everyone's
+/// audio. `Err(())` = it panicked.
+fn guarded(call: impl FnOnce() -> Result<usize, &'static str>) -> Result<Result<usize, &'static str>, ()> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+        Ok(Ok(n)) if n > MAX_FRAME => Ok(Err("decoder returned more samples than fit")),
         Ok(res) => Ok(res),
         Err(_) => Err(()),
     }
 }
 
-/// 20 ms (`n` pairs) that continue `tail`: its last pitch period repeated and faded to
-/// silence. For lost CELT-only frames, which opus-rs replaces with zeros. Empty when there
-/// is nothing to extrapolate from.
-fn extrapolate(tail: &[(f32, f32)], n: usize) -> Vec<(f32, f32)> {
-    const WINDOW: usize = 480; // 10 ms compared against earlier audio
-    const MIN_LAG: usize = 96; // 500 Hz
-    const MAX_LAG: usize = 960; // 50 Hz
-    const JOIN: usize = 96; // 2 ms
-    let len = tail.len();
-    if len < WINDOW + MIN_LAG + 1 {
-        return Vec::new();
-    }
-    let mono: Vec<f32> = tail.iter().map(|p| (p.0 + p.1) * 0.5).collect();
-    let recent = &mono[len - WINDOW..];
-    let energy: f32 = recent.iter().map(|v| v * v).sum();
-    if energy < 1e-7 {
-        return Vec::new();
-    }
-    let (mut best_lag, mut best) = (MIN_LAG, f32::MIN);
-    for lag in MIN_LAG..=MAX_LAG.min(len - WINDOW) {
-        let earlier = &mono[len - WINDOW - lag..len - lag];
-        let (mut cross, mut e2) = (0.0f32, 0.0f32);
-        for (a, b) in recent.iter().zip(earlier) {
-            cross += a * b;
-            e2 += b * b;
-        }
-        let score = cross / (energy * e2).sqrt().max(1e-9);
-        if score > best {
-            best = score;
-            best_lag = lag;
-        }
-    }
-    // Audio with no clear period (noise, consonants) repeated for 20 ms would buzz.
-    let fade_len = if best >= 0.5 { n } else { n / 4 };
-    let from = len - best_lag;
-    // Without this the repeat would start with the step between two unrelated samples.
-    let join = if from > 0 {
-        (tail[len - 1].0 - tail[from - 1].0, tail[len - 1].1 - tail[from - 1].1)
-    } else {
-        (0.0, 0.0)
-    };
-    (0..n).map(|i| {
-        let s = tail[from + i % best_lag];
-        let j = if i < JOIN { 1.0 - i as f32 / JOIN as f32 } else { 0.0 };
-        let g = if i < fade_len { 0.5 + 0.5 * (std::f32::consts::PI * i as f32 / fade_len as f32).cos() } else { 0.0 };
-        (((s.0 + join.0 * j) * g).clamp(-1.0, 1.0), ((s.1 + join.1 * j) * g).clamp(-1.0, 1.0))
-    }).collect()
-}
-
 /// Decoder state of one remote member (one SSRC).
 pub struct VoiceRxDecoder {
-    // opus-rs rejects a packet whose channel flag differs from the decoder's. The number
-    // is `decode_no` when that decoder was last used.
-    decoders: HashMap<usize, (OpusDecoder, u64)>,
-    /// Packets given to a decoder so far (silence frames are not).
-    decode_no: u64,
+    /// Two channels out whatever a packet is coded as: libopus plays a mono-coded packet on
+    /// both and follows a sender that changes between the two without a break.
+    decoder: Option<OpusDecoder>,
     last: Option<LastPacket>,
     pcm: Vec<f32>,
-    /// The most recent decoded audio, to extrapolate from.
-    tail: Vec<(f32, f32)>,
-    /// Lost frames in a row that the decoder could not conceal.
-    made_up_run: u32,
-    /// The next decoded frame follows made-up audio or silence it knows nothing about.
-    rejoin: bool,
     last_ms: u64,
     not_decoded_until_ms: u64,
     pub stats: RxStats,
@@ -363,9 +295,7 @@ impl Default for VoiceRxDecoder {
 impl VoiceRxDecoder {
     pub fn new() -> Self {
         Self {
-            decoders: HashMap::new(), decode_no: 0, last: None, pcm: vec![0.0; 11520],
-            tail: Vec::with_capacity(TAIL_PAIRS + 5760), made_up_run: 0, rejoin: false, last_ms: 0,
-            not_decoded_until_ms: 0,
+            decoder: None, last: None, pcm: vec![0.0; MAX_FRAME * 2], last_ms: 0, not_decoded_until_ms: 0,
             stats: RxStats::default(),
         }
     }
@@ -414,90 +344,62 @@ impl VoiceRxDecoder {
                 let lost = (missed as usize).min(by_time);
                 let conceal = if queued == Some(0) { lost.min(1) } else { lost };
                 self.stats.conceal_skipped += (lost - conceal) as u64;
-                self.conceal(conceal, &mut frame);
+                self.conceal(conceal, Some(opus), &mut frame);
             }
         }
 
         let toc = opus[0];
-        let channels = if (toc & 0x04) != 0 { 2 } else { 1 };
-        let silence = opus == OPUS_SILENCE_FRAME;
         self.stats.packets += 1;
         match toc >> 3 {
             0..=11 => self.stats.silk += 1,
             12..=15 => self.stats.hybrid += 1,
             _ => self.stats.celt += 1,
         }
-        if channels == 2 { self.stats.stereo += 1; }
+        if (toc & 0x04) != 0 { self.stats.stereo += 1; }
         if opus_packet_has_fec(opus) { self.stats.with_fec += 1; }
+        // The silence frame is decoded like every other packet, as the official client
+        // does: the last sound ends properly, and the decoder is where the sender's encoder
+        // expects it when the next word starts.
+        if opus == OPUS_SILENCE_FRAME { self.stats.silence_frames += 1; }
 
         let mut samples = 0usize;
-        if silence {
-            self.stats.silence_frames += 1;
-            samples = 960;
-            frame.decoded = vec![(0.0, 0.0); samples];
-            self.made_up_run = 0;
-            self.rejoin = false;
-        } else {
-            self.decode_no += 1;
-            let packet_no = self.decode_no;
-            // A decoder that last ran several packets ago (the sender went to the other
-            // channel count and came back) would resume from state that no longer matches.
-            if self.decoders.get(&channels).is_some_and(|(_, used)| packet_no - *used > STALE_DECODER_PACKETS) {
-                self.decoders.remove(&channels);
-            }
-            if !self.decoders.contains_key(&channels) {
-                match OpusDecoder::new(48000, channels) {
-                    Ok(dec) => { self.decoders.insert(channels, (dec, packet_no)); }
-                    Err(e) => {
-                        self.stats.decode_errors += 1;
-                        frame.error = Some(e);
-                    }
+        if self.decoder.is_none() {
+            match OpusDecoder::new(48000, 2) {
+                Ok(dec) => self.decoder = Some(dec),
+                Err(e) => {
+                    self.stats.decode_errors += 1;
+                    frame.error = Some(e);
                 }
             }
-            if let Some((dec, used)) = self.decoders.get_mut(&channels) {
-                *used = packet_no;
-                match guarded_decode(dec, opus, &mut self.pcm[..]) {
-                    Ok(Ok(n)) if n > 0 => {
-                        samples = n;
-                        frame.decoded = decoded_voice_pairs(&self.pcm[..n * channels], channels);
-                        if self.rejoin {
-                            for (i, p) in frame.decoded.iter_mut().take(REJOIN_FADE_PAIRS).enumerate() {
-                                let w = (i + 1) as f32 / (REJOIN_FADE_PAIRS + 1) as f32;
-                                *p = (p.0 * w, p.1 * w);
-                            }
-                        }
-                        self.made_up_run = 0;
-                        self.rejoin = false;
-                        self.tail.extend_from_slice(&frame.decoded);
-                        let excess = self.tail.len().saturating_sub(TAIL_PAIRS);
-                        self.tail.drain(..excess);
-                    }
-                    Ok(Ok(_)) => {
-                        self.stats.decode_errors += 1;
-                        frame.error = Some("decoder returned no samples");
-                    }
-                    Ok(Err(e)) => {
-                        self.stats.decode_errors += 1;
-                        frame.error = Some(e);
-                    }
-                    Err(()) => {
-                        // Whatever it was doing, its state cannot be trusted any more.
-                        self.decoders.remove(&channels);
-                        self.panicked();
-                        frame.error = Some("decoder panicked on this packet; its state was reset");
-                    }
+        }
+        if let Some(dec) = self.decoder.as_mut() {
+            let pcm = &mut self.pcm[..];
+            match guarded(|| dec.decode(opus, MAX_FRAME, pcm)) {
+                Ok(Ok(n)) => {
+                    samples = n;
+                    frame.decoded = decoded_voice_pairs(&self.pcm[..n * 2], 2);
+                }
+                Ok(Err(e)) => {
+                    self.stats.decode_errors += 1;
+                    frame.error = Some(e);
+                }
+                Err(()) => {
+                    // Whatever it was doing, its state cannot be trusted any more.
+                    self.decoder = None;
+                    self.panicked();
+                    frame.error = Some("decoder panicked on this packet; its state was reset");
                 }
             }
         }
 
         let next_seq = seq.wrapping_add(1);
         if samples > 0 {
-            self.last = Some(LastPacket { next_seq, timestamp, at_ms: now_ms, toc, channels, samples, silence });
+            self.last = Some(LastPacket { next_seq, timestamp, at_ms: now_ms, samples });
         } else if self.last.is_some() {
             // Not decodable: it still used 20 ms of the member's time, so within a
             // talkspurt it is treated as a lost packet.
             if self.last.as_ref().is_some_and(|l| now_ms.saturating_sub(l.at_ms) <= TALKSPURT_GAP_MS) {
-                self.conceal(1, &mut frame);
+                self.conceal(1, None, &mut frame);
             }
             if let Some(last) = self.last.as_mut() {
                 last.next_seq = next_seq;
@@ -515,58 +417,44 @@ impl VoiceRxDecoder {
         }
     }
 
-    fn conceal(&mut self, packets: usize, frame: &mut RxFrame) {
-        let Some(last) = self.last.as_ref() else { return };
-        // opus-rs has no concealment for CELT-only packets: it returns 20 ms of zeros.
-        let celt_only = (last.toc & 0x80) != 0;
-        for _ in 0..packets {
+    /// Audio for `packets` lost frames. `next` is the packet that arrived after them: when
+    /// it carries a copy of the frame before it (in-band FEC, which the official client
+    /// sends), the last lost frame is decoded from that copy. The others are continued by
+    /// the decoder from what it played last.
+    fn conceal(&mut self, packets: usize, next: Option<&[u8]>, frame: &mut RxFrame) {
+        let Some(samples) = self.last.as_ref().map(|l| l.samples) else { return };
+        for i in 0..packets {
             frame.conceal_calls += 1;
             let before = frame.concealed.len();
-            let mut as_silence = false;
-            if last.silence {
-                // Silence next to silence.
-            } else if celt_only {
-                if self.made_up_run == 0 {
-                    frame.concealed.extend(extrapolate(&self.tail, last.samples));
-                }
-                as_silence = frame.concealed.len() == before;
-                self.made_up_run += 1;
-                self.rejoin = true;
-            } else if let Some((dec, _)) = self.decoders.get_mut(&last.channels) {
-                // A packet that is only its first byte is "frame lost" to the decoder, which
-                // then runs its own concealment from the previous frames. (An empty packet,
-                // which this code used to pass, is rejected by opus-rs.)
-                match guarded_decode(dec, &[last.toc & 0xFC], &mut self.pcm[..]) {
+            let copy = next.filter(|p| i + 1 == packets && opus_packet_has_fec(p));
+            if let Some(dec) = self.decoder.as_mut() {
+                let pcm = &mut self.pcm[..];
+                let made = guarded(|| match copy {
+                    Some(p) => dec.decode_fec(p, samples, pcm),
+                    None => dec.conceal(samples, pcm),
+                });
+                match made {
                     Ok(Ok(n)) => {
-                        let pairs = decoded_voice_pairs(&self.pcm[..n * last.channels], last.channels);
-                        self.tail.extend_from_slice(&pairs);
-                        frame.concealed.extend(pairs);
+                        frame.concealed.extend(decoded_voice_pairs(&self.pcm[..n.min(samples) * 2], 2));
+                        if copy.is_some() { self.stats.fec_recovered += 1; }
                     }
                     Ok(Err(_)) => {}
                     Err(()) => {
-                        self.decoders.remove(&last.channels);
-                        self.stats.decoder_panics += 1;
-                        if self.stats.decoder_panics >= 3 {
-                            self.not_decoded_until_ms = self.last_ms + PANIC_TIMEOUT_MS;
-                        }
+                        self.decoder = None;
+                        self.panicked();
                     }
                 }
             }
-            if as_silence {
-                self.stats.concealed_as_silence += 1;
-            } else if frame.concealed.len() > before || last.silence {
+            if frame.concealed.len() > before {
                 frame.conceal_ok += 1;
                 self.stats.concealed += 1;
             } else {
                 self.stats.conceal_failed += 1;
-                self.rejoin = true;
             }
             // Whatever happened, the lost packet keeps its place in time.
             let have = frame.concealed.len() - before;
-            frame.concealed.extend(std::iter::repeat((0.0, 0.0)).take(last.samples.saturating_sub(have)));
+            frame.concealed.extend(std::iter::repeat((0.0, 0.0)).take(samples.saturating_sub(have)));
         }
-        let excess = self.tail.len().saturating_sub(TAIL_PAIRS);
-        self.tail.drain(..excess);
     }
 }
 
@@ -1229,16 +1117,59 @@ mod tests {
     }
 
     #[test]
-    fn the_silence_frame_is_zeros_and_a_loss_next_to_it_stays_silent() {
+    fn the_silence_frame_ends_the_sound_and_a_loss_next_to_it_stays_silent() {
         let packets = encoded_speechlike(6);
         let mut rx = VoiceRxDecoder::new();
         for (i, p) in packets.iter().enumerate() {
             rx.packet(i as u16, i as u32 * 960, p, i as u64 * 20);
         }
+        // The first silence frame still carries the end of the sound before it.
         let s = rx.packet(6, 6 * 960, &OPUS_SILENCE_FRAME, 120);
-        assert!(s.decoded.len() == 960 && s.decoded.iter().all(|p| *p == (0.0, 0.0)));
+        assert_eq!(s.decoded.len(), 960);
+        assert!(s.decoded[480..].iter().all(|p| p.0.abs() < 1e-3), "silent after 10 ms");
         let after = rx.packet(8, 8 * 960, &OPUS_SILENCE_FRAME, 160);
-        assert!(after.concealed.len() == 960 && after.concealed.iter().all(|p| *p == (0.0, 0.0)));
+        assert_eq!((after.concealed.len(), after.decoded.len()), (960, 960));
+        assert!(after.concealed.iter().chain(&after.decoded).all(|p| p.0.abs() < 1e-3));
+        assert_eq!(rx.stats.silence_frames, 2);
+    }
+
+    #[test]
+    fn mono_and_stereo_packets_of_one_sender_share_a_decoder() {
+        use crate::audio::opus_decoder::test_packets::speechlike;
+        let (mono, stereo) = (speechlike(1, false, 30), speechlike(2, false, 30));
+        let mut rx = VoiceRxDecoder::new();
+        for i in 0..30usize {
+            let p = if (i / 5) % 2 == 0 { &mono[i] } else { &stereo[i] };
+            let f = rx.packet(i as u16, i as u32 * 960, p, i as u64 * 20);
+            assert!(f.error.is_none() && f.decoded.len() == 960, "packet {i}: {:?}", f.error);
+            if i >= 6 { assert!((0.1..0.3).contains(&rms(&f.decoded)), "packet {i}: level {}", rms(&f.decoded)); }
+        }
+        assert_eq!(rx.stats.stereo, 15);
+    }
+
+    #[test]
+    fn a_lost_frame_is_taken_from_the_copy_in_the_next_packet() {
+        use crate::audio::opus_decoder::test_packets::speechlike;
+        let packets = speechlike(1, true, 60);
+        // Not every packet carries a copy: lose one, and later two in a row, before packets that do.
+        let with_copy: Vec<usize> = (0..60).filter(|&i| opus_packet_has_fec(&packets[i])).collect();
+        let one = with_copy.iter().find(|&&i| i > 8).expect("a packet with a copy") - 1;
+        let two = with_copy.iter().find(|&&i| i > one + 6).unwrap_or_else(|| panic!("two packets with a copy: {with_copy:?}")) - 2;
+        let mut whole = VoiceRxDecoder::new();
+        let reference: Vec<Vec<(f32, f32)>> = packets.iter().enumerate().map(|(i, p)| whole.packet(i as u16, i as u32 * 960, p, i as u64 * 20).decoded).collect();
+        let mut rx = VoiceRxDecoder::new();
+        for (i, p) in packets.iter().enumerate() {
+            if i == one || i == two || i == two + 1 { continue; }
+            let f = rx.packet(i as u16, i as u32 * 960, p, i as u64 * 20);
+            if i == one + 1 {
+                assert_eq!((f.conceal_ok, f.concealed.len(), f.decoded.len()), (1, 960, 960));
+                let (want, got) = (rms(&reference[one]), rms(&f.concealed));
+                assert!((0.6..1.6).contains(&(got / want)), "recovered frame level {got}, the lost frame had {want}");
+            }
+            if i == two + 2 { assert_eq!((f.conceal_calls, f.conceal_ok, f.concealed.len()), (2, 2, 1920)); }
+        }
+        // One lost packet: its copy. Two in a row: the first continued, the second from its copy.
+        assert_eq!((rx.stats.concealed, rx.stats.fec_recovered), (3, 2));
     }
 
     // ----- transport encryption -----
@@ -1425,29 +1356,17 @@ mod tests {
         let mut rx = VoiceRxDecoder::new();
         let mut state = 0x9E37_79B9_7F4A_7C15u64;
         let mut rand = move || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state };
-        let (mut seq, mut pairs, mut now, mut refused) = (0u16, 0usize, 0u64, 0usize);
-        for i in 0..200_000usize {
-            let len = 60 + (rand() % 61) as usize;
+        let (mut seq, mut pairs, mut now) = (0u16, 0usize, 0u64);
+        for i in 0..20_000usize {
+            let len = 1 + (rand() % 160) as usize;
             let garbage: Vec<u8> = (0..len).map(|_| rand() as u8).collect();
-            let panics_before = rx.stats.decoder_panics;
             let f = rx.packet(seq, seq as u32 * 960, &garbage, now);
             assert!(f.concealed.iter().chain(&f.decoded).all(|p| p.0.is_finite() && p.1.is_finite() && p.0.abs() <= 1.0 && p.1.abs() <= 1.0));
             pairs += f.concealed.len() + f.decoded.len();
-            if f.error.is_some_and(|e| e.starts_with("not decoded")) { refused += 1; }
             seq = seq.wrapping_add(1);
             now += 20;
-            if rx.stats.decoder_panics > panics_before && rx.stats.decoder_panics >= 3 {
-                // From the third panic on the member is left alone for two seconds...
-                for p in &real[..5] {
-                    let f = rx.packet(seq, seq as u32 * 960, p, now);
-                    assert!(f.error.is_some() && f.decoded.is_empty());
-                    seq = seq.wrapping_add(1);
-                    now += 20;
-                }
-                now += PANIC_TIMEOUT_MS;
-            }
             if i % 1000 == 999 {
-                // ...and real packets decode again afterwards.
+                // Real packets decode again afterwards.
                 now += PANIC_TIMEOUT_MS;
                 for p in &real[..5] {
                     let f = rx.packet(seq, seq as u32 * 960, p, now);
@@ -1457,8 +1376,8 @@ mod tests {
                 }
             }
         }
-        println!("garbage: 200000 packets, decoder_panics={} decode_errors={} refused_after_panics={refused} pairs={pairs}", rx.stats.decoder_panics, rx.stats.decode_errors);
-        assert!(rx.stats.decoder_panics > 0, "the test no longer reaches the panic it guards against");
+        println!("garbage: 20000 packets, decoder_panics={} decode_errors={} pairs={pairs}", rx.stats.decoder_panics, rx.stats.decode_errors);
+        assert_eq!(rx.stats.decoder_panics, 0, "libopus refuses a damaged packet, it does not panic");
     }
 
     #[test]
@@ -1570,7 +1489,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_celt_packet_is_extrapolated_not_cut_to_zeros() {
+    fn lost_celt_packets_are_continued_by_the_decoder() {
         let packets = encoded_celt(40);
         let mut rx = VoiceRxDecoder::new();
         let mut out = Vec::new();
@@ -1580,19 +1499,17 @@ mod tests {
             if i == 21 {
                 assert_eq!((f.conceal_ok, f.concealed.len()), (1, 960));
                 let before = rms(&out[out.len() - 960..]);
-                println!("celt: rms before {before}, first half of the made-up frame {}, second half {}", rms(&f.concealed[..480]), rms(&f.concealed[480..]));
-                assert!(rms(&f.concealed[..480]) > 0.5 * before, "the lost frame starts as audio, not as silence");
-                assert!(f.concealed[959].0.abs() < 0.01, "and ends faded out");
+                println!("celt: rms before {before}, made-up frame {}", rms(&f.concealed));
+                assert!(rms(&f.concealed) > 0.5 * before, "the lost frame is audio, not silence");
             }
             if i == 32 {
-                assert_eq!((f.conceal_calls, f.conceal_ok, f.concealed.len()), (2, 1, 1920));
-                assert!(f.concealed[960..].iter().all(|p| *p == (0.0, 0.0)));
+                assert_eq!((f.conceal_calls, f.conceal_ok, f.concealed.len()), (2, 2, 1920));
             }
             out.extend_from_slice(&f.concealed);
             out.extend_from_slice(&f.decoded);
         }
         assert_eq!(out.len(), 40 * 960);
-        assert_eq!((rx.stats.concealed, rx.stats.concealed_as_silence), (2, 1));
+        assert_eq!((rx.stats.concealed, rx.stats.conceal_failed), (3, 0));
         // 180 Hz + 720 Hz at 0.3 + 0.15 moves at most about 0.022 per sample.
         let (mut biggest, mut at) = (0.0f32, 0);
         for i in 12 * 960..out.len() - 1 {
