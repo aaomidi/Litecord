@@ -105,6 +105,8 @@ struct Counters {
     encoder_errors: u32,
     trims: u32,
     trimmed_samples: u32,
+    slow_turns: u32,
+    longest_turn_gap_ms: u32,
 }
 
 pub struct VoiceTx {
@@ -296,16 +298,28 @@ impl VoiceTx {
         }
     }
 
+    /// Records how long after the previous turn this one started (see the send loop). A
+    /// turn should start every 20 ms; more than 40 ms means the loop itself ran late (a
+    /// busy runtime), which a listener hears as late packets even when the microphone
+    /// was on time.
+    pub fn note_turn_gap(&mut self, ms: u32) {
+        if ms > 40 {
+            self.counters.slow_turns += 1;
+        }
+        self.counters.longest_turn_gap_ms = self.counters.longest_turn_gap_ms.max(ms);
+    }
+
     /// One line about the turns since the last report, and a new period.
     pub fn take_report(&mut self) -> String {
         let c = std::mem::take(&mut self.counters);
         let g: GainReport = self.processor.take_gain_report();
         let level = |v: f32| if v.is_finite() { format!("{v:.1}") } else { "-".to_string() };
         format!(
-            "turns={} audio={} silence={} not_sent={} utterances={} lookback_frames={} | gain: speech_in={} dBFS speech_out={} dBFS gain={:+.1} dB noise_floor={:.1} dBFS speech_frames={} limiter_frames={} limiter_max={:.1} dB | mic: late_turns={} late_in_speech={} forced_ends={} queue_trims={} trimmed_ms={} encoder_errors={}",
+            "turns={} audio={} silence={} not_sent={} utterances={} lookback_frames={} | gain: speech_in={} dBFS speech_out={} dBFS gain={:+.1} dB noise_floor={:.1} dBFS speech_frames={} limiter_frames={} limiter_max={:.1} dB | mic: late_turns={} late_in_speech={} forced_ends={} queue_trims={} trimmed_ms={} encoder_errors={} | loop: slow_turns={} longest_gap={} ms",
             c.turns, c.audio_packets, c.silence_packets, c.not_sent, c.utterances, c.lookback_frames,
             level(g.speech_in_db), level(g.speech_out_db), g.gain_db, g.noise_db, g.speech_frames, g.limited_frames, g.limiter_max_db,
             c.stalls, c.stalls_in_speech, c.forced_ends, c.trims, c.trimmed_samples / 48, c.encoder_errors,
+            c.slow_turns, c.longest_turn_gap_ms,
         )
     }
 

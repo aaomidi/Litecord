@@ -796,6 +796,7 @@ pub async fn connect_voice_gateway(
                                                 let mut nonce_cnt: u32 = 0;
                                                 let mut tx_cipher: Option<(Vec<u8>, VoiceCipher)> = None;
                                                 let mut tx_turns: u32 = 0;
+                                                let mut last_tx_turn = std::time::Instant::now();
                                                 let mut speaking_loop_counter: u32 = 0;
 
                                                 // Wait for the secret key (received in op=4) before starting audio
@@ -874,6 +875,12 @@ pub async fn connect_voice_gateway(
                                                         Err(_) => (None, 0),
                                                     };
                                                     voice_tx.note_trim(trimmed);
+                                                    // Only turns that came with a frame: a wait for a late
+                                                    // microphone is counted on its own.
+                                                    if mic_frame.is_some() {
+                                                        voice_tx.note_turn_gap(last_tx_turn.elapsed().as_millis() as u32);
+                                                    }
+                                                    last_tx_turn = std::time::Instant::now();
                                                     let suppression_mode = crate::utils::video_settings::get_noise_suppression();
                                                     let tx_settings = TxSettings {
                                                         noise_suppression: &suppression_mode,

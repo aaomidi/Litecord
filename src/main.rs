@@ -4247,6 +4247,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ch_name = target_channel.as_ref().map(|c| c.name.clone()).unwrap_or_else(|| crate::utils::i18n_ui::pick("channel", "canal").to_string());
 
         if let Some(ui) = app_weak_chan_select.upgrade() {
+            if is_voice && ui.get_is_in_voice() && ui.get_voice_channel_id().as_str() == ch_id {
+                // Already in this call: show its room. Joining again re-opened the
+                // microphone (a hole in what the call was sending), re-sent the voice state
+                // and announced the share's presence a second time.
+                ui.set_is_voice_focused(true);
+                show_chat_select(&ui, &ch_id, &ch_name, true);
+                return;
+            }
             if is_voice {
                 ui.set_is_in_voice(true);
                 ui.set_is_voice_connecting(true);
